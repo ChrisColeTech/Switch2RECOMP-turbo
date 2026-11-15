@@ -20,15 +20,24 @@ gcc/
 tcc/
 tool/deps/
 external/
+dotnet/
+lib/
+dist/
+_downloads/
 
 # games and their output
 games/
 captures/
+logs/
+shader_cache/
+/performance.txt
+/threads.txt
 *_nvn/
 *.log
 *.ini
 
 # python
+.venv/
 __pycache__/
 *.pyc
 

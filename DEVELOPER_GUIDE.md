@@ -11,7 +11,8 @@ Rules of the project:
 - No code from GPL-2.0-only or other incompatible projects. yuzu, Eden and similar emulators may be read to understand
   hardware behavior, but their code is not copied.
 - Every source file keeps the header `SwitchRecomp - Copyright 2026 MZ Labs` (AGPL v3 with NOTICE.txt).
-- Packages stay under 20 MB. Python, GCC and SDL2 are downloaded by `Install.bat` / `Install.sh`, not shipped.
+- Upstream lightweight packages stay under 20 MB and download tools through `Install.bat` / `Install.sh`.
+  This fork's all-in-one Windows/Linux releases bundle those tools and exceed that limit; see `docs/RELEASES.md`.
 - A fix is not done until it is explained by a mechanism (log, trace or replay), not by trial and error.
 
 ---
@@ -65,6 +66,8 @@ change on a game, copy the new runtime over the game's executable** and keep the
 "Update all games" does that for every game. Windows Explorer sometimes renames the copy; check the name.
 
 Packaging (what the release has):
+The following describes the upstream lightweight layout. This fork's automated Qt bundles use
+`scripts/package-release.py` and the layout documented in `docs/RELEASES.md`.
 - Windows zip: the whole `SwitchRecomp` folder, without `gcc/`, `python/`, `games/*/*` and `__pycache__`.
 - Linux tar.gz: the Linux package folder (`SwitchRecomp` launcher script + `SwitchRecomp.bin`, `lib/`, `bin/`).
 - AppImage: the Linux package + `AppRun`, built with `mksquashfs -comp zstd` on top of an AppImage runtime.

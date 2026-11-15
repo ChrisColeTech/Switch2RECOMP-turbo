@@ -150,7 +150,7 @@ def relocate(paths, prefix):
         os.chmod(f, mode | 0o200); open(f, 'wb').write(data); os.chmod(f, mode)
 
 
-def unpack(data):
+def unpack(data, package=None):
     z = zipfile.ZipFile(io.BytesIO(data))
     paths = []
     for n in z.namelist():
@@ -159,6 +159,12 @@ def unpack(data):
         if n.startswith('info-'):
             try: paths = json.load(t.extractfile('info/paths.json'))['paths']
             except Exception: paths = []
+            if package:
+                for m in t.getmembers():
+                    if m.isfile() and (m.name.startswith(('info/licenses/', 'info/recipe/')) or m.name == 'info/index.json') and '..' not in m.name.split('/'):
+                        out = os.path.join(DEST, 'licenses', package, m.name)
+                        os.makedirs(os.path.dirname(out), exist_ok=True)
+                        with t.extractfile(m) as src, open(out, 'wb') as dst: shutil.copyfileobj(src, dst)
             continue
         for m in t.getmembers():
             if m.name.startswith('/') or '..' in m.name.split('/'): continue
@@ -246,7 +252,7 @@ def install_gcc(force=False):
     try:
         for i, (p, sha) in enumerate(PKGS.items()):
             print('  [%2d/%d] %s' % (i + 1, total, p.split('/')[-1])); sys.stdout.flush()
-            relocate(unpack(get(p, sha)), DEST)
+            relocate(unpack(get(p, sha), p.split('/')[-1]), DEST)
     except Exception as e:
         print('\n  the download failed: %s' % e)
         print('  check the internet connection and run it again (what was downloaded is kept)')

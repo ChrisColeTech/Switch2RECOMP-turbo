@@ -1,5 +1,17 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Added all-in-one Windows/Linux release packaging and a main-branch release workflow, with checksum-pinned tools,
+  Qt/MSVC deployment, dependency notices, and a relocated synthetic-NUP build check before publishing.
+- Qt builds and imports native Linux games, detects their running processes, and cancels Linux compiler process groups.
+- Games launched from the library use the current bundled Python, .NET, SPIRV tools, and Linux library paths.
+- Qt cards now own Play/Build/Stop/Cancel and Properties; library view/size controls are in Search & Filter,
+  Settings is in the status bar, and the details list is edge-to-edge. Added live EXE-state detection.
+- Added persisted light/dark and five accent palettes, removed focus outlines, and fixed cover/background WebP
+  decoding and stale-image refresh. Equivalent Windows path spellings no longer invalidate completed builds.
+- Refined the Qt launcher with a charcoal/lime theme, high-contrast text and keyboard focus, and a search/filter
+  popout instead of exposed toolbar fields; added status/source filtering and accessibility contrast tests.
+- Added a Qt desktop launcher: persistent gallery/list library, native menus/status bar, large labeled command
+  icons, per-game Properties, optional artwork backgrounds, dockable build output, and launch from the same library.
 - Game builds deploy the bundled Vulkan shader tools independently of development-only NVN library artifacts.
 - Indexed Switch 2 NUP packages are direct inputs. ExeFS is materialized for recompilation, while the runtime reads
   raw and zstd RomFS entries from the original package with a bounded cache; no extracted RomFS copy is required.

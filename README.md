@@ -10,6 +10,12 @@ own dump of a game you own.
 Player manual (recompiling a game, controls, `.ini` options): `README.txt`.
 Code layout, logs and traces: `DEVELOPER_GUIDE.md`. Changes: `CHANGELOG.txt`.
 
+## Qt desktop launcher
+
+The Qt launcher provides a persistent game library, NUP imports, native build controls, and one-click Play.
+Run `bin/launcher/SwitchRecompLauncher.exe`. Build it with `scripts/build-launcher.bat`.
+See [the launcher guide](docs/LAUNCHER.md) for its gallery/list views, Properties dialogs, and setup.
+
 ## Renderers
 
 The game's `.ini` picks one with `renderer=`:

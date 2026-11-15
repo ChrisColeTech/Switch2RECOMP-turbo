@@ -1,0 +1,131 @@
+# SwitchRecomp - Copyright 2026 MZ Labs
+# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+name: Portable release
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+            qt_arch: win64_msvc2022_64
+          - os: ubuntu-24.04
+            platform: linux
+            qt_arch: linux_gcc_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools libx11-dev libgl-dev libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: ${{ matrix.qt_arch }}
+          modules: qtimageformats
+          cache: true
+      - name: Download bundled tools and license sources
+        run: python scripts/release-deps.py --dest build/release-deps
+      - name: Python regression tests
+        run: python -m unittest discover -s tests -p "test_n*.py"
+      - name: Windows shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 15.1.0 https://github.com/KhronosGroup/glslang.git build/glslang-src
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S build/glslang-src -B build/glslang -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DBUILD_TESTING=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build/glslang --config Release --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Resolve-Path build/glslang/StandAlone/Release).Path >> $env:GITHUB_PATH
+      - name: Windows runtime and launcher
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd\build\release-deps\gcc\Library\bin;$env:PATH"
+          python tools/build_nvn.py --jobs 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python switchrecomp.py --build-runtime --target win64 --backend win32 --cc "$pwd\build\release-deps\gcc\Library\bin\x86_64-w64-mingw32-gcc.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./scripts/build-launcher.ps1 -QtPrefix $env:QT_ROOT_DIR -Jobs 4
+      - name: Linux runtime and launcher
+        if: runner.os == 'Linux'
+        run: |
+          python tools/build_nvn.py --linux --jobs 4
+          python switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
+          SWR_QT_PREFIX="$QT_ROOT_DIR" SWR_JOBS=4 sh scripts/build-launcher.sh
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python scripts/package-release.py --deps build/release-deps --launcher bin/launcher --qt "$env:QT_ROOT_DIR"
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: python scripts/package-release.py --deps build/release-deps --launcher bin/launcher-linux --qt "$QT_ROOT_DIR"
+      - name: Test relocated Windows archive
+        if: runner.os == 'Windows'
+        run: python scripts/smoke-release.py dist/Switch2RECOMP-turbo-windows-x64.zip
+      - name: Test relocated Linux archive
+        if: runner.os == 'Linux'
+        run: python scripts/smoke-release.py dist/Switch2RECOMP-turbo-linux-x64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.platform }}
+          path: |
+            logs/
+            build/launcher-*/Testing/Temporary/LastTest.log
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portable-*
+          path: release
+          merge-multiple: true
+      - name: Verify downloaded archives
+        working-directory: release
+        run: sha256sum -c *.sha256
+      - name: Publish tested bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="turbo-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          git archive --format=tar.gz --prefix=Switch2RECOMP-turbo-source/ -o "release/Switch2RECOMP-turbo-source.tar.gz" "$GITHUB_SHA"
+          gh release create "$tag" release/*.zip release/*.tar.gz release/*.sha256 --target "$GITHUB_SHA" --title "Switch2RECOMP turbo build ${GITHUB_RUN_NUMBER}" --notes-file docs/RELEASE_NOTES.md --latest
