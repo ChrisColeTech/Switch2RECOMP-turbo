@@ -6,6 +6,7 @@ import os, re
 from typing import Any
 
 HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'runtime', 'nvn', 'gfx', 'dmsh_abi.h')
+if not os.path.isfile(HEADER): HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dmsh_abi.h')
 _DEFINE = re.compile(r'#define DMSH_([A-Z][A-Z0-9_]*)[ \t]+(0x[0-9A-Fa-f]+|[1-9][0-9]*|0|"[^"\\]*")(?:[ \t]+//.*)?')
 
 

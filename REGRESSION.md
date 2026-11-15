@@ -38,6 +38,7 @@ The runtime prints the version `0.4.1` in the first line of every game log. A bu
 
 ```sh
 sh tests/run_audio.sh
+python3 tests/test_nxs_parent.py
 ```
 
 This builds `tests/test_audio.c` and `tests/test_record_time.c` with AddressSanitizer and UndefinedBehaviorSanitizer

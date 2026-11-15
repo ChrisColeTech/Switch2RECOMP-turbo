@@ -229,6 +229,7 @@ static const IniOpt INI_INPUT[]={
   {NULL,NULL,NULL}};
 
 static const IniOpt INI_GRAPHICS[]={
+  {"renderer","opengl","Graphics backend: opengl (default), vulkan (native NVN layer), or eden"},
   {"resolution","1","Internal 3D resolution: 1 = native, 2 = double, 0.75 / 0.5 = faster (applies live)"},
   {"dynamic_resolution","0","1 = lower the resolution automatically when the GPU can't keep up (down to dynamic_resolution_min)"},
   {"dynamic_resolution_min","0.6","Lowest internal resolution allowed by dynamic_resolution"},

@@ -314,14 +314,15 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if spvc: cmd += [spvc]
     # renderer=vulkan: the NVN layer (runtime/nvn, built by tools/build_nvn.py into build/nvn/libnvn.a), Windows only
     nvn_lib = os.path.join(HERE, 'build', 'nvn', 'libnvn.a')
-    if target_win and backend == 'win32' and os.path.isfile(nvn_lib) and not os.environ.get('SWR_NO_NVN'): cmd += ['-DSWR_HAVE_NVN', nvn_lib, '-lbcrypt', '-luuid']
+    nvn = target_win and backend == 'win32' and os.path.isfile(nvn_lib) and not os.environ.get('SWR_NO_NVN')
+    if nvn: cmd += ['-DSWR_HAVE_NVN', nvn_lib, '-lbcrypt', '-luuid']
     nvn_lin = os.path.join(HERE, 'build', 'nvn_lin', 'libnvn.a')   # tools/build_nvn.py --linux
     if not target_win and backend == 'x11' and os.path.isfile(nvn_lin) and not os.environ.get('SWR_NO_NVN'): cmd += ['-DSWR_HAVE_NVN', nvn_lin, '-lstdc++', '-ldl', '-lpthread']
     if h264: cmd += h264_libs
     if opus: cmd += [os.path.join(op, 'libopus.a')]
     if vp9: cmd += [os.path.join(vp, 'libvpx.a')]
     if edenvk: cmd += evk_libs + (['-luuid', '-lole32', '-lshell32', '-lntdll'] if target_win else [])
-    if spvc or h264 or edenvk:
+    if spvc or h264 or edenvk or nvn:
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro
         cmd += ['-lstdc++'] if target_win else ['-Wl,-Bstatic', '-lstdc++', '-Wl,-Bdynamic', '-static-libgcc']
     if target_win:
@@ -404,6 +405,18 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
                 say('rsync is unavailable; using the built-in ROMFS copy fallback')
             n = sync_tree(romfs, dst)
             if n and not first: say('romfs: %d changed files copied' % n)
+
+
+def copy_nxshader(outdir, say):
+    """Stage bundled shader tools independently of development-only NVN build artifacts."""
+    src = os.path.join(HERE, 'tools', 'nxshader')
+    if not os.path.isfile(os.path.join(src, 'nxs_live.py')): return
+    dst = os.path.join(outdir, 'tools', 'nxshader')
+    copied = sync_tree(src, dst)
+    shutil.copyfile(os.path.join(RT, 'nvn', 'gfx', 'dmsh_abi.h'), os.path.join(dst, 'dmsh_abi.h'))
+    with open(os.path.join(dst, 'python.path'), 'w', encoding='utf-8', newline='\n') as fileobj:
+        fileobj.write(os.path.abspath(sys.executable) + '\n')
+    if copied: say('Vulkan shader translator: %d files copied' % copied)
 
 
 def check_writable(*paths):
@@ -501,6 +514,7 @@ def main():
     files = gen_module(prog, mods, npdm, build, title, a.chunk, say)
     datadir = base + '_data'
     copy_data(mods, npdm, romfs, a.input, datadir, say)
+    copy_nxshader(outdir, say)
     if not os.path.exists(base + '.ini'):
         with open(base + '.ini', 'w', encoding='utf-8') as fo: fo.write(INI % {'title': title})
     if a.no_build: return

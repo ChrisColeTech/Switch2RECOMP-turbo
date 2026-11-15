@@ -273,10 +273,20 @@ static int chat_disp(SvcObj* o, IpcCtx* c){
   return ns2_unknown(o,c); }
 
 /* video decoder (nn::codec::video): gsv 902/906/1002 hand out a session whose command 1 (CreateVideoDecoderService)
-   hands out another. Nothing decodes yet: everything on them answers ok (movies get no picture) */
-static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ return ns2_unknown(o,c); }
+   hands out another. Nothing decodes yet, but command 3 must return the submission-ready event: clients clear and
+   wait on it, and abort if a successful IPC reply contains handle zero. Keep it signaled while the stub has room. */
+typedef struct { KEvent* ready; } VDec;
+static KEvent* vdec_ready(VDec* v){ if(!v->ready){ v->ready=kevent_new("video decoder ready",0); kobj_ref(&v->ready->o); kevent_signal(v->ready); } return v->ready; }
+static void vdec_destroy(SvcObj* o){ VDec* v=o->data; if(v->ready) kobj_unref(&v->ready->o); }
+static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data;
+  switch(c->cmd){
+    case 3: out_copy_h(c,ev_h(vdec_ready(v))); return 0;                 /* GetEvent */
+    case 6: case 8: case 207: kevent_signal(vdec_ready(v)); return 0;    /* Start / Flush / Stop */
+    case 109: case 400: kevent_signal(vdec_ready(v)); out64(c,0); return 0; /* SubmitInputBuffer */
+  }
+  return ns2_unknown(o,c); }
 static int vdec_disp(SvcObj* o, IpcCtx* c){
-  if(c->cmd==1) return move_obj(c,svcobj_new("IVideoDecoderService",vdec_svc_disp,0),0);
+  if(c->cmd==1){ SvcObj* s=svcobj_new("IVideoDecoderService",vdec_svc_disp,sizeof(VDec)); s->destroy=vdec_destroy; return move_obj(c,s,0); }
   return ns2_unknown(o,c); }
 
 static int vi2_disp(SvcObj* o, IpcCtx* c){   /* IVi2Session */

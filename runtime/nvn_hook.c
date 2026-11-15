@@ -134,6 +134,9 @@ static void nvn_hle_install(u64 (*find)(const char*)){
       if(!sc[0]){ snprintf(x,sizeof x,"%s%snxshader" SWR_SEP "nxs_live.py",g_exedir,up[i]); f=fopen(x,"rb"); if(f){ fclose(f); snprintf(sc,sizeof sc,"%s",x); } } }
 #ifdef _WIN32
     for(int i=0;i<4 && !py[0];i++){ snprintf(x,sizeof x,"%s%spython\\python.exe",g_exedir,up[i]); FILE* f=fopen(x,"rb"); if(f){ fclose(f); snprintf(py,sizeof py,"%s",x); } }
+    if(!py[0] && sc[0]){ snprintf(x,sizeof x,"%s",sc); char* slash=strrchr(x,'\\'); if(!slash) slash=strrchr(x,'/');
+      if(slash){ snprintf(slash+1,(size_t)(x+sizeof x-(slash+1)),"python.path"); FILE* f=fopen(x,"rb");
+        if(f){ if(fgets(py,sizeof py,f)){ size_t n=strlen(py); while(n && (py[n-1]=='\r'||py[n-1]=='\n')) py[--n]=0; } fclose(f); } } }
     if(!py[0]) snprintf(py,sizeof py,"python");
 #else
     snprintf(py,sizeof py,"python3");
@@ -147,7 +150,7 @@ static void nvn_hle_install(u64 (*find)(const char*)){
       char cmd[6000]; snprintf(cmd,sizeof cmd,"\"%s\" -I \"%s\" --dump \"%s\" --cache \"%s\" --parent %s",py,sc,dump,cache,pid);
       STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si;
       if(CreateProcessA(NULL,cmd,NULL,NULL,FALSE,CREATE_NO_WINDOW|BELOW_NORMAL_PRIORITY_CLASS,NULL,NULL,&si,&pi)){ CloseHandle(pi.hThread); CloseHandle(pi.hProcess); LOG("nvn: live shader translator started (%s)\n",sc); }
-      else LOG("nvn: the live shader translator didn't start (error %lu): is Python there?\n",GetLastError());
+      else LOG("nvn: the live shader translator didn't start (error %lu): is Python there? (%s)\n",GetLastError(),py);
 #else
       { extern char** environ; pid_t p; char* av[]={py,"-I",sc,"--dump",dump,"--cache",(char*)cache,"--parent",pid,NULL};
         if(!posix_spawnp(&p,py,NULL,NULL,av,environ)) LOG("nvn: live shader translator started (%s)\n",sc); else LOG("nvn: the live shader translator didn't start: is python3 there?\n"); }

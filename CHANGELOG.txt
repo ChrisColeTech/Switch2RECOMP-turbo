@@ -1,5 +1,22 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Game builds deploy the bundled Vulkan shader tools independently of development-only NVN library artifacts.
+- Portable setup now installs and probes the matching GCC C++ frontend needed by runtime C++ sources; GCC 16 builds
+  also include the standard math declarations required by the Windows platform code.
+- Windows accepts native PlayStation and other HID game controllers through WinMM when no XInput controller is
+  connected, including sticks, triggers, D-pad, hot-plug detection, and positional button mapping.
+- Switch 2 video-decoder command 3 returns a real submission-ready event instead of handle zero, preventing games
+  from aborting in `InterProcessEventImplByHorizon::Clear` when a movie starts.
+- Windows executables request the high-performance GPU on hybrid systems instead of silently running demanding
+  Switch 2 graphics on the integrated adapter.
+- NVN builds prefer the repository's current vendored Vulkan headers over an older installed Vulkan SDK.
+- Runtime builds link the C++ standard library when the optional NVN Vulkan layer is present.
+- Generated game settings expose the renderer option instead of documenting a key absent from the rewritten INI.
+- NVN-enabled game builds stage the live shader translator and record their Python interpreter beside the executable,
+  so Vulkan works when the game and source checkout are on different drives.
+- The staged shader translator includes its NVN ABI header instead of assuming the repository exists beside it.
+- The live shader helper monitors its parent safely on Windows with a synchronization handle, and supports --once
+  for bounded translation of existing dumps. Verified Bananza's Vulkan title screen after staging its shader tools.
 - Install.bat and Install.sh work again: the release builds were missing the tool folder (get_deps.py).
 - A newer Mario Kart World version passed a NULL device to NvRmGpuDeviceChooseKind on its first GPU memory
   allocation and crashed at boot. The runtime gives it the GPU device it made at startup.

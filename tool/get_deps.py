@@ -2,7 +2,7 @@
 # Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
 # Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
 # downloads what SwitchRecomp needs and doesn't come in the package, into the SwitchRecomp folder (no admin, no
-# password, nothing installed on the system): GCC from conda-forge into gcc/, and on linux SDL2 into lib/ (from the
+# password, nothing installed on the system): GCC/G++ from conda-forge into gcc/, and on linux SDL2 into lib/ (from the
 # pysdl2-dll wheel on PyPI). started by Install.bat (windows, after it got python) or Install.sh (linux).
 #   get_deps.py           everything that's missing
 #   get_deps.py gcc|sdl   only that
@@ -19,6 +19,7 @@ CC = os.path.join(DEST, 'Library', 'bin', 'x86_64-w64-mingw32-gcc.exe') if WIN e
 WIN_PKGS = {
     'win-64/gcc_win-64-16.2.0-h5d11a75_2.conda': '11175ab515a5c7285d1cc91c48727dfb82785d7e8bcf8094b2600a0c415ecba8',
     'win-64/gcc_impl_win-64-16.2.0-h94e87e1_7.conda': '795d89968b7e67745360ff57ebc84dcae51dac2cbd4b4861be2523dbab97b71c',
+    'win-64/gxx_impl_win-64-16.2.0-hdbe55fc_7.conda': 'a9ee571df9ca3ec7ac8ec85916a12615e7c5ab0740d17f930abfb8730528935c',
     'win-64/binutils_win-64-2.46.1-default_hd1c8def_103.conda': '85a13f3a1d16b771cdf39715470789eb43981f2900ea5b4bbb0ef90b5301f2e3',
     'noarch/m2w64-sysroot_win-64-12.0.0.r4.gg4f2fc60ca-hd8ed1ab_10.conda': 'fb0ffe6b3c25189038c29abbd1fac2522d87fe2775a09e5f5088e5542dc3309b',
     'win-64/gendef-v12.0.0.r1.ggdc42231f0-he1bec0e_2.conda': 'ab5e10c99bff6ed9482c7293e2d8231d494756f81bebddfc42109c9d47c64385',
@@ -42,6 +43,7 @@ LINUX_PKGS = {
     'linux-64/gcc_linux-64-16.2.0-h0ab548f_2.conda': 'b9817e310019a9c8b79e46335c87e478c7646d2fcc727cc53bb5a3e8ce276c1d',
     'noarch/tzdata-2026e-h5d301ff_0.conda': '2b7ca858879f183ce2dcc65b300f48a0133d5430550f35b23d80d405a0788dbf',
     'linux-64/gcc_impl_linux-64-16.2.0-h9891192_7.conda': '14acaa661e4c4ef6c65606612b8b08f8f079c6a9e6da3ffcb77056685c675651',
+    'linux-64/gxx_impl_linux-64-16.2.0-h0d273dc_7.conda': 'f873532a86ce9073a7255dec909472c2a271a57db938f383b630a3caa0b47709',
     'linux-64/binutils_linux-64-2.46.1-default_h4852527_103.conda': '606a42c754752fb905fe2012d52ff370d47b5b6adefd5f7befc4ec30ce758f23',
     'linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_103.conda': '98f9ddc6dc5d56a824b7eaea5bab6ad4bb47642288fc70d6b1b4024ac39d5595',
     'linux-64/libgcc-16.2.0-ha9f2e26_7.conda': 'e031634c3a928f9594eba868bc46ef5230d6571a364a0c63215b06c4563bfcea',
@@ -182,7 +184,7 @@ def works():
     if not os.path.isfile(CC): return False
     d = tempfile.mkdtemp()
     try:
-        c = os.path.join(d, 't.c'); open(c, 'w').write('int swr_test(int x){ return x*3; }\n')
+        c = os.path.join(d, 't.cpp'); open(c, 'w').write('extern "C" int swr_test(int x){ return x*3; }\n')
         o = os.path.join(d, 't.dll' if WIN else 't.so')
         env = dict(os.environ)
         if WIN: env['PATH'] = os.path.join(DEST, 'Library', 'bin') + os.pathsep + env.get('PATH', '')
@@ -238,7 +240,7 @@ def install_gcc(force=False):
         print('  already there\n'); return 0
     if not force and system_gcc():
         print('  the system has gcc (%s), using that one\n' % shutil.which('gcc')); return 0
-    print('  downloading GCC 16.2 into %s (about %d MB, once)' % (DEST, 110 if WIN else 175))
+    print('  downloading GCC 16.2 into %s (about %d MB, once)' % (DEST, 125 if WIN else 190))
     os.makedirs(DEST, exist_ok=True)
     total = len(PKGS)
     try:

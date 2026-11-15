@@ -1,7 +1,7 @@
 /* SwitchRecomp - Copyright 2026 MZ Labs
    Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
-/* win32 backend: window, WGL, keyboard, XInput.
+/* win32 backend: window, WGL, keyboard, XInput and native Windows joystick input.
    F1 help  F3 screenshot  F4 fps limit  F11 fullscreen  Esc quit */
 #include "rt.h"
 #include "audio.h"
@@ -75,10 +75,62 @@ typedef struct { DWORD dwPacketNumber; XGP Gamepad; } XST;
 
 typedef DWORD (WINAPI *XGetState)(DWORD, XST*);
 static XGetState xget;
+static UINT g_joy_id=UINT_MAX; static JOYCAPSA g_joy_caps; static u64 g_joy_next_scan; static int g_pad_source;
+static i32 dz(i32 v);
 
 static void xinput_load(void){
   const char* dl[]={"xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"};
   for(int i=0;i<3 && !xget;i++){ HMODULE h=LoadLibraryA(dl[i]); if(h) xget=(XGetState)GetProcAddress(h,"XInputGetState"); }
+}
+
+static i32 joy_axis(DWORD value,DWORD min,DWORD max,int invert){
+  if(max<=min) return 0; i64 middle=((i64)min+max)/2,span=((i64)max-min)/2;
+  i64 out=((i64)value-middle)*32767/span; if(out>32767) out=32767; if(out< -32767) out=-32767;
+  if(invert) out=-out; return (i32)out;
+}
+
+static int joy_open(void){
+  JOYINFOEX state; memset(&state,0,sizeof state); state.dwSize=sizeof state; state.dwFlags=JOY_RETURNALL;
+  UINT count=joyGetNumDevs();
+  for(UINT id=0;id<count;id++) if(joyGetPosEx(id,&state)==JOYERR_NOERROR){ JOYCAPSA caps; memset(&caps,0,sizeof caps);
+      if(joyGetDevCapsA(id,&caps,sizeof caps)!=JOYERR_NOERROR) continue; g_joy_id=id; g_joy_caps=caps; return 1; }
+  return 0;
+}
+
+static int joy_poll(u64* buttons,i32* lx,i32* ly,i32* rx,i32* ry){
+  JOYINFOEX state; memset(&state,0,sizeof state); state.dwSize=sizeof state; state.dwFlags=JOY_RETURNALL;
+  if(g_joy_id==UINT_MAX){ u64 now=plat_ns(); if(now<g_joy_next_scan) return 0; g_joy_next_scan=now+1000000000ull; if(!joy_open()) return 0; }
+  if(joyGetPosEx(g_joy_id,&state)!=JOYERR_NOERROR){ g_joy_id=UINT_MAX; return 0; }
+  DWORD x=state.dwButtons;
+  /* DirectInput/WinMM numbers PlayStation face buttons square, cross, circle, triangle. Map by physical position. */
+  if(x&(1u<<2)) *buttons|=1ull<<0; if(x&(1u<<1)) *buttons|=1ull<<1;
+  if(x&(1u<<3)) *buttons|=1ull<<2; if(x&(1u<<0)) *buttons|=1ull<<3;
+  if(x&(1u<<4)) *buttons|=1ull<<4; if(x&(1u<<5)) *buttons|=1ull<<5;
+  if(x&(1u<<10)) *buttons|=1ull<<6; if(x&(1u<<11)) *buttons|=1ull<<7;
+  if(x&(1u<<6)) *buttons|=1ull<<8; if(x&(1u<<7)) *buttons|=1ull<<9;
+  if(x&(1u<<8)) *buttons|=1ull<<10; if(x&(1u<<9)) *buttons|=1ull<<11;
+  if(state.dwPOV!=JOY_POVCENTERED){ DWORD pov=state.dwPOV;
+    if(pov>=31500 || pov<=4500) *buttons|=1ull<<13;
+    if(pov>=4500 && pov<=13500) *buttons|=1ull<<14;
+    if(pov>=13500 && pov<=22500) *buttons|=1ull<<15;
+    if(pov>=22500 && pov<=31500) *buttons|=1ull<<12; }
+  i32 left_x=dz(joy_axis(state.dwXpos,g_joy_caps.wXmin,g_joy_caps.wXmax,0));
+  i32 left_y=dz(joy_axis(state.dwYpos,g_joy_caps.wYmin,g_joy_caps.wYmax,1));
+  /* Sony's DirectInput layout exposes the right stick as Z / R and the analog triggers as U / V. */
+  i32 right_x=dz(joy_axis(state.dwZpos,g_joy_caps.wZmin,g_joy_caps.wZmax,0));
+  i32 right_y=dz(joy_axis(state.dwRpos,g_joy_caps.wRmin,g_joy_caps.wRmax,1));
+  if(!*lx && !*ly){ *lx=left_x; *ly=left_y; }
+  if(!*rx && !*ry){ *rx=right_x; *ry=right_y; }
+  return 1;
+}
+
+static void pad_source(int source){
+  if(source==g_pad_source) return;
+  if(source==1) LOG("controllers: XInput controller connected\n");
+  else if(source==2) LOG("controllers: native Windows controller connected (vendor %04x product %04x, %u axes, %u buttons)\n",
+    g_joy_caps.wMid,g_joy_caps.wPid,g_joy_caps.wNumAxes,g_joy_caps.wNumButtons);
+  else if(g_pad_source) LOG("controllers: disconnected\n");
+  g_pad_source=source;
 }
 
 static void set_fullscreen(int on){
@@ -379,6 +431,7 @@ void video_poll(void){
     }
     rx=(g_mouse_invert&1)?-g_mouse_rx:g_mouse_rx; ry=(g_mouse_invert&2)?-g_mouse_ry:g_mouse_ry;
   }
+  int source=0;
   if(xget && focused){
     for(DWORD i=0;i<4;i++){ XST s; if(xget(i,&s)) continue; XGP* g=&s.Gamepad; WORD x=g->wButtons;
       /* map by position like a Switch pad: A right (xbox B), B bottom (xbox A), X top, Y left */
@@ -388,8 +441,10 @@ void video_poll(void){
       if(x&0x0010) b|=1<<10; if(x&0x0020) b|=1<<11;
       if(x&0x0004) b|=1<<12; if(x&0x0001) b|=1<<13; if(x&0x0008) b|=1<<14; if(x&0x0002) b|=1<<15;
       if(!lx&&!ly){ lx=dz(g->sThumbLX); ly=dz(g->sThumbLY); } if(!rx&&!ry){ rx=dz(g->sThumbRX); ry=dz(g->sThumbRY); }
-      break; }
+      source=1; break; }
   }
+  if(focused && !source && joy_poll(&b,&lx,&ly,&rx,&ry)) source=2;
+  if(focused) pad_source(source);
   /* stick-as-button bits 16..23 */
   if(lx<-16000) b|=1ull<<16; if(ly>16000) b|=1ull<<17; if(lx>16000) b|=1ull<<18; if(ly<-16000) b|=1ull<<19;
   if(rx<-16000) b|=1ull<<20; if(ry>16000) b|=1ull<<21; if(rx>16000) b|=1ull<<22; if(ry<-16000) b|=1ull<<23;

@@ -20,6 +20,37 @@ import nxs_front as F, nxs_cache as C, nxshader as N
 SPH_STAGE = {1: 'vs', 2: 'hs', 3: 'ds', 4: 'gs', 5: 'ps'}
 
 
+class ParentProcess:
+    """Hold the Windows process handle so PID reuse cannot extend a helper's lifetime."""
+    def __init__(self, pid):
+        self.pid, self.handle = pid, None
+        if pid and os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            self.kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            self.kernel.OpenProcess.restype = wintypes.HANDLE
+            self.kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+            self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            self.kernel.CloseHandle.restype = wintypes.BOOL
+            self.handle = self.kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+
+    def alive(self):
+        if not self.pid: return True
+        if os.name == 'nt':
+            return bool(self.handle) and self.kernel.WaitForSingleObject(self.handle, 0) == 258
+        try: os.kill(self.pid, 0)
+        except ProcessLookupError: return False
+        except PermissionError: return True
+        return True
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
 def stage_of(ctl, code):
     """nxnative shader_split.py nvn2_stage / sph_stage (MIT): compute, task and mesh by the control's stage byte (+0x56),
     else the graphics SPH word 0 of the code area"""
@@ -57,7 +88,9 @@ def main():
     ap.add_argument('--dump', required=True); ap.add_argument('--cache', required=True)
     ap.add_argument('--xlate', default=os.path.join(HERE, 'xlate_bin')); ap.add_argument('--dotnet', default='dotnet')
     ap.add_argument('--facts'); ap.add_argument('--parent', type=int, default=0); ap.add_argument('--batch', type=int, default=48)
+    ap.add_argument('--once', action='store_true', help='translate the current dump set and exit')
     a = ap.parse_args()
+    if a.batch < 1: ap.error('--batch must be positive')
     os.makedirs(a.dump, exist_ok=True); os.makedirs(os.path.join(a.cache, 'vk'), exist_ok=True)
     log = open(os.path.join(a.cache, 'nxs_live.log'), 'a', buffering=1)
     say = lambda s: log.write(time.strftime('%H:%M:%S ') + s + '\n')
@@ -70,16 +103,18 @@ def main():
     say('ready: translator %s, chain %s, dumps %s' % (xl.id, b.chain, a.dump))
     done = set(k[:-5] for k in os.listdir(os.path.join(a.cache, 'vk')) if k.endswith('.json'))
     failed = set()
+    parent = ParentProcess(a.parent)
     try:
         while True:
-            if a.parent:
-                try: os.kill(a.parent, 0)
-                except OSError: break
+            if not parent.alive(): break
             keys = sorted(f[:-4] for f in os.listdir(a.dump) if f.endswith('.ctl') and len(f) == 20)
             todo = [k for k in keys if k not in done and k not in failed and os.path.exists(os.path.join(a.dump, k + '.code'))]
-            if not todo: time.sleep(0.05); continue
+            if not todo:
+                if a.once: break
+                time.sleep(0.05); continue
             time.sleep(0.03)   # the shaders of one pipeline arrive together: one translator run for them
             for i in range(0, len(todo), a.batch):
+                if not parent.alive(): break
                 part = todo[i:i + a.batch]; t0 = time.time()
                 try: out = b.make(part)
                 except Exception: say(traceback.format_exc()); out = {k: {'status': 'failed'} for k in part}
@@ -88,8 +123,12 @@ def main():
                     if r.get('status') == 'ok': done.add(k)
                     else: failed.add(k); say('%s: %s %s' % (k, r.get('status'), r.get('error', '')))
                 say('%d translated in %.2f s (%d failed)' % (len(ok), time.time() - t0, len(part) - len(ok)))
-    finally: shutil.rmtree(w, ignore_errors=True)
-    return 0
+            if a.once: break
+    finally:
+        parent.close()
+        shutil.rmtree(w, ignore_errors=True)
+        log.close()
+    return 1 if a.once and failed else 0
 
 
 if __name__ == '__main__':

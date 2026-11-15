@@ -7,6 +7,7 @@ import nxs_spv as S
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ABI_H = os.path.join(HERE, '..', '..', 'runtime', 'nvn', 'gfx', 'dmsh_abi.h')
+if not os.path.isfile(ABI_H): ABI_H = os.path.join(HERE, 'dmsh_abi.h')
 _DEFINE = re.compile(r'#define DMSH_([A-Z][A-Z0-9_]*)[ \t]+(0x[0-9A-Fa-f]+|[1-9][0-9]*|0|"[^"\\]*")(?:[ \t]+//.*)?')
 
 

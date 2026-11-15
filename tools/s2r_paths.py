@@ -47,7 +47,9 @@ def glslang():
 
 
 def vulkan_include():
-    return _first(ext('deps', 'Vulkan-Headers', 'include'), os.path.join(VULKAN_SDK, 'Include') if VULKAN_SDK else None)
+    return _first(ext('deps', 'Vulkan-Headers', 'include'),
+                  os.path.join(ROOT, 'runtime', 'edenvk', 'deps', 'vulkan-headers', 'include'),
+                  os.path.join(VULKAN_SDK, 'Include') if VULKAN_SDK else None)
 
 
 def spirv_tool(name):

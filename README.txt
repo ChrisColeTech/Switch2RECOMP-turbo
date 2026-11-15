@@ -78,6 +78,8 @@ notice) that the recompiler and every recompiled game show when they start.
 
   Controls
     Xbox / XInput controller: same as the Switch one, by position.
+    PlayStation and other Windows game controllers: native WinMM fallback, no
+      controller-emulation software required. Buttons are mapped by position.
     Keyboard: Arrows = D-Pad, WASD = left stick, IJKL = right stick,
               X/Space = A, Z = B, C = X, V = Y, Q = L, E = R, 1 = ZL, 3 = ZR,
               Enter = +, Backspace = -
