@@ -238,8 +238,7 @@ class Module:
         return enc
 
 
-def load_nso(path, name=None):
-    d = open(path, 'rb').read()
+def load_nso_data(d, path='<memory>', name=None):
     if d[:4] != b'NSO0':
         raise ValueError('%s is not NSO0' % path)
     flags = struct.unpack_from('<I', d, 0xC)[0]
@@ -264,8 +263,11 @@ def load_nso(path, name=None):
                   (segs[2][1], segs[2][2]), bss, d[0x40:0x60].rstrip(b'\0'))
 
 
-def load_nro(path):
-    d = open(path, 'rb').read()
+def load_nso(path, name=None):
+    return load_nso_data(open(path, 'rb').read(), path, name)
+
+
+def load_nro_data(d, path='<memory>'):
     if d[0x10:0x14] != b'NRO0':
         raise ValueError('%s is not NRO0' % path)
     size = struct.unpack_from('<I', d, 0x18)[0]
@@ -276,6 +278,10 @@ def load_nro(path):
     m.nro = True
     m.asset = d[size:]          # icon / nacp / embedded romfs
     return m
+
+
+def load_nro(path):
+    return load_nro_data(open(path, 'rb').read(), path)
 
 
 def nro_asset(m, which):
@@ -306,12 +312,22 @@ def romfs_nros(romfs):
     compiled with the rest at fixed bases and the runtime puts each one there when the game loads
     it (matched by build id)"""
     out = []
+    if hasattr(romfs, 'walk_files'):
+        for relative, node in romfs.walk_files():
+            if not relative.lower().endswith('.nro') or node.size > 256 << 20: continue
+            data = romfs.read(node)
+            if data[0x10:0x14] != b'NRO0': continue
+            m = load_nro_data(data, romfs.path + '/' + relative)
+            m.name = 'romfs/' + relative.replace('"', '')
+            m.deferred = True
+            out.append(m)
+        return out
     if not isinstance(romfs, str) or not os.path.isdir(romfs): return out
-    for dp, dn, fn in os.walk(romfs):
+    for dp, dn, files in os.walk(romfs):
         dn.sort()
-        for f in sorted(fn):
-            if not f.lower().endswith('.nro'): continue
-            p = os.path.join(dp, f)
+        for filename in sorted(files):
+            if not filename.lower().endswith('.nro'): continue
+            p = os.path.join(dp, filename)
             try:
                 if os.path.getsize(p) > 256 << 20: continue
                 with open(p, 'rb') as fh: hd = fh.read(0x14)
@@ -330,6 +346,20 @@ def load_program(entry):
     mods = []; npdm = None; romfs = None
     if os.path.isfile(entry) and entry.lower().endswith('.nro'):
         m = load_nro(entry); mods = [m]; romfs = nro_romfs(m)
+    elif os.path.isfile(entry):
+        import nup
+        if not nup.is_nup(entry):
+            raise ValueError('%s is not an NRO or NUP file' % entry)
+        package = nup.load(entry)
+        exefs = {name: reader for name, _, reader in package.exefs()}
+        for name in MODULE_ORDER:
+            if name in exefs:
+                mods.append(load_nso_data(exefs[name](), entry + ':' + name, name))
+        if 'main.npdm' in exefs:
+            npdm = exefs['main.npdm']()
+        if not mods:
+            raise ValueError('%s has no loadable ExeFS modules' % entry)
+        romfs = nup.NupRomfs(package)
     else:
         ex = find_exefs(entry)
         if not ex:
@@ -343,7 +373,7 @@ def load_program(entry):
         root = os.path.dirname(ex) if os.path.basename(ex).lower() == 'exefs' else ex
         for c in ('romfs', 'RomFS'):
             if os.path.isdir(os.path.join(root, c)): romfs = os.path.join(root, c)
-        mods += romfs_nros(romfs)
+    mods += romfs_nros(romfs)
     base = CODE_BASE
     for m in mods:
         m.base = base

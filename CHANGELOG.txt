@@ -1,6 +1,11 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
 - Game builds deploy the bundled Vulkan shader tools independently of development-only NVN library artifacts.
+- Indexed Switch 2 NUP packages are direct inputs. ExeFS is materialized for recompilation, while the runtime reads
+  raw and zstd RomFS entries from the original package with a bounded cache; no extracted RomFS copy is required.
+- Multi-title NUPs select the last record with valid ExeFS and RomFS indexes, instead of mistaking trailing auxiliary
+  content for the executable title.
+- Added direct-NUP Windows/Linux build scripts, build and storage guides, and generated Python/C package tests.
 - Portable setup now installs and probes the matching GCC C++ frontend needed by runtime C++ sources; GCC 16 builds
   also include the standard math declarations required by the Windows platform code.
 - Windows accepts native PlayStation and other HID game controllers through WinMM when no XInput controller is

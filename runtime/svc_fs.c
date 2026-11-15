@@ -1,7 +1,7 @@
 /* SwitchRecomp - Copyright 2026 MZ Labs
    Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
-/* fs: RomFS (built on the fly from an extracted romfs/ folder, or a romfs.bin), plus save data and SD card mapped
+/* fs: RomFS (a NUP read in place, an extracted romfs/ folder, or romfs.bin), plus save data and SD card mapped
    to normal folders */
 #include "rt.h"
 #include <ctype.h>
@@ -10,13 +10,14 @@
 #define FS_EXISTS   RC(2,2)
 
 /* ============================================================ RomFS virtual */
-typedef struct { char* path; u64 off, size; int logged; } RFile;
+typedef struct { char* path; u64 off, size; u32 nup; int logged, failed; } RFile;
 
 static size_t g_romdir_len;
 static RFile* rfiles; static int nrfiles;
 static u8* rmeta; static u64 rmeta_size;        /* header + tables sit at the start of the image */
 static u64 rdata_off, rtotal;
 static FILE* rraw;                               /* plain romfs.bin */
+static Nup* rnup;                                /* original NUP package */
 
 char g_romfs_dir_override[1024];
 
@@ -27,7 +28,7 @@ static PMutex g_romlock;
 
 typedef struct DNode { char* name; int parent; int first_child, next_sib, first_file; u32 off; } DNode;
 
-typedef struct FNode { char* name; int parent, next_sib; u32 off; u64 size; char* host; } FNode;
+typedef struct FNode { char* name; int parent, next_sib; u32 off, nup; u64 size; char* host; } FNode;
 
 static DNode* dn; static int ndn, capdn; static FNode* fn; static int nfn, capfn;
 
@@ -35,7 +36,7 @@ static int add_dir(const char* name, int parent){ if(ndn==capdn){ capdn=capdn?ca
   DNode* d=&dn[ndn]; d->name=strdup(name); d->parent=parent; d->first_child=-1; d->next_sib=-1; d->first_file=-1; return ndn++; }
 
 static int add_file(const char* name, int parent, u64 size, const char* host){ if(nfn==capfn){ capfn=capfn?capfn*2:1024; fn=realloc(fn,sizeof(FNode)*capfn); }
-  FNode* f=&fn[nfn]; f->name=strdup(name); f->parent=parent; f->next_sib=-1; f->size=size; f->host=strdup(host); return nfn++; }
+  FNode* f=&fn[nfn]; f->name=strdup(name); f->parent=parent; f->next_sib=-1; f->size=size; f->host=strdup(host); f->nup=0xFFFFFFFFu; return nfn++; }
 
 static int cmpname(const void* a, const void* b){ return strcmp(*(char* const*)a,*(char* const*)b); }
 
@@ -66,9 +67,7 @@ static u32 hcount(u32 n){ if(n<3) return 3; if(n<19) return n|1; u32 c=n; while(
 
 static int rf_cmp(const void* a, const void* b){ const RFile* x=a,*y=b; return x->off<y->off? -1 : x->off>y->off; }
 
-static void romfs_build(const char* dir){
-  add_dir("",0); dn[0].parent=0; g_romdir_len=strlen(dir);
-  scan(dir,0);
+static void romfs_emit(void){
   /* table offsets */
   u32 doff=0; for(int i=0;i<ndn;i++){ dn[i].off=doff; doff+=0x18+((strlen(dn[i].name)+3)&~3u); }
   u32 foff=0; for(int i=0;i<nfn;i++){ fn[i].off=foff; foff+=0x20+((strlen(fn[i].name)+3)&~3u); }
@@ -84,7 +83,7 @@ static void romfs_build(const char* dir){
   for(int i=0;i<nfn;i++){ fn[i].size=fn[i].size; data=(data+0xF)&~0xFull;
     /* an empty file has the same offset as the next one, if we list it romfs_read finds it instead and reads the
        real file back as padding (zeros). it never gets read anyway */
-    if(fn[i].size){ rfiles[nrfiles].path=fn[i].host; rfiles[nrfiles].off=rdata_off+data; rfiles[nrfiles].size=fn[i].size; nrfiles++; }
+    if(fn[i].size){ rfiles[nrfiles].path=fn[i].host; rfiles[nrfiles].off=rdata_off+data; rfiles[nrfiles].size=fn[i].size; rfiles[nrfiles].nup=fn[i].nup; nrfiles++; }
     u8* e=rmeta+fmt+fn[i].off; u32 w[2]={dn[fn[i].parent].off, fn[i].next_sib>=0? fn[fn[i].next_sib].off : 0xFFFFFFFFu};
     memcpy(e,w,8); memcpy(e+8,&data,8); memcpy(e+16,&fn[i].size,8);
     u32 h=rhash(dn[fn[i].parent].off,fn[i].name)%fhc; u32 nl=(u32)strlen(fn[i].name);
@@ -100,10 +99,44 @@ static void romfs_build(const char* dir){
   LOG("RomFS: %d folders, %d files, %.1f MB\n",ndn,nfn,(double)rtotal/1048576.0);
 }
 
+static void romfs_build(const char* dir){
+  add_dir("",0); dn[0].parent=0; g_romdir_len=strlen(dir); scan(dir,0); romfs_emit();
+}
+
+static int nup_scan(u32 entry,int di,const char* path){
+  u32 first=0,count=0; if(nup_children(rnup,entry,&first,&count)) return -1;
+  for(int pass=0;pass<2;pass++){ int last=-1;
+    for(u32 k=0;k<count;k++){ u32 child=first+k; int is_file=nup_is_file(rnup,child); if(is_file!=(pass==1)) continue;
+      u32 nl=0; const char* raw=nup_name(rnup,child,&nl); if(!raw || nl>0x300) return -1;
+      char name[0x301]; memcpy(name,raw,nl); name[nl]=0; char full[2048]; snprintf(full,sizeof full,"%s/%s",path,name);
+      if(!is_file){ int c=add_dir(name,di); if(last<0) dn[di].first_child=c; else dn[last].next_sib=c; last=c;
+        if(nup_scan(child,c,full)) return -1; }
+      else { int f=add_file(name,di,nup_file_size(rnup,child),full); fn[f].nup=child;
+        if(last<0) dn[di].first_file=f; else fn[last].next_sib=f; last=f; }
+    }
+  }
+  return 0;
+}
+
+static int romfs_build_nup(void){
+  add_dir("",0); dn[0].parent=0; g_romdir_len=5;
+  if(nup_scan(0,0,"romfs")) return -1;
+  romfs_emit(); return 0;
+}
+
 void romfs_init(void){
   pm_init(&g_romlock);
   char p[1200];
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
+  char nup_path[2048]={0}; const char* override=getenv("SWR_ROMFS_NUP");
+  if(override && override[0]){ strncpy(nup_path,override,sizeof nup_path-1); }
+  else { snprintf(p,sizeof p,"%sromfs.nup",g_datadir); FILE* marker=fopen(p,"rb");
+    if(marker){ if(!fgets(nup_path,sizeof nup_path,marker)) nup_path[0]=0; fclose(marker);
+      size_t l=strlen(nup_path); while(l && isspace((unsigned char)nup_path[l-1])) nup_path[--l]=0; } }
+  if(nup_path[0]){ rnup=nup_open(nup_path);
+    if(rnup && !romfs_build_nup()){ LOG("RomFS: NUP %s (read in place)\n",nup_path); return; }
+    if(rnup){ nup_close(rnup); rnup=NULL; }
+    WARN("RomFS: cannot open NUP %s\n",nup_path); }
   snprintf(p,sizeof p,"%sromfs.bin",g_datadir); rraw=fopen(p,"rb");
   if(rraw){ rtotal=plat_file_size(p); LOG("RomFS: image %s (%.1f MB)\n",p,(double)rtotal/1048576.0); return; }
   snprintf(p,sizeof p,"%sromfs",g_datadir);
@@ -112,7 +145,7 @@ void romfs_init(void){
   char q[1200]; snprintf(q,sizeof q,"%sexefs/main.nro",g_datadir);
   if(!plat_file_size(q)){
     char m[1600]; snprintf(m,sizeof m,"The game's romfs is missing (the data: models, textures, sound).\n\n"
-      "Extract it with hactool (--romfsdir=romfs) and copy the folder to:\n%s\n\nThe game will close when it tries to read its data.",p);
+      "Provide the original NUP through romfs.nup, or extract with hactool (--romfsdir=romfs) and copy the folder to:\n%s\n\nThe game will close when it tries to read its data.",p);
 #if defined(_WIN32)
     extern void win_fatal_box(const char*); win_fatal_box(m);
 #else
@@ -150,8 +183,10 @@ int romfs_read(u64 off, void* dst, u64 size){
     { extern void vp9_note_file(const char* path); vp9_note_file(f->path); }
 #endif
     if(!f->logged){ f->logged=1; LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0); }
-    FILE* fp=rf_open(f->path);
-    if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n){ memset(d,0,n); }
+    if(f->nup!=0xFFFFFFFFu){ if(nup_pread(rnup,f->nup,d,n,off-f->off)){
+        if(!f->failed){ f->failed=1; WARN("RomFS: NUP read failed for %s\n",f->path+g_romdir_len); }
+        pm_unlock(&g_romlock); return -1; } }
+    else { FILE* fp=rf_open(f->path); if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n) memset(d,0,n); }
     d+=n; off+=n; size-=n;
   }
   pm_unlock(&g_romlock);
@@ -163,7 +198,7 @@ static int romstorage(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
       if(off>rtotal) return RC(2,6001); if(off+sz>rtotal) sz=rtotal-off;
-      romfs_read(off,GP(a),sz); return 0; }
+      if(romfs_read(off,GP(a),sz)) return RC(2,6001); return 0; }
     case 4: out64(c,rtotal); return 0;
     case 1: case 2: case 3: return RC(2,6300);
     case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }

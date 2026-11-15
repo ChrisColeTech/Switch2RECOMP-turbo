@@ -75,10 +75,12 @@ The results go to `bin/`.
 
 ```sh
 python3 switchrecomp.py /path/to/game -o MyGame
+python3 switchrecomp.py /path/to/game.nup -o MyGame
 ```
 
-`/path/to/game` holds the `exefs/` and `romfs/` folders extracted from a legally owned copy. `README.txt` has the
-full steps and the options.
+`/path/to/game` may hold extracted `exefs/` and `romfs/` folders, or the input may be an indexed Switch 2 `.nup`
+package. With a NUP, only ExeFS is materialized; the runtime reads RomFS directly from the original package. See
+`docs/NUP_IN_PLACE.md`, `docs/BUILD_ENVIRONMENT_GUIDE.md`, and `README.txt` for the full steps and options.
 
 ## License
 

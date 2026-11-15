@@ -10,6 +10,7 @@ instruction templates). The runtime provides HLE kernel/services and a GL render
 
 Usage:
   python switchrecomp.py GAME_FOLDER                   (with exefs/ and romfs/ from hactool)
+  python switchrecomp.py game.nup                      (ExeFS materialized, RomFS read in place)
   python switchrecomp.py game.nro                      (homebrew)
   python switchrecomp.py FOLDER -o Game --cc gcc -O 2 --jobs 8
 
@@ -30,7 +31,7 @@ import nxloader, codegen
 
 RT = os.path.join(HERE, 'runtime')
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'svc_ns2', 'sm86', 'gpu', 'gpu_engines',
-               'gpu_3d', 'loader', 'main', 'nvn_hook', 'nvn_glue']
+               'gpu_3d', 'loader', 'main', 'nup', 'nvn_hook', 'nvn_glue']
 ABI = 1
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
 CC_DIRS = [os.path.join(HERE, *d) for d in (('tcc',), ('tools', 'tcc'), ('gcc', 'bin'), ('gcc', 'Library', 'bin'),
@@ -278,6 +279,12 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     gl = backend != 'headless'
     extra = ['gpu_gl', 'gl_load', 'shader', 'shader_proc', 'astc', 'glq', 'glq_gen'] if gl else ['gpu_nogl', 'shader_proc']
     srcs = [os.path.join(RT, s + '.c') for s in RUNTIME_SRC + extra] + [os.path.join(RT, 'backend_%s.c' % backend), os.path.join(RT, 'entry.c')]
+    zstd = os.path.join(RT, 'edenvk', 'deps', 'zstd', 'lib')
+    srcs += [os.path.join(zstd, folder, name) for folder, name in (
+        ('common', 'entropy_common.c'), ('common', 'error_private.c'), ('common', 'fse_decompress.c'),
+        ('common', 'xxhash.c'), ('common', 'zstd_common.c'), ('decompress', 'huf_decompress.c'),
+        ('decompress', 'zstd_ddict.c'), ('decompress', 'zstd_decompress.c'),
+        ('decompress', 'zstd_decompress_block.c'))]
     if gl: srcs += [os.path.join(RT, 'bcn', 'bcn.cpp'), os.path.join(RT, 'bcn', 'bcdec.cpp')]
     # LSFG (uses the user's Lossless.dll), desktop GL only
     spvc = None
@@ -306,7 +313,9 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     # VP9 WebM movies: indexed from RomFS and decoded with libvpx (BSD), linked when runtime/vp9/<os>/libvpx.a exists
     vp = os.path.join(RT, 'vp9', 'win' if target_win else 'lin')
     vp9 = os.path.isfile(os.path.join(vp, 'libvpx.a')) and backend in ('win32', 'x11', 'headless')
-    cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
+    cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S',
+        '-DZSTD_DISABLE_ASM=1', '-DXXH_NAMESPACE=ZSTD_', '-I', RT, '-I', zstd, '-I', os.path.join(RT, 'bcn'),
+        '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
     if target_win and backend == 'win32': cmd += ['-DSWR_RECORD_AUDIO']
     if not h264: cmd += ['-DSWR_NO_H264']
     if not opus: cmd += ['-DSWR_NO_OPUS']
@@ -374,15 +383,41 @@ def sync_tree(src, dst):
 
 def copy_data(mods, npdm, romfs, entry, datadir, say):
     ex = os.path.join(datadir, 'exefs'); os.makedirs(ex, exist_ok=True)
+    nup_marker = os.path.join(datadir, 'romfs.nup')
+    romfs_image = os.path.join(datadir, 'romfs.bin')
     if os.path.isfile(entry) and entry.lower().endswith('.nro'):
+        if os.path.exists(nup_marker): os.remove(nup_marker)
         shutil.copyfile(entry, os.path.join(ex, 'main.nro'))
         if isinstance(romfs, (bytes, bytearray)):
-            with open(os.path.join(datadir, 'romfs.bin'), 'wb') as fo: fo.write(romfs)
+            with open(romfs_image, 'wb') as fo: fo.write(romfs)
+        elif os.path.exists(romfs_image):
+            os.remove(romfs_image)
         # icon and title for the tool
         for which, name in ((0, 'icon.jpg'), (1, 'control.nacp')):
             blob = nxloader.nro_asset(mods[0], which)
             if blob: open(os.path.join(datadir, name), 'wb').write(blob)
         return
+    if hasattr(romfs, 'nup'):
+        if os.path.exists(romfs_image): os.remove(romfs_image)
+        for name, _, reader in romfs.nup.exefs():
+            base = name.rstrip(' .').split('.', 1)[0].upper()
+            reserved = {'CON', 'PRN', 'AUX', 'NUL'} | {'COM%d' % i for i in range(1, 10)} | {'LPT%d' % i for i in range(1, 10)}
+            if (not name or name != name.rstrip(' .') or any(ch in name for ch in '/\\:')
+                    or name in ('.', '..') or base in reserved):
+                raise ValueError('unsafe ExeFS name in %s: %r' % (romfs.path, name))
+            dst = os.path.join(ex, name)
+            data = reader()
+            current = None
+            if os.path.isfile(dst):
+                with open(dst, 'rb') as fileobj: current = fileobj.read()
+            if current != data:
+                with open(dst, 'wb') as fileobj: fileobj.write(data)
+        with open(nup_marker, 'w', encoding='utf-8', newline='\n') as fileobj:
+            fileobj.write(os.path.abspath(romfs.path) + '\n')
+        say('RomFS: using %s in place' % romfs.path)
+        return
+    if os.path.exists(nup_marker): os.remove(nup_marker)
+    if os.path.exists(romfs_image): os.remove(romfs_image)
     # compare contents, not sizes: after a game update main.npdm (and sometimes an NSO) keeps its
     # size, and the runtime refuses an NSO whose build id differs from the recompiled one
     src = nxloader.find_exefs(entry)
@@ -438,7 +473,7 @@ language=1
 
 def main():
     ap = argparse.ArgumentParser(description='Recompiles a Switch game into a native executable.')
-    ap.add_argument('input', nargs='?', help='game folder (exefs/ + romfs/) or .nro file')
+    ap.add_argument('input', nargs='?', help='game folder (exefs/ + romfs/), .nup package or .nro file')
     ap.add_argument('-o', '--out', help='output name (no extension)')
     ap.add_argument('--outdir', help='output folder')
     ap.add_argument('--cc', help='C compiler (gcc, clang, tcc, x86_64-w64-mingw32-gcc)')
@@ -468,7 +503,7 @@ def main():
         build_runtime(cc, out, target_win, backend, say, a.O)
         say('Done: %s' % out)
         return
-    if not a.input: ap.error('the game folder or .nro file is required')
+    if not a.input: ap.error('the game folder, .nup package or .nro file is required')
     # check the compiler first, not after minutes of translation
     cc = None
     if not a.no_build:

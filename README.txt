@@ -6,7 +6,8 @@ SwitchRecomp - static recompiler for Nintendo Switch games (ARM64 -> C -> native
 
 Same idea as GBRecomp / PSXRecomp: the game CODE (exefs) is translated to C once
 and compiled to a native Windows program. The game DATA (romfs: models, textures,
-music) is not compiled: the game reads it as is from the GAME_data\romfs folder.
+music) is not compiled: the game reads it from GAME_data\romfs or directly from
+the original NUP package.
 
 Use only your own copy of the game. No games, keys or firmware are included.
 
@@ -29,6 +30,10 @@ notice) that the recompiler and every recompiled game show when they start.
      With an update, extract the combined romfs:
         hactool -k prod.keys --basenca=base.nca --exefsdir=exefs --romfsdir=romfs  update.nca
      You end up with a folder that has exefs\ and romfs\ inside.
+
+     Switch 2 indexed NUP dumps can instead be used directly. RomFS stays in the
+     package; see docs\NUP_IN_PLACE.md. From a terminal:
+        scripts\build-from-nup.bat "D:\Games\Game.nup" --outdir "D:\Games\Game-build"
 
   b) Open SwitchRecomp.exe. It looks like the Switch HOME menu and works with
      the mouse (also keyboard: arrows + Enter / Esc, or a controller).
@@ -55,6 +60,7 @@ notice) that the recompiler and every recompiled game show when they start.
 
   Command line:
      python\python.exe switchrecomp.py C:\path\to\game -o MyGame
+     scripts\build-from-nup.bat C:\path\to\game.nup --outdir C:\Games\MyGame-build -o MyGame
      python\python.exe switchrecomp.py homebrew.nro
      Options: --native (optimize for your CPU)  -O 3  --jobs N  --cc tcc
 
@@ -64,7 +70,7 @@ notice) that the recompiler and every recompiled game show when they start.
   Output:
      MyGame.exe          the runtime (kernel, services, GPU -> OpenGL, video)
      MyGame_code.dll     the game code translated to x86-64
-     MyGame_data\        exefs\ + romfs\ + save data
+     MyGame_data\        exefs\ + romfs\ or romfs.nup + save data
      MyGame.ini          options
 
   The exe and the dll must come from the same game version. If you update the
@@ -134,4 +140,3 @@ Third-party components
 
   The AGPL v3 in LICENSE.txt covers the SwitchRecomp code. Each component
   above keeps its own license.
-

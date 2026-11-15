@@ -24,6 +24,7 @@ echo.
 "%PY%" -u -I "tool\get_deps.py"
 if errorlevel 1 goto failed
 echo.
+if defined SWR_NO_PAUSE exit /b 0
 echo This window closes by itself in 15 seconds.
 timeout /t 15 >nul
 exit /b 0

@@ -3,7 +3,7 @@
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
 /* SwitchRecomp tool: the recompiler's front end and the place to play the games, drawn like the console's HOME
    menu but made for the PC: mouse first, keyboard and controller too.
-   - recompiles a dump (exefs/ + romfs/) into games\
+   - recompiles a dump (exefs/ + romfs/), NUP or NRO into games\
    - puts the latest runtime (bin\runtime_win64_win32.exe) into every game already made
    - edits each game's options (the .ini) and starts it
    build: see build_tool.sh */
@@ -1675,8 +1675,10 @@ static void recompile(const char *src)
 {
     char ex[MAX_PATH];
     snprintf(ex, sizeof ex, "%s\\exefs", src);
-    if (!file_exists(ex) && !(strlen(src) > 4 && !_stricmp(src + strlen(src) - 4, ".nro"))) {
-        dialog_open(DLG_INFO, "That folder has no exefs inside.", "Pick the folder that has exefs and romfs (extracted with hactool).", "OK", NULL);
+    size_t n = strlen(src);
+    int package = n > 4 && (!_stricmp(src + n - 4, ".nro") || !_stricmp(src + n - 4, ".nup"));
+    if (!file_exists(ex) && !package) {
+        dialog_open(DLG_INFO, "That input has no exefs inside.", "Pick an extracted game folder, NUP package, or NRO.", "OK", NULL);
         return;
     }
     job_start(src);
