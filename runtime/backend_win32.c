@@ -78,9 +78,48 @@ static XGetState xget;
 static UINT g_joy_id=UINT_MAX; static JOYCAPSA g_joy_caps; static u64 g_joy_next_scan; static int g_pad_source;
 static i32 dz(i32 v);
 
+/* ---------------------------------------------------------------- vibration (XInputSetState) */
+typedef struct { WORD wLeftMotorSpeed, wRightMotorSpeed; } XVIB;
+typedef DWORD (WINAPI *XSetState)(DWORD, XVIB*);
+static XSetState xset;
+static DWORD g_xuser=(DWORD)~0;                    /* the XInput user index that owns input */
+static volatile LONG g_vib_dirty; static WORD g_vib_left,g_vib_right; static u64 g_vib_last;
+static CRITICAL_SECTION g_vib_lock;
+
 static void xinput_load(void){
   const char* dl[]={"xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"};
-  for(int i=0;i<3 && !xget;i++){ HMODULE h=LoadLibraryA(dl[i]); if(h) xget=(XGetState)GetProcAddress(h,"XInputGetState"); }
+  for(int i=0;i<3 && !xget;i++){ HMODULE h=LoadLibraryA(dl[i]); if(h){ xget=(XGetState)GetProcAddress(h,"XInputGetState");
+    if(!xset) xset=(XSetState)GetProcAddress(h,"XInputSetState"); if(xget) break; } }
+}
+
+void backend_vibration_set(float low,float high){
+  if(!xset) return;
+  WORD l=(WORD)(low*65535.0f+0.5f),r=(WORD)(high*65535.0f+0.5f);
+  if(l>65535) l=65535; if(r>65535) r=65535;
+  EnterCriticalSection(&g_vib_lock);
+  if(l!=g_vib_left || r!=g_vib_right){ g_vib_left=l; g_vib_right=r; InterlockedExchange(&g_vib_dirty,1); }
+  LeaveCriticalSection(&g_vib_lock);
+}
+
+void backend_vibration_stop(void){
+  if(!xset) return;
+  EnterCriticalSection(&g_vib_lock);
+  if(g_vib_left || g_vib_right){ g_vib_left=0; g_vib_right=0; InterlockedExchange(&g_vib_dirty,1); }
+  LeaveCriticalSection(&g_vib_lock);
+}
+
+/* called from the frontend poll: flushes at most one physical write per frame, stop always goes out immediately */
+void hid_vibration_flush(void){
+  if(!xset || g_xuser==(DWORD)~0) return;
+  static int inited;
+  if(!inited){ inited=1; InitializeCriticalSection(&g_vib_lock); }
+  int dirty=InterlockedExchange(&g_vib_dirty,0);
+  if(!dirty) return;
+  EnterCriticalSection(&g_vib_lock); XVIB v; v.wLeftMotorSpeed=g_vib_left; v.wRightMotorSpeed=g_vib_right; LeaveCriticalSection(&g_vib_lock);
+  u64 now=plat_ns();
+  if((v.wLeftMotorSpeed || v.wRightMotorSpeed) && now-g_vib_last<15000000ull) { InterlockedExchange(&g_vib_dirty,1); return; }   /* ~60 Hz for nonzero, stop is immediate */
+  DWORD r=xset(g_xuser,&v); g_vib_last=now;
+  if(r==ERROR_DEVICE_NOT_CONNECTED){ g_xuser=(DWORD)~0; LOG("controllers: vibration device disconnected\n"); }
 }
 
 static i32 joy_axis(DWORD value,DWORD min,DWORD max,int invert){
@@ -102,13 +141,15 @@ static int joy_poll(u64* buttons,i32* lx,i32* ly,i32* rx,i32* ry){
   if(g_joy_id==UINT_MAX){ u64 now=plat_ns(); if(now<g_joy_next_scan) return 0; g_joy_next_scan=now+1000000000ull; if(!joy_open()) return 0; }
   if(joyGetPosEx(g_joy_id,&state)!=JOYERR_NOERROR){ g_joy_id=UINT_MAX; return 0; }
   DWORD x=state.dwButtons;
-  /* DirectInput/WinMM numbers PlayStation face buttons square, cross, circle, triangle. Map by physical position. */
-  if(x&(1u<<2)) *buttons|=1ull<<0; if(x&(1u<<1)) *buttons|=1ull<<1;
+  /* WinMM numbers PlayStation face buttons square, cross, circle, triangle. PC players expect Cross to confirm;
+     other DirectInput pads retain Switch's physical A/B positions. */
+  int sony=g_joy_caps.wMid==0x054c;
+  if(x&(1u<<(sony?1:2))) *buttons|=1ull<<0; if(x&(1u<<(sony?2:1))) *buttons|=1ull<<1;
   if(x&(1u<<3)) *buttons|=1ull<<2; if(x&(1u<<0)) *buttons|=1ull<<3;
   if(x&(1u<<4)) *buttons|=1ull<<4; if(x&(1u<<5)) *buttons|=1ull<<5;
   if(x&(1u<<10)) *buttons|=1ull<<6; if(x&(1u<<11)) *buttons|=1ull<<7;
   if(x&(1u<<6)) *buttons|=1ull<<8; if(x&(1u<<7)) *buttons|=1ull<<9;
-  if(x&(1u<<8)) *buttons|=1ull<<10; if(x&(1u<<9)) *buttons|=1ull<<11;
+  if(x&(1u<<(sony?9:8))) *buttons|=1ull<<10; if(x&(1u<<(sony?8:9))) *buttons|=1ull<<11;
   if(state.dwPOV!=JOY_POVCENTERED){ DWORD pov=state.dwPOV;
     if(pov>=31500 || pov<=4500) *buttons|=1ull<<13;
     if(pov>=4500 && pov<=13500) *buttons|=1ull<<14;
@@ -301,8 +342,20 @@ static u64 keymap(WPARAM k){
     case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47; }
   return 0; }
 
+static void startup_paint(HWND h){
+  PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps); RECT r; GetClientRect(h,&r);
+  HBRUSH bg=CreateSolidBrush(RGB(18,22,29)); FillRect(dc,&r,bg); DeleteObject(bg);
+  SetBkMode(dc,TRANSPARENT); SetTextColor(dc,RGB(245,245,245));
+  HFONT title=CreateFontA(52,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,"Segoe UI");
+  HFONT body=CreateFontA(24,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,"Segoe UI");
+  HGDIOBJ old=SelectObject(dc,title); RECT t=r; t.bottom=r.bottom/2+20; DrawTextA(dc,"SwitchRecomp",-1,&t,DT_CENTER|DT_BOTTOM|DT_SINGLELINE);
+  SelectObject(dc,body); t.top=r.bottom/2+34; t.bottom=t.top+42; SetTextColor(dc,RGB(72,205,224)); DrawTextA(dc,"Starting the game...",-1,&t,DT_CENTER|DT_TOP|DT_SINGLELINE);
+  t.top=r.bottom-52; t.bottom=r.bottom-18; SetTextColor(dc,RGB(145,151,161)); DrawTextA(dc,"SwitchRecomp by MZ Labs",-1,&t,DT_CENTER|DT_BOTTOM|DT_SINGLELINE);
+  SelectObject(dc,old); DeleteObject(title); DeleteObject(body); EndPaint(h,&ps); }
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
   switch(m){
+  case WM_PAINT: startup_paint(h); return 0;
   case WM_CLOSE: LOG("window: closed by the user or the system\n"); g_quit=1; return 0;
   case WM_QUERYENDSESSION: LOG("window: Windows is logging off / shutting down\n"); break;
   case WM_POWERBROADCAST: if(w==PBT_APMSUSPEND) LOG("window: the PC is going to sleep\n"); else if(w==PBT_APMRESUMEAUTOMATIC) LOG("window: the PC resumed from sleep\n"); break;
@@ -353,6 +406,7 @@ static void win_thread(void* arg){ (void)arg;
   RegisterClassA(&wc);
   RECT r={0,0,1280,720}; AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
   g_hwnd=CreateWindowA("SwitchRecompWnd",g_title,WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,NULL,NULL,hi,NULL);
+  UpdateWindow(g_hwnd);
   RAWINPUTDEVICE rid={1,2,0,g_hwnd}; RegisterRawInputDevices(&rid,1,sizeof rid);
   g_hdc=GetDC(g_hwnd);
   PIXELFORMATDESCRIPTOR pfd={sizeof pfd,1,PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER,PFD_TYPE_RGBA,32};
@@ -434,6 +488,7 @@ void video_poll(void){
   int source=0;
   if(xget && focused){
     for(DWORD i=0;i<4;i++){ XST s; if(xget(i,&s)) continue; XGP* g=&s.Gamepad; WORD x=g->wButtons;
+      g_xuser=i;   /* remember which pad owns input so vibration reaches the right device */
       /* map by position like a Switch pad: A right (xbox B), B bottom (xbox A), X top, Y left */
       if(x&0x2000) b|=1<<0; if(x&0x1000) b|=1<<1; if(x&0x8000) b|=1<<2; if(x&0x4000) b|=1<<3;
       if(x&0x0040) b|=1<<4; if(x&0x0080) b|=1<<5; if(x&0x0100) b|=1<<6; if(x&0x0200) b|=1<<7;
@@ -445,6 +500,8 @@ void video_poll(void){
   }
   if(focused && !source && joy_poll(&b,&lx,&ly,&rx,&ry)) source=2;
   if(focused) pad_source(source);
+  if(!focused || (source && source!=1)){ if(!focused) backend_vibration_stop(); if(source!=1) g_xuser=(DWORD)~0; }
+  hid_vibration_flush();
   /* stick-as-button bits 16..23 */
   if(lx<-16000) b|=1ull<<16; if(ly>16000) b|=1ull<<17; if(lx>16000) b|=1ull<<18; if(ly<-16000) b|=1ull<<19;
   if(rx<-16000) b|=1ull<<20; if(ry>16000) b|=1ull<<21; if(rx>16000) b|=1ull<<22; if(ry<-16000) b|=1ull<<23;

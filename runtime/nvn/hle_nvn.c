@@ -1304,7 +1304,8 @@ static struct { uint64_t seq, fence; } g_aq_f[AQ_FN];   // the timeline value af
 static pthread_mutex_t g_aq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_aq_cv = PTHREAD_COND_INITIALIZER, g_aq_done_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_aq_ns, g_aq_cyc;   // the translation thread's time in its ops (frame statistics)
 static int g_aq_on = -1;
-static int aq_on(void) { if (g_aq_on < 0) { const char *e = getenv("SWR_ASYNC_SUBMIT"); g_aq_on = e && atoi(e) > 0; if (g_aq_on) LOG("[nvn] asynchronous submission: submits and presents are translated on a thread of their own (SWR_ASYNC_SUBMIT)"); } return g_aq_on; }
+static int aq_on(void) { if (g_aq_on < 0) { const char *e = getenv("SWR_ASYNC_SUBMIT"); g_aq_on = e ? atoi(e) > 0 : 1;   // on by default: synchronous replay took ~27 ms of a 34 ms MKW race frame on the game's own thread
+    if (g_aq_on) LOG("[nvn] asynchronous submission: submits and presents are translated on a thread of their own (SWR_ASYNC_SUBMIT=0 restores the old synchronous replay)"); } return g_aq_on; }
 static int aq_busy(void) { return aq_on() && atomic_load(&g_aq_done) < g_aq_tail; }
 static unsigned __stdcall aq_main(void *arg) {
     (void)arg; SetThreadDescription(GetCurrentThread(), L"nvn translation"); SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);

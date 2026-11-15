@@ -164,7 +164,7 @@ typedef struct { Wave q[4]; u32 nq,consumed; u64 played; double pos,fraction;
   u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
 typedef struct { u8 config[0xc0]; BiquadState filter[6]; int aux_logged; } Effect;
 typedef struct { Voice v[NV]; float* mix; u32 mix_cap; u64 updates,last_diag,ipc_serial; int logged;
-  Effect* effects; Effect** effect_order; u32 neffects,update_blocks; int effect_log; } AudioState;
+  Effect* effects; Effect** effect_order; u32 neffects,update_blocks; int effect_log,v2_logged; } AudioState;
 static AudioState* audio_state(SvcObj* o){
   AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(!a){ a=calloc(1,sizeof *a); o->u[4]=(u64)(uintptr_t)a; }return a;
 }
@@ -319,18 +319,50 @@ static void queue_waves(Voice* v,const u8* vi,unsigned channels,unsigned format,
     v->seen[k]=1; v->sent[k]=sent; v->signature[k]=sig;
   }
 }
+/* REV15 (Switch 2) sends 0x188-byte voices: float biquads and shifted wave-buffer fields. convert each one into
+   the legacy 0x170 layout the mixer already reads, then mix as usual. layouts match Eglantine's
+   VoiceInfo::InParameter2 (GPL-3.0-or-later, Copyright Eden Emulator Project / yuzu Emulator Project) */
+static void voice_v2_to_legacy(const u8* s,u8* d){
+  memcpy(d,s,0x24);                                 /* id, node_id, is_new, in_use, play_state, format, rate, priority, sort, channels, pitch, volume */
+  for(int f=0;f<2;f++){ const u8* sf=s+0x24+f*0x18; u8* df=d+0x24+f*0x0c;
+    df[0]=sf[0];                                     /* enabled */
+    const float* num=(const float*)(sf+4); const float* den=(const float*)(sf+0x10);
+    for(int j=0;j<3;j++){ float x=num[j]*16384.0f; if(!isfinite(x)) x=0; if(x>32767) x=32767; if(x<-32768) x=-32768; i16 q=(i16)lrintf(x); memcpy(df+2+j*2,&q,2); }
+    for(int j=0;j<2;j++){ float x=den[j]*16384.0f; if(!isfinite(x)) x=0; if(x>32767) x=32767; if(x<-32768) x=-32768; i16 q=(i16)lrintf(x); memcpy(df+8+j*2,&q,2); }
+  }
+  memcpy(d+0x3c,s+0x54,4);                           /* wave_buffer_count */
+  { u32 w=rd32(s+0x58)&3; memcpy(d+0x40,&w,2); }     /* wave_buffer_index (u32 -> u16) */
+  memset(d+0x42,0,6);
+  memcpy(d+0x48,s+0x60,8);                           /* src_data_address */
+  memcpy(d+0x50,s+0x68,8);                           /* src_data_size */
+  memcpy(d+0x58,s+0x70,4);                           /* mix_id */
+  memcpy(d+0x5c,s+0x74,4);                           /* splitter_id */
+  memcpy(d+0x60,s+0x78,4*0x38);                      /* wave_buffer_internal[4]: same 0x38 records */
+  memcpy(d+0x140,s+0x158,6*4);                        /* channel_resource_ids */
+  d[0x158]=s[0x170];                                 /* clear_voice_drop */
+  d[0x159]=s[0x171];                                 /* flush_buffer_count */
+  d[0x15a]=0; d[0x15b]=0;
+  d[0x15c]=s[0x174];                                 /* flags */
+  d[0x15d]=0;
+  d[0x15e]=s[0x176];                                 /* src_quality */
+  memset(d+0x15f,0,0x11);
+}
+
 /* routing only knows the legacy 0x930 byte mixes. other layouts get a straight stereo mix so you still hear the
    first sounds, and it says so in the log */
 int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* resources,u32 resources_size,
  const u8* mixes,u32 mixes_size,const u8* sinks,u32 sinks_size,u8* status,float* stereo){
-  memset(stereo,0,NF*2*sizeof(float)); if(count>NV || stride<0x170) return 0;
+  memset(stereo,0,NF*2*sizeof(float)); if(count>NV || (stride<0x170 && stride!=0x188)) return 0;
   AudioState* a=audio_state(o); if(!a) return 0;
   unsigned nm=mixes_size/0x930; if(nm>NM || mixes_size%0x930) nm=0;
   int map[NM]; const u8* mi[NM]; unsigned nbuf[NM]; memset(mi,0,sizeof mi); memset(nbuf,0,sizeof nbuf); for(int i=0;i<NM;i++) map[i]=-1;
   for(unsigned i=0;i<nm;i++){ const u8* p=mixes+i*0x930; u32 id=rd32(p+0x10),nb=rd32(p+8); if(p[0xc] && id<NM && nb>0 && nb<=NC){ map[id]=(int)i; mi[i]=p; nbuf[i]=nb; } }
   if(nm){ u32 cap=nm*NC*NF; if(a->mix_cap<cap){ float* t=realloc(a->mix,(size_t)cap*4); if(!t) return 0; a->mix=t; a->mix_cap=cap; }memset(a->mix,0,(size_t)cap*4); }
-  int active=0;
-  for(u32 i=0;i<count;i++){ const u8* vi=voices+i*stride; u32 id=rd32(vi); if(id>=NV) continue; Voice* v=&a->v[id];
+  int active=0; const int v2=stride==0x188;
+  if(v2 && !a->v2_logged){ a->v2_logged=1; LOG("audio: REV15 voices, converting 0x188 -> legacy 0x170 per update\n"); }
+  for(u32 i=0;i<count;i++){ u8 legacy[0x170]; const u8* vi;
+    if(v2){ voice_v2_to_legacy(voices+i*stride,legacy); vi=legacy; } else vi=voices+i*stride;
+    u32 id=rd32(vi); if(id>=NV) continue; Voice* v=&a->v[id];
     if(vi[8]) memset(v,0,sizeof *v);
     unsigned channels=rd32(vi+0x18),format=vi[0xb]; if(!channels || channels>6) channels=1;
     if(vi[9]){

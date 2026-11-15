@@ -21,6 +21,10 @@ static int g_seconds=0, g_maxframes=-1; static char g_shot[1024]; static u64 g_s
 static char g_script[8192]; static char g_title[256]; static volatile int g_shot_req;
 static u64 keys_held;
 extern int g_opt_fps;
+/* vibration: SDL2 rumble is wired later; these are the safe no-op defaults */
+void backend_vibration_set(float low,float high){ (void)low; (void)high; }
+void backend_vibration_stop(void){}
+void hid_vibration_flush(void){}
 
 void backend_ini(const char* k, const char* v){
   if(!strcmp(k,"fullscreen")) g_want_fs=atoi(v);

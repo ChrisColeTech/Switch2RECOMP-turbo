@@ -8,9 +8,10 @@ and the bugs that are still open.
 Rules of the project:
 - The version is **0.4.1** (major.fix.sub: fix 40 is 0.4.0, 0.4.1 a sub-release) (`SWR_RUNTIME_VERSION` in `runtime/main.c`). Changes go in `CHANGELOG.txt`,
   in English.
-- No code from GPL-2.0-only or other incompatible projects. yuzu, Eden and similar emulators may be read to understand
-  hardware behavior, but their code is not copied.
-- Every source file keeps the header `SwitchRecomp - Copyright 2026 MZ Labs` (AGPL v3 with NOTICE.txt).
+- Porting from GPL-3.0-compatible projects (Eglantine, Eden, Ryujinx) is allowed and encouraged. Keep the original
+  copyright headers on ported files or add them when porting pieces; this project is AGPL v3, so the combination is
+  distributable under AGPL v3.
+- New files written for this project keep the header `SwitchRecomp - Copyright 2026 MZ Labs` (AGPL v3 with NOTICE.txt).
 - Upstream lightweight packages stay under 20 MB and download tools through `Install.bat` / `Install.sh`.
   This fork's all-in-one Windows/Linux releases bundle those tools and exceed that limit; see `docs/RELEASES.md`.
 - A fix is not done until it is explained by a mechanism (log, trace or replay), not by trial and error.

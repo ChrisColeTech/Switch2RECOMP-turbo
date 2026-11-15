@@ -65,7 +65,7 @@ static PMutex g_ns2; static int g_ns2_init;
 static void ns2_lock(void){ if(!g_ns2_init){ pm_init(&g_ns2); g_ns2_init=1; } pm_lock(&g_ns2); }
 static void ns2_unlock(void){ pm_unlock(&g_ns2); }
 
-typedef struct { u32 id, mem; u32 pref[16]; u64 size; int window_pool; u64 off; } NsImage;   /* off: where in mem (image pools) */
+typedef struct { u32 id, mem; u32 pref[16]; u64 size; int window_pool; u64 off; int decoder; } NsImage;   /* off: where in mem (image pools); decoder: decoder image pool (gsv 911) */
 static NsImage g_img[1024]; static u32 g_nimg, g_next_img=1;
 static u32 g_native_mem[1024]; static u32 g_nnative;
 static int g_phase;              /* 0 created, 1 initialized, 2 process bound, 3 ready */
@@ -400,10 +400,30 @@ static int gsv_disp(SvcObj* o, IpcCtx* c){
     /* 991: nn::codec::CalculateDecoderImagePoolBuffer, one block-linear NV12 frame: luma and chroma planes with
        their heights rounded to 128 lines (640x360 -> 0x64000). The size words aren't known yet: logged, 640x360
        unless the first words look like a size */
-    case 991: { u32 w=W(c,2), h=W(c,3); if(w<16 || w>8192 || h<16 || h>8192){ w=640; h=360; }
+    case 991: { u32 dims=W(c,4), w=(dims&0xFFFF)+1, h=(dims>>16)+1;   /* pref[2] packs (w-1)|(h-1)<<16, pref[1] is the layout code: 1/4 NV12, 2/5 BGRA, else RGBA */
+      if(w<16 || w>8192 || h<16 || h>8192){ w=640; h=360; }
       u64 pitch=(w+63)&~63ull, sz=pitch*((h+127)&~127ull)+pitch*(((h+1)/2+127)&~127ull);
       { static int said; if(said<sw2_cap(2)){ said++; LOG("switch 2: decoder image size {%x %x %x %x} -> %ux%u, %llx bytes\n",W(c,2),W(c,3),W(c,4),W(c,5),w,h,(unsigned long long)sz); } }
-      out64(c,sz); out64(c,0x10000); break; }
+      out64(c,sz); out64(c,0x8000); break; }
+    /* 911: CreateDecoderImagePool {preference[16], count, memory}: count images sharing the pool memory, image i at
+       offset layout.size*i, handle = first + i. The decoder writes NV12 into these (gsv 961 describes the layout). */
+    case 911: { u32 p[16]; for(int i=0;i<16;i++) p[i]=W(c,2+i); u32 mem=W(c,19), count=W(c,18);
+      u32 dims=p[2], w=(dims&0xFFFF)+1, h=(dims>>16)+1; if(w<16 || w>8192 || h<16 || h>8192){ w=640; h=360; }
+      u64 pitch=(w+63)&~63ull, isz=pitch*((h+127)&~127ull)+pitch*(((h+1)/2+127)&~127ull);
+      if(!mem || !native_mem_has(mem) || !count || !isz){ rc=K_NOTFOUND; if(rc) out32(c,0); break; }
+      if(g_nimg+count>1024) rc=K_OUTOFRES;
+      else { u32 first=g_next_img; for(u32 i=0;i<count;i++){ NsImage* im=&g_img[g_nimg++]; memset(im,0,sizeof *im); im->id=g_next_img++; im->mem=mem; memcpy(im->pref,p,sizeof p); im->size=isz; im->off=(u64)i*isz; im->decoder=1; }
+        out32(c,first); }
+      { static int said; if(said<sw2_cap(2)){ said++; LOG("switch 2: decoder image pool in memory %u: %u images of %ux%u (%llx bytes) (%x)\n",mem,count,w,h,(unsigned long long)isz,rc); } }
+      break; }
+    /* 961: GetCpuImageDescriptor {image}: the 128-byte descriptor behind nn::codec::ReadDecoderOutputImage.
+       kind byte at +0 (8 RGBA / 9 BGRA / 10 NV12), plane offset u32 at +8, row pitch u64 at +0x10,
+       NV12 chroma offset at +0x18 and chroma pitch at +0x20. */
+    case 961: { NsImage* im=image_find(W(c,2)); if(!im){ rc=K_NOTFOUND; break; }
+      u32 dims=im->pref[2], w=(dims&0xFFFF)+1, h=(dims>>16)+1; u64 pitch=(w+63)&~63ull;
+      u64 chroma_off=pitch*((h+127)&~127ull);
+      out32(c,10); out32(c,0); out64(c,0); out64(c,pitch); out64(c,chroma_off); out64(c,pitch);
+      break; }
     case 601: break;
     case 602: rc=move_obj(c,svcobj_new("IGsvSession602",ns2_unknown,0),0); break;
     case 1201: break;

@@ -670,9 +670,16 @@ static VkImageView tex_view(int tid, const vks_bind *b, VkImageLayout *layout, v
     VkImageViewType have = v.set_target ? view_type_of_target(v.target, im->vtype) : im->vtype;
     if (have != b->vtype) { v.set_target = 1; v.target = (uint8_t)nvn_target_of(b->vtype, b->ms); use = 1; }
     if ((have == VK_IMAGE_VIEW_TYPE_3D) != (b->vtype == VK_IMAGE_VIEW_TYPE_3D)) {
-        RED_ONCE(31, "a 3D texture read as another type, or the reverse (texture ID %d, ser%llu %ux%ux%u view type %d; shader %s binding %u declares view type %d): it reads 0", tid,
-                 (unsigned long long)im->serial, im->w, im->h, im->depth, (int)have, g_cur_sh ? g_cur_sh->key : "?", b->binding, (int)b->vtype);
-        return VK_NULL_HANDLE; }
+        // a 3D image read as 2D/2D-array is legal: the image carries VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT and
+        // vkt_view maps that level's depth slices to layers (mkw reads volumetric data this way; the old code
+        // bound null here and the shader read 0)
+        if (have == VK_IMAGE_VIEW_TYPE_3D && b->vtype != VK_IMAGE_VIEW_TYPE_CUBE && b->vtype != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
+            if (b->vtype == VK_IMAGE_VIEW_TYPE_2D && !v.set_layers) { v.set_layers = 1; v.min_layer = 0; v.nlayers = 1; }
+        } else {
+            RED_ONCE(31, "a 3D texture read as another type, or the reverse (texture ID %d, ser%llu %ux%ux%u view type %d; shader %s binding %u declares view type %d): it reads 0", tid,
+                     (unsigned long long)im->serial, im->w, im->h, im->depth, (int)have, g_cur_sh ? g_cur_sh->key : "?", b->binding, (int)b->vtype);
+            return VK_NULL_HANDLE; }
+    }
     if (b->depth && !(im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
         VkImageView dv = dcmp_view(im, b->vtype);
         if (dv) { *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; return dv; }
@@ -1129,6 +1136,13 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (vkp_blend_is_src1(b0.src_rgb) || vkp_blend_is_src1(b0.dst_rgb) || vkp_blend_is_src1(b0.src_a) || vkp_blend_is_src1(b0.dst_a)) fsv |= VKSH_FS_DUAL;
     }
     if (sh[1] && S->color.alpha_func && S->color.alpha_func != NVN_ALPHA_FUNC_ALWAYS && (sh[1]->out_mask & 1) && !(P.ncolor && P.cv[0] && fmt_int_kind(P.cf[0]))) fsv |= VKSH_FS_ALPHA;
+    // a float output into a uint or sint target stores undefined values (Vulkan converts nothing, Maxwell's ROP truncated towards zero): the int-output variant retypes
+    // the output and truncates every store (nvn_mtl.m fs_uint); its out_ct then stops RED_ONCE(55) below
+    for (int i = 0; i < P.ncolor && sh[1]; i++) {
+        uint32_t m = (S->chmask.mask >> (4 * i)) & 0xf;
+        if (!P.cv[i] || !(sh[1]->out_mask >> i & 1)) m = 0;   // only where the target exists and the shader writes it (a partial mask still needs the conversion)
+        if (m && sh[1]->out_ct[i] == VKS_CT_FLOAT) { int ik = fmt_int_kind(P.cf[i]); if (ik) fsv |= ik << (2 + 2 * i); }
+    }
     if (fsv) { sh[1] = vksh_fs_variant(sh[1], fsv); atest = sh[1]->alpha; }
     if (g_id_on && sh[1]) sh[1] = vksh_id_variant(sh[1]);
     // pipeline: what is not dynamic here

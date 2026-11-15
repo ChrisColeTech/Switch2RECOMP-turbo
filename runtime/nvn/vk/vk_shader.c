@@ -516,7 +516,7 @@ const vks_shader *vksh_vin_variant(const vks_shader *vs, uint32_t mask, const ui
 
 // ---------- Fragment variants (M6 phase B): dual-source blending, the alpha test ----------
 enum { OP_ENTRY_POINT = 15, OP_TYPE_VOID = 19, OP_TYPE_BOOL = 20, OP_TYPE_STRUCT = 30, OP_CONSTANT = 43, OP_FUNCTION = 54, OP_FUNCTION_END = 56, OP_MEMBER_DECORATE = 72,
-       OP_ISUB = 130, OP_LOGICAL_OR = 166, OP_LOGICAL_AND = 167, OP_INOT_EQUAL = 171, OP_FORD_EQUAL = 180, OP_FORD_LESS = 184, OP_FORD_GREATER = 186, OP_BITWISE_AND = 199,
+       OP_STORE = 62, OP_COPY_MEMORY = 63, OP_CONVERT_F_TO_U = 109, OP_CONVERT_F_TO_S = 110, OP_ISUB = 130, OP_LOGICAL_OR = 166, OP_LOGICAL_AND = 167, OP_INOT_EQUAL = 171, OP_FORD_EQUAL = 180, OP_FORD_LESS = 184, OP_FORD_GREATER = 186, OP_BITWISE_AND = 199,
        OP_SELECTION_MERGE = 247, OP_LABEL = 248, OP_BRANCH_COND = 250, OP_KILL = 252, OP_RETURN = 253,
        DEC_BLOCK = 2, DEC_BUILTIN = 11, DEC_INDEX = 32, DEC_OFFSET = 35, SC_OUTPUT = 3, SC_PUSH = 9 };
 // The non-builtin Output variables by Location (-1 when absent; -2 when a location holds more than one; a second blend source, Index 1, is not counted); returns how many
@@ -549,6 +549,113 @@ uint32_t *vkspv_dual_source(const uint32_t *w, size_t n, size_t *out_n) {
         } else wput(&o, w + i, wc);
     }
     *out_n = o.n; return o.w;
+}
+// Float outputs retyped into integer ones (nxshader's IntOutputs pass, nvn_mtl.m fs_uint): a float output whose target is uint or sint stores undefined values, because
+// Vulkan converts nothing and Maxwell's ROP truncated towards zero. kinds[i]: 1 = target i unsigned, 2 = signed, 0 = float or unwritten. Each matching output becomes an
+// int32 of the same shape (its Location stays), and every float store to it goes through a truncating OpConvertFToU / OpConvertFToS. Needs no Flat: Vulkan asks it of
+// integer inputs, not of outputs. New words or NULL
+uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], size_t *out_n) {
+    if (!spv_ok(w, n)) return NULL;
+    uint32_t bound = w[3], *def = calloc(bound, sizeof *def), f32 = 0;
+    uint32_t iscal[2] = {0}, ivec[2][5] = {{0}}, ivp[2][5] = {{0}}, isp[2] = {0};
+    for (size_t i = 5; i < n; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > n) { free(def); return NULL; }
+        if (op >= OP_TYPE_VOID && op <= OP_TYPE_POINTER && wc >= 2 && w[i + 1] < bound) def[w[i + 1]] = (uint32_t)i;
+        if (op == OP_VARIABLE && wc >= 4 && w[i + 2] < bound) def[w[i + 2]] = (uint32_t)i;
+        if (op == OP_TYPE_INT && wc == 4 && w[i + 2] == 32 && w[i + 3] < 2) iscal[w[i + 3]] = w[i + 1];
+        if (op == OP_TYPE_FLOAT && wc == 3 && w[i + 2] == 32) f32 = w[i + 1];
+        i += wc;
+    }
+    // the existing int32 vectors, and the Output pointers to them and to the scalars (a second declaration of a non-aggregate type is invalid)
+    for (size_t i = 5; i < n; i += w[i] >> 16) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == OP_TYPE_VECTOR && wc == 4) for (int k = 0; k < 2; k++) if (iscal[k] && w[i + 2] == iscal[k] && w[i + 3] >= 2 && w[i + 3] <= 4) ivec[k][w[i + 3]] = w[i + 1];
+    }
+    for (size_t i = 5; i < n; i += w[i] >> 16)
+        if ((w[i] & 0xffff) == OP_TYPE_POINTER && (w[i] >> 16) == 4 && w[i + 2] == SC_OUTPUT)
+            for (int k = 0; k < 2; k++) {
+                if (iscal[k] && w[i + 3] == iscal[k]) isp[k] = w[i + 1];
+                for (int c = 2; c <= 4; c++) if (ivec[k][c] && w[i + 3] == ivec[k][c]) ivp[k][c] = w[i + 1];
+            }
+    // the outputs to retype, and their shape
+    int32_t at[8]; spv_outputs(w, n, at);
+    uint32_t var_of[8] = {0}; int k_of[8] = {0}, nc_of[8] = {0}, any = 0;
+    for (int l = 0; l < 8; l++) {
+        if (!kinds[l]) continue;
+        if (kinds[l] < 1 || kinds[l] > 2) { free(def); return NULL; }
+        if (at[l] < 0) { free(def); return NULL; }   // absent, or more than one output at the location: no variant
+        uint32_t vi = def[at[l]], pt = vi ? w[vi + 1] : 0, pti = pt < bound ? def[pt] : 0;
+        if (!pti || (w[pti] & 0xffff) != OP_TYPE_POINTER || w[pti + 2] != SC_OUTPUT) { free(def); return NULL; }
+        uint32_t vt = w[pti + 3], vti = vt < bound ? def[vt] : 0;
+        if (vti && (w[vti] & 0xffff) == OP_TYPE_FLOAT && w[vti + 2] == 32) nc_of[l] = 1;
+        else if (vti && (w[vti] & 0xffff) == OP_TYPE_VECTOR && f32 && w[vti + 2] == f32 && w[vti + 3] >= 2 && w[vti + 3] <= 4) nc_of[l] = (int)w[vti + 3];
+        else { free(def); return NULL; }
+        var_of[l] = (uint32_t)at[l]; k_of[l] = kinds[l] - 1; any = 1;
+    }
+    if (!any) { free(def); return NULL; }
+    // the new types go right before the first retyped variable; the existing types they name must be defined before that
+    size_t first_var = 0;
+    for (int l = 0; l < 8; l++) if (var_of[l] && (!first_var || def[var_of[l]] < first_var)) first_var = def[var_of[l]];
+    for (int k = 0; k < 2; k++) if (iscal[k] && def[iscal[k]] > first_var) { free(def); return NULL; }
+    for (int k = 0; k < 2; k++) for (int c = 2; c <= 4; c++) if (ivec[k][c] && def[ivec[k][c]] > first_var) { free(def); return NULL; }
+    wbuf types = {0};
+    #define NEWT(...) do { uint32_t t_[] = {__VA_ARGS__}; wput(&types, t_, sizeof t_ / 4); } while (0)
+    for (int l = 0; l < 8; l++) {
+        if (!var_of[l]) continue;
+        int k = k_of[l], nc = nc_of[l];
+        if (!iscal[k]) { iscal[k] = bound++; NEWT(4u << 16 | OP_TYPE_INT, iscal[k], 32, k); }
+        if (nc == 1) { if (!isp[k]) { isp[k] = bound++; NEWT(4u << 16 | OP_TYPE_POINTER, isp[k], SC_OUTPUT, iscal[k]); } }
+        else {
+            if (!ivec[k][nc]) { ivec[k][nc] = bound++; NEWT(4u << 16 | OP_TYPE_VECTOR, ivec[k][nc], iscal[k], (uint32_t)nc); }
+            if (!ivp[k][nc]) { ivp[k][nc] = bound++; NEWT(4u << 16 | OP_TYPE_POINTER, ivp[k][nc], SC_OUTPUT, ivec[k][nc]); }
+        }
+    }
+    #undef NEWT
+    // the rewrite: variables take the new pointer type; access chains into them the scalar pointer; stores through either convert the value (a whole variable: the vector,
+    // one index into it: the scalar)
+    uint32_t *repl = calloc(bound + 1, sizeof *repl);   // pointer id -> class + 1 of what it now points to
+    wbuf o = {0};
+    wput(&o, w, 5);
+    int bad = 0;
+    for (size_t i = 5; i < n && !bad; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > n) { bad = 1; break; }
+        if (i == first_var && types.n) wput(&o, types.w, types.n);
+        if (wc > 64) { wput(&o, w + i, wc); i += wc; continue; }
+        uint32_t x[64] = {0}; memcpy(x, w + i, wc * 4);
+        if (op == OP_VARIABLE && wc >= 4) {
+            for (int l = 0; l < 8; l++) if (var_of[l] && x[2] == var_of[l]) {
+                x[1] = nc_of[l] > 1 ? ivp[k_of[l]][nc_of[l]] : isp[k_of[l]];
+                repl[x[2]] = (uint32_t)k_of[l] + 1;
+            }
+            wput(&o, x, wc);
+        } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && wc >= 5 && x[3] < bound && repl[x[3]]) {
+            int k = (int)repl[x[3]] - 1; x[1] = isp[k]; repl[x[2]] = (uint32_t)k + 1;   // one index into a vector: the scalar
+            wput(&o, x, wc);
+        } else if ((op == OP_STORE || op == OP_COPY_MEMORY) && x[1] < bound && repl[x[1]]) {
+            if (op == OP_COPY_MEMORY || wc != 3) bad = 1;   // a copy keeps the source's float type: no variant
+            else {
+                int k = (int)repl[x[1]] - 1;
+                uint32_t pt = w[def[x[1]] + 1], nc = 1;
+                if (pt < bound && def[pt] && (w[def[pt]] & 0xffff) == OP_TYPE_POINTER) {
+                    uint32_t vt = w[def[pt] + 3];
+                    if (vt < bound && def[vt] && (w[def[vt]] & 0xffff) == OP_TYPE_VECTOR) nc = w[def[vt] + 3];
+                }
+                uint32_t want = nc > 1 ? ivec[k][nc] : iscal[k], nid = bound++;
+                uint32_t cv[4] = {4u << 16 | (k ? OP_CONVERT_F_TO_S : OP_CONVERT_F_TO_U), want, nid, x[2]};
+                wput(&o, cv, 4);
+                uint32_t st[3] = {3u << 16 | OP_STORE, x[1], nid};
+                wput(&o, st, 3);
+            }
+        } else wput(&o, x, wc);
+        i += wc;
+    }
+    if (bad) { free(def); free(repl); free(types.w); free(o.w); return NULL; }
+    o.w[3] = bound;
+    free(def); free(repl); free(types.w);
+    *out_n = o.n;
+    return o.w;
 }
 // The alpha test (nxnative's dmsh_alpha.py library, as nvn_mtl.m at_fn / at_bind use it): before each return of the entry point, colour 0's alpha is compared with the
 // reference by NVN's alpha function, both in a push constant block {uint function; float reference;} (fragment stage, offset 0, 8 bytes), and the fragment is discarded
@@ -635,7 +742,9 @@ static const vks_shader *fs_variant_l(const vks_shader *fs_, int flags) {
     uint64_t key = 0x100u | (unsigned)flags;
     for (int i = 0; i < fs->nvar; i++) if (fs->var[i].key == key) return fs->var[i].s;
     if (fs->nvar == 8) return fs;
-    size_t n = fs->nwords, nn = 0; uint32_t *w = NULL; int dual = 0, alpha = 0;
+    size_t n = fs->nwords, nn = 0; uint32_t *w = NULL; int dual = 0, alpha = 0, ik = 0;
+    int kinds[8] = {0};   // bits 2 + 2 i: target i's kind, 1 = unsigned, 2 = signed (vk_replay asks for the kind its format has)
+    for (int i = 0; i < 8; i++) { kinds[i] = (int)(((unsigned)flags >> (2 + 2 * i)) & 3u); ik |= kinds[i] != 0; }
     if (flags & VKSH_FS_DUAL) {
         if ((w = vkspv_dual_source(fs->words, n, &nn))) { n = nn; dual = 1; }
         else { static int k; if (k++ < 8) VKRED("shader %s: no dual-source variant (it does not write exactly outputs 0 and 1): the second source counts as zero", fs->key); }
@@ -645,14 +754,22 @@ static const vks_shader *fs_variant_l(const vks_shader *fs_, int flags) {
         if (a) { free(w); w = a; n = nn; alpha = 1; }
         else { static int k; if (k++ < 8) VKRED("shader %s: no alpha test variant (its colour 0 is not a float vec4): drawn without the test", fs->key); }
     }
+    if (ik) {
+        uint32_t *a = vkspv_int_outputs(w ? w : fs->words, n, kinds, &nn);
+        if (a) { free(w); w = a; n = nn; }
+        else { free(w); w = NULL; static int k; if (k++ < 8) VKRED("shader %s: no integer-output variant (its float stores could not be retyped): the values stay undefined", fs->key); }
+    }
     VkShaderModule mod = VK_NULL_HANDLE;
+    const char *what = ik ? dual && alpha ? "dual source + alpha test + int outputs" : dual ? "dual source + int outputs" : alpha ? "alpha test + int outputs" : "int outputs"
+                          : dual && alpha ? "dual source + alpha test" : dual ? "dual source" : "alpha test";
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n * 4, w};
-    if (!w || vk_module(&mci, &mod, fs->key, dual && alpha ? "dual source + alpha test" : dual ? "dual source" : "alpha test") != VK_SUCCESS) { free(w); fs->var[fs->nvar].key = key; fs->var[fs->nvar].s = fs; fs->nvar++; return fs; }   // the base, remembered
+    if (!w || vk_module(&mci, &mod, fs->key, what) != VK_SUCCESS) { free(w); fs->var[fs->nvar].key = key; fs->var[fs->nvar].s = fs; fs->nvar++; return fs; }   // the base, remembered
     vks_shader *s = malloc(sizeof *s); *s = *fs;
-    s->mod = mod; s->words = w; s->nwords = n; s->base = fs; s->nvar = 0; s->dual = dual; s->alpha = alpha; s->fs_flags = (uint8_t)flags;
+    s->mod = mod; s->words = w; s->nwords = n; s->base = fs; s->nvar = 0; s->dual = dual; s->alpha = alpha; s->fs_flags = (uint32_t)flags;
     if (dual) s->out_mask = fs->out_mask & ~2u;   // output 1 is target 0's second source now, not a target of its own
+    for (int i = 0; i < 8; i++) if (kinds[i]) s->out_ct[i] = (uint8_t)kinds[i];   // vk_replay's checks see the conversion, and stop asking for it
     fs->var[fs->nvar].key = key; fs->var[fs->nvar].s = s; fs->nvar++;
-    static int nl; if (nl++ < 16) VKLOG("fragment shader %s: %s%s%s variant", fs->key, dual ? "dual-source" : "", dual && alpha ? " + " : "", alpha ? "alpha test" : "");
+    static int nl; if (nl++ < 16) VKLOG("fragment shader %s: %s%s%s%s variant", fs->key, dual ? "dual-source" : "", dual && alpha ? " + " : "", alpha ? "alpha test" : "", ik ? (dual || alpha ? " + int outputs" : "int outputs") : "");
     return s;
 }
 // A pixel shader that draws a number as a flat colour: 1 + n / 32 in each channel, 5 bits a channel, which R11G11B10F keeps exactly (NXRT_VK_DUMP_AT_S, tools/pass_pair.py)

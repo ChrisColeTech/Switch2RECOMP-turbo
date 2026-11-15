@@ -3,6 +3,7 @@ bin/
 build/
 *.o
 *.a
+!runtime/vp9/win/libvpx.a
 *.exe
 *.dll
 *.so

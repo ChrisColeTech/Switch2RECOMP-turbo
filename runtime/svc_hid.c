@@ -4,6 +4,7 @@
 /* hid. games read the shared memory directly, so we fill it in the real layout (17 entry LIFOs) */
 #include "rt.h"
 #include "hid_layout.h"
+#include <math.h>
 
 KShmem* kshmem_new(u64 size, const char* name);
 u8* kshmem_ptr(KShmem* s);
@@ -95,7 +96,35 @@ static int hid_applet_res(SvcObj* o, IpcCtx* c){
   if(c->cmd==0){ out_copy_h(c,h_new(&g_hid_shm->o)); return 0; }
   return stub_ok(o,c); }
 
-static int hid_vibration_list(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }   /* IActiveVibrationDeviceList: 0 ActivateVibrationDevice */
+/* vibration. the game activates handles through IActiveVibrationDeviceList, then sends values per handle.
+   we aggregate both LRA sides to the two Xbox motors: low-frequency -> left, high-frequency -> right.
+   handle layout and value semantics follow the nn::hid contract (see Eglantine hid_types.h, GPL-3.0) */
+static struct { float low,lowf,high,highf; u8 active; } g_vib[2];   /* device 0=left, 1=right */
+static u8 g_vib_permission=1, g_vib_list_created;
+void hid_vibration_flush(void);   /* backend_win32.c calls this from its poll loop */
+
+static int vib_side(u32 h){ u32 dev=(h>>16)&0xFF, id=h&0xFF, style=(h>>8)&0xFF;
+  if(dev>1 || (id!=0 && id!=0x20)) return -1;
+  if(id==0 && style!=3 && style!=5 && style!=0) return -1;   /* FullKey, JoyconDual or raw */
+  return (int)dev; }
+
+static void vib_store(int side,const u8* p){
+  if(side<0 || side>1) return;
+  float v[4]; memcpy(v,p,16); for(int j=0;j<4;j++) if(!isfinite(v[j])) v[j]= j&1? (j==1?160.f:320.f):0;
+  if(v[0]<0) v[0]=0; if(v[0]>1) v[0]=1; if(v[2]<0) v[2]=0; if(v[2]>1) v[2]=1;
+  g_vib[side].low=v[0]; g_vib[side].lowf=v[1]; g_vib[side].high=v[2]; g_vib[side].highf=v[3]; }
+
+static void vib_aggregate(void){
+  if(!g_vib_permission){ hid_vibration_flush(); return; }
+  float low=0,high=0; for(int s=0;s<2;s++) if(g_vib[s].active){ if(g_vib[s].low>low) low=g_vib[s].low; if(g_vib[s].high>high) high=g_vib[s].high; }
+  extern void backend_vibration_set(float low,float high);
+  backend_vibration_set(low,high); }
+
+static void vib_stop(void){ memset(g_vib,0,sizeof g_vib); extern void backend_vibration_stop(void); backend_vibration_stop(); }
+
+static int hid_vibration_list(SvcObj* o, IpcCtx* c){
+  if(c->cmd==0){ u32 h=in32(c,0); int side=vib_side(h); if(side>=0) g_vib[side].active=1; }
+  (void)o; return 0; }   /* IActiveVibrationDeviceList: 0 ActivateVibrationDevice */
 
 static u64 g_hold_type=0, g_comm_mode=0, g_handheld_mode=0;
 
@@ -121,16 +150,25 @@ static int hid_disp(SvcObj* o, IpcCtx* c){
     case 129: out32(c,0); return 0;                                                /* GetNpadFullKeyGripColor... */
     case 133: case 134: case 135: case 136: case 137: case 138: out8(c,0); return 0;
     case 200: { u32 h=in32(c,0); u32 dev=(h>>16)&0xFF; out32(c,1); out32(c,dev==0? 1 : 2); return 0; }  /* GetVibrationDeviceInfo: LRA, left/right */
-    case 202: { float v[4]={0.f,160.f,0.f,320.f}; outbytes(c,v,16); return 0; }  /* GetActualVibrationValue */
-    case 203: out_obj(c,svcobj_new("IActiveVibrationDeviceList",hid_vibration_list,0)); return 0;
-    case 205: case 211: out8(c,1); return 0;                                       /* IsVibrationPermitted / Mounted */
-    case 208: out32(c,0); return 0;
+    case 201: { u32 h=in32(c,0); int side=vib_side(h); u64 va; if(side>=0 && g_vib_permission && buf_in(c,1,&va,0) && va){ const u8* vp=(const u8*)GP(va); vib_store(side,vp); if(!g_vib[side].active) g_vib[side].active=1; vib_aggregate(); } return 0; }  /* SendVibrationValue: handle raw+0, value X-buffer+0 */
+    case 202: { float v[4]={0.f,160.f,0.f,320.f}; int side=vib_side(in32(c,0)); if(side>=0 && g_vib[side].active){ v[0]=g_vib[side].low; v[1]=g_vib[side].lowf; v[2]=g_vib[side].high; v[3]=g_vib[side].highf; } outbytes(c,v,16); return 0; }  /* GetActualVibrationValue */
+    case 203: g_vib_list_created=1; out_obj(c,svcobj_new("IActiveVibrationDeviceList",hid_vibration_list,0)); return 0;
+    case 204: { u8 p=in8(c,0); g_vib_permission=p!=0; if(!p) vib_stop(); return 0; }  /* PermitVibration */
+    case 205: out8(c,g_vib_permission); return 0;   /* IsVibrationPermitted */
+    case 206: { /* SendVibrationValues: X-buffer 0 = handles, X-buffer 1 = values */
+      u64 ha,hs,va,vs; if(buf_xs(c,0,&ha,&hs) && buf_xs(c,1,&va,&vs) && ha && va && hs>=4 && vs>=16){
+        u32 n=(u32)(hs/4); if(n>(vs/16)) n=(u32)(vs/16); if(n>256) n=256;
+        for(u32 k=0;k<n;k++){ const u8* hp=(const u8*)GP(ha+(u64)k*4); const u8* vp=(const u8*)GP(va+(u64)k*16);
+          u32 h; memcpy(&h,hp,4); int side=vib_side(h); if(side>=0 && g_vib_permission){ vib_store(side,vp); vib_aggregate(); } } }
+      return 0; }
+    case 211: { u32 h=in32(c,0); int side=vib_side(h); out8(c,side>=0); return 0; }  /* IsVibrationDeviceMounted */
+    case 208: { u32 v=0; outbytes(c,&v,8); return 0; }   /* GetActualVibrationGcErmCommand: 8-byte Stop */
     case 400: out8(c,0); return 0;                                                 /* IsUsbFullKeyControllerEnabled */
     case 1000: g_comm_mode=in64(c,8); return 0;
     case 1001: out64(c,g_comm_mode); return 0;
     case 1003: out8(c,0); return 0;
     case 102: case 103: case 104: case 107: case 109: case 122: case 123: case 124: case 125: case 126: case 130: case 131: case 132:
-    case 201: case 204: case 206: case 207: case 209: case 210: case 212:
+    case 207: case 209: case 210: case 212:
     case 1002: case 1004:
     case 300: case 301: case 302: case 303: case 304: case 305: case 306: case 307: case 308: case 309: case 310: case 311: case 312: case 313: case 314: case 315: case 316: case 317:
     case 60: case 61: case 63: case 64: case 65: case 66: case 67: case 91:

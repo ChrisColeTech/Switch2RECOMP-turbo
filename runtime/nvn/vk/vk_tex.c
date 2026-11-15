@@ -247,7 +247,7 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
         if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fi->feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
     VkImageCreateFlags cf = (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) | (!depth ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
-    if (type == VK_IMAGE_TYPE_3D && !(fi->flags & VKF_COMPRESSED)) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    if (type == VK_IMAGE_TYPE_3D) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     // drop what this format cannot have in this combination (storage on an sRGB format, a sample count)
     for (int pass = 0; pass < 3; pass++) {
         VkImageFormatProperties ip;

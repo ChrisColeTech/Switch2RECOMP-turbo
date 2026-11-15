@@ -17,6 +17,10 @@ void backend_ini(const char* k, const char* v){
 }
 
 int video_has_gl(void){ return 0; }
+/* vibration: headless has no device */
+void backend_vibration_set(float low,float high){ (void)low; (void)high; }
+void backend_vibration_stop(void){}
+void hid_vibration_flush(void){}
 
 void video_init(const char* t){ (void)t; pm_init(&g_hl); g_start=plat_ns(); }
 

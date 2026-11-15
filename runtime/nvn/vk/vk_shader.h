@@ -41,7 +41,7 @@ typedef struct vks_shader {
     uint32_t *words; size_t nwords;                         // the module as created (vertex shaders: the source of their input variants)
     struct vks_shader *base;                                // a variant's shader; NULL for one from the cache
     struct { uint64_t key; struct vks_shader *s; } var[8]; int nvar;
-    uint8_t dual, alpha, fs_flags;                          // a fragment variant: output 1 is Location 0 Index 1; the alpha test reads its push constants; what made it
+    uint8_t dual, alpha; uint32_t fs_flags;                 // a fragment variant: output 1 is Location 0 Index 1; the alpha test reads its push constants; what made it (bit 2 + 2 i: target i's kind, 1 unsigned, 2 signed)
     uint32_t vin_mask; uint8_t vin_ct[32];                  // a vertex input variant: what made it (the pipeline manifest names variants by these)
     uint8_t ds_reuse;                                       // vk_replay.c set_reusable: 0 not looked at yet, 1 its set may serve the next draw, 2 never
 } vks_shader;
@@ -63,14 +63,17 @@ void vksh_stats(uint64_t *loaded, uint64_t *failed);
 // the body uses: a vertex format of another numeric class then hands the shader Maxwell's register bits (an RGBA16I attribute sign-extended into a uint input,
 // a normalized one as float bits). The base shader when mask is 0 or the module cannot be retyped (logged)
 const vks_shader *vksh_vin_variant(const vks_shader *vs, uint32_t mask, const uint8_t ct[32]);
-// M6 phase B: a fragment shader for dual-source blending (VKSH_FS_DUAL: output 1 as target 0's second source) and / or the alpha test (VKSH_FS_ALPHA: colour 0's alpha
+// M6 phase B: a fragment shader for dual-source blending (VKSH_FS_DUAL: output 1 as target 0's second source), the alpha test (VKSH_FS_ALPHA: colour 0's alpha
 // compared with the reference by NVN's function, both in fragment push constants {uint function; float reference;}, before each return; the fragment discarded when it
-// fails). The base shader when no variant can be made (logged once)
+// fails) and / or float outputs retyped into integer ones (bits 2 + 2 i: target i's kind, 1 = unsigned, 2 = signed, the kind its format asks for; every float store
+// to the output goes through a truncating OpConvertFToU / OpConvertFToS, because Vulkan converts nothing and Maxwell's ROP truncated towards zero). The base shader
+// when no variant can be made (logged once)
 enum { VKSH_FS_DUAL = 1, VKSH_FS_ALPHA = 2 };
 const vks_shader *vksh_fs_variant(const vks_shader *fs, int flags);
 const vks_shader *vksh_id_variant(const vks_shader *fs);
 uint32_t *vkspv_dual_source(const uint32_t *words, size_t nwords, size_t *out_n);   // the edits themselves (tests): new words, or NULL
 uint32_t *vkspv_alpha_test(const uint32_t *words, size_t nwords, size_t *out_n);
+uint32_t *vkspv_int_outputs(const uint32_t *words, size_t nwords, const int kinds[8], size_t *out_n);   // the edits themselves (tests): new words, or NULL
 // The retyping itself (tests): new words, or NULL
 uint32_t *vkspv_retype_inputs(const uint32_t *words, size_t nwords, uint32_t mask, const uint8_t ct[32], size_t *out_n);
 
