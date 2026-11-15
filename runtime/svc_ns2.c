@@ -8,6 +8,10 @@
    Requests are TIPC: W(c,0) is the header word (16 + command), W(c,1) the size word, the arguments follow. Results go
    back as the first payload word (the dispatch return value) */
 #include "rt.h"
+#ifdef SWR_HAVE_VP9
+#include <vpx/vpx_decoder.h>
+#include <vpx/vp8dx.h>
+#endif
 
 extern SvcObj* nvdrv_obj_new(const char* name);
 extern u32 nv_native_handle(u64 addr, u64 size);
@@ -15,7 +19,7 @@ extern void nv_gpu_map_raw(u64 gva, u64 cpu, u64 size), nv_gpu_unmap_raw(u64 gva
 extern int nv_native_bind(u32 h, u64 addr), nv_native_alive(u32 h), nv_native_map(u64 gva, u32 h, u64 off, u64 size);
 extern void nv_native_free(u32 h), nv_native_unmap(u64 gva, u64 size);
 extern int nv_open_dev(const char* name), nv_fd_is_as(u32 fd);
-extern u32 syncpt_read(u32 id); extern int syncpt_wait(u32 id, u32 thresh, i64 timeout);
+extern u32 syncpt_read(u32 id), syncpt_alloc(void); extern void syncpt_incr(u32 id); extern int syncpt_wait(u32 id, u32 thresh, i64 timeout);
 extern u64 nvmap_addr(u32 h); extern u32 nvmap_size(u32 h);
 extern void vi_show_addr(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt);
 extern int ipc_warn_once(const char* name, u32 cmd);
@@ -272,21 +276,143 @@ static int chat_disp(SvcObj* o, IpcCtx* c){
   if(c->cmd==11){ static KEvent* ev; if(!ev){ ev=kevent_new("chat notification",0); kobj_ref(&ev->o); } out_move_h(c,ev_h(ev)); return 0; }
   return ns2_unknown(o,c); }
 
-/* video decoder (nn::codec::video): gsv 902/906/1002 hand out a session whose command 1 (CreateVideoDecoderService)
-   hands out another. Nothing decodes yet, but command 3 must return the submission-ready event: clients clear and
-   wait on it, and abort if a successful IPC reply contains handle zero. Keep it signaled while the stub has room. */
-typedef struct { KEvent* ready; } VDec;
-static KEvent* vdec_ready(VDec* v){ if(!v->ready){ v->ready=kevent_new("video decoder ready",0); kobj_ref(&v->ready->o); kevent_signal(v->ready); } return v->ready; }
-static void vdec_destroy(SvcObj* o){ VDec* v=o->data; if(v->ready) kobj_unref(&v->ready->o); }
-static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data;
+/* video decoder protocol and output ordering adapted from Eglantine Emulator Project's nx2_gsv.h (GPL-3.0-or-later).
+   libvpx is synchronous here: the service owns no shared GSV lock, so a decode only stalls the submitting guest thread. */
+#define VDEC_IMAGES 32
+#define VDEC_FRAMES 32
+#define VDEC_OUTPUTS 64
+#define VDEC_QUEUE_BYTES (128u<<20)
+typedef struct { u32 id,target,release_id,release_val; int state,has_release; } VDecImage; /* 1 queued, 2 held by client */
+typedef struct { u8 *y,*uv; u32 w,h,uv_pitch; u64 pts,serial; int end; } VDecFrame;
+typedef struct { u32 image,w,h; u64 pts,serial; int end; } VDecOutput;
+typedef struct {
+  PMutex lock; KEvent* ready; u32 width,height,rate,syncpt,sync_base,handed; u64 submitted,pictures,dropped,queue_bytes,next_serial;
+  int configured,started,ended,ctx_ok; char codec[32]; VDecImage images[VDEC_IMAGES]; u32 nimages,free[VDEC_IMAGES],nfree;
+  VDecFrame frames[VDEC_FRAMES]; u32 nframes; VDecOutput outputs[VDEC_OUTPUTS]; u32 noutputs;
+#ifdef SWR_HAVE_VP9
+  vpx_codec_ctx_t ctx;
+#endif
+} VDec;
+static PMutex g_vpx_lock; static int g_vpx_lock_init;
+static u64 vdec_frame_bytes(VDec* v){ u64 w=v->width,h=v->height; return w*h+((w+1)&~1ull)*((h+1)/2); }
+static int vdec_room(VDec* v,u32 reserve){ u64 one=vdec_frame_bytes(v); return one && reserve && v->nframes+reserve<=VDEC_FRAMES && one<=VDEC_QUEUE_BYTES/reserve && v->queue_bytes<=VDEC_QUEUE_BYTES-one*reserve; }
+static KEvent* vdec_ready_event(VDec* v){ if(!v->ready){ v->ready=kevent_new("video decoder ready",0); kobj_ref(&v->ready->o); } return v->ready; }
+static void vdec_ready_update(VDec* v){ if(!v->ready) return; if(!v->ended && vdec_room(v,2)) kevent_signal(v->ready); else kevent_clear(v->ready); }
+static VDecImage* vdec_image(VDec* v,u32 id){ for(u32 i=0;i<v->nimages;i++) if(v->images[i].id==id) return &v->images[i]; return NULL; }
+static void vdec_complete(VDec* v,u32 target){ if(!v->syncpt) return; u32 cur=syncpt_read(v->syncpt); while((i32)(target-cur)>0){ syncpt_incr(v->syncpt); cur++; } }
+static void vdec_complete_all(VDec* v){ if(v->syncpt) vdec_complete(v,v->sync_base+v->handed); }
+static void vdec_cancel_free(VDec* v){ for(u32 i=0;i<v->nfree;i++){ VDecImage* vi=vdec_image(v,v->free[i]); if(vi) vi->state=2; } v->nfree=0; }
+static void vdec_free_frame(VDec* v,VDecFrame* f){ v->queue_bytes-=f->y? (u64)f->w*f->h+(u64)f->uv_pitch*((f->h+1)/2) : 0; free(f->y); memset(f,0,sizeof *f); }
+static void vdec_clear_frames(VDec* v){ while(v->nframes) vdec_free_frame(v,&v->frames[--v->nframes]); }
+/* A submission may already be scheduled from an older ready signal. Keep it successful and bounded by discarding the
+   oldest picture it overtook. Frames in output images aren't in this queue, and an EOS marker is never discarded. */
+static int vdec_make_room(VDec* v,u64 bytes,u64 pts){
+  if(bytes>VDEC_QUEUE_BYTES) return 0;
+  while(v->nframes>=VDEC_FRAMES || v->queue_bytes>VDEC_QUEUE_BYTES-bytes){ u32 i;
+    for(i=0;i<v->nframes;i++) if(!v->frames[i].end && v->frames[i].pts<=pts) break;
+    if(i==v->nframes) return 0; u64 old=v->frames[i].pts; vdec_free_frame(v,&v->frames[i]);
+    memmove(v->frames+i,v->frames+i+1,(--v->nframes-i)*sizeof *v->frames); memset(&v->frames[v->nframes],0,sizeof *v->frames); v->dropped++;
+    if(v->dropped<=8 || !(v->dropped%60)) LOG("switch 2 video: dropped queued frame %llu (pts %llu us) for newer pts %llu us, %u queued (%.1f MB)\n",(unsigned long long)v->dropped,(unsigned long long)old,(unsigned long long)pts,v->nframes,v->queue_bytes/1048576.0); }
+  return 1; }
+#ifdef SWR_HAVE_VP9
+static int vdec_codec_open(VDec* v){
+  if(v->ctx_ok) return 1;
+  vpx_codec_dec_cfg_t cfg; memset(&cfg,0,sizeof cfg); cfg.threads=1; cfg.w=v->width; cfg.h=v->height;
+  pm_lock(&g_vpx_lock); int e=vpx_codec_dec_init(&v->ctx,vpx_codec_vp9_dx(),&cfg,0); pm_unlock(&g_vpx_lock);
+  if(e){ WARN("switch 2 video: libvpx decoder init failed: %s\n",vpx_codec_err_to_string((vpx_codec_err_t)e)); return 0; }
+  v->ctx_ok=1; return 1; }
+static void vdec_codec_close(VDec* v){ if(v->ctx_ok){ pm_lock(&g_vpx_lock); vpx_codec_destroy(&v->ctx); pm_unlock(&g_vpx_lock); v->ctx_ok=0; } }
+#else
+static int vdec_codec_open(VDec* v){ (void)v; return 0; }
+static void vdec_codec_close(VDec* v){ (void)v; }
+#endif
+static void vdec_reset(VDec* v){ vdec_codec_close(v); vdec_clear_frames(v); v->ended=0; if(v->configured) vdec_codec_open(v); }
+#ifdef SWR_HAVE_VP9
+/* 1 captured, 0 unsupported output, -1 bounded queue full, -2 allocation failed */
+static int vdec_capture(VDec* v,const vpx_image_t* im,u64 fallback_pts,u64* serial){
+  if(!im || !im->d_w || !im->d_h || im->d_w>8192 || im->d_h>8192 || im->x_chroma_shift!=1 || im->y_chroma_shift!=1) return 0;
+  if(!im->planes[0] || !im->planes[1] || ((im->fmt&~VPX_IMG_FMT_HIGHBITDEPTH)!=VPX_IMG_FMT_NV12 && !im->planes[2])) return 0;
+  u32 w=im->d_w,h=im->d_h,uvp=(w+1)&~1u,ch=(h+1)/2; u64 yn=(u64)w*h,uvn=(u64)uvp*ch,total=yn+uvn;
+  u64 outpts=im->user_priv? (u64)(uintptr_t)im->user_priv-1 : fallback_pts; if(!vdec_make_room(v,total,outpts)) return -1;
+  u8* data=malloc((size_t)total); if(!data) return -2; VDecFrame* f=&v->frames[v->nframes]; memset(f,0,sizeof *f); f->y=data; f->uv=data+yn; f->w=w; f->h=h; f->uv_pitch=uvp;
+  f->pts=outpts; f->serial=++v->next_serial; *serial=f->serial;
+  int high=(im->fmt&VPX_IMG_FMT_HIGHBITDEPTH)!=0, shift=high && im->bit_depth>8? (int)im->bit_depth-8 : 0;
+  for(u32 y=0;y<h;y++){ const u8* s=im->planes[0]+(i64)y*im->stride[0]; u8* d=f->y+(u64)y*w;
+    if(high) for(u32 x=0;x<w;x++){ u16 q; memcpy(&q,s+x*2,2); d[x]=(u8)(q>>shift); } else memcpy(d,s,w); }
+  if((im->fmt&~VPX_IMG_FMT_HIGHBITDEPTH)==VPX_IMG_FMT_NV12){ for(u32 y=0;y<ch;y++){ u32 n=im->stride[1]<0? (u32)-im->stride[1] : (u32)im->stride[1]; if(n>uvp) n=uvp; memcpy(f->uv+(u64)y*uvp,im->planes[1]+(i64)y*im->stride[1],n); } }
+  else { int flip=(im->fmt&VPX_IMG_FMT_UV_FLIP)!=0; const u8* up=im->planes[flip?2:1]; const u8* vp=im->planes[flip?1:2]; int us=im->stride[flip?2:1],vs=im->stride[flip?1:2]; u32 cw=(w+1)/2;
+    for(u32 y=0;y<ch;y++){ u8* d=f->uv+(u64)y*uvp; const u8* u=up+(i64)y*us; const u8* q=vp+(i64)y*vs;
+      for(u32 x=0;x<cw;x++){ if(high){ u16 a,b; memcpy(&a,u+x*2,2); memcpy(&b,q+x*2,2); d[x*2]=(u8)(a>>shift); d[x*2+1]=(u8)(b>>shift); } else { d[x*2]=u[x]; d[x*2+1]=q[x]; } } } }
+  v->queue_bytes+=total; v->nframes++; return 1; }
+#endif
+static int vdec_write(VDec* v,VDecImage* vi,VDecFrame* f,u32* ow,u32* oh){
+  NsImage* im=image_find(vi->id); if(!im || !im->decoder) return 0; u32 lw=(im->pref[2]&0xFFFF)+1,lh=(im->pref[2]>>16)+1; u64 pitch=(lw+63)&~63ull,chroma=pitch*((lh+127)&~127ull),size=chroma+pitch*(((lh+1)/2+127)&~127ull);
+  u64 base=nvmap_addr(im->mem),msz=nvmap_size(im->mem); if(!base || im->off>msz || size>msz-im->off || size>im->size || !guest_span_writable(base+im->off,size,1)) return 0;
+  u8* d=GP(base+im->off); memset(d,0,(size_t)size); *ow=f->y? (f->w<lw?f->w:lw) : (v->width<lw?v->width:lw); *oh=f->y? (f->h<lh?f->h:lh) : (v->height<lh?v->height:lh);
+  if(!f->y) return 1;
+  for(u32 y=0;y<*oh;y++) memcpy(d+(u64)y*pitch,f->y+(u64)y*f->w,*ow);
+  u32 cw=(*ow+1)&~1u,ch=(*oh+1)/2; for(u32 y=0;y<ch;y++) memcpy(d+chroma+(u64)y*pitch,f->uv+(u64)y*f->uv_pitch,cw); return 1; }
+static void vdec_pump(VDec* v){
+  while(v->nframes && v->nfree && v->noutputs<VDEC_OUTPUTS){ u32 id=v->free[0]; memmove(v->free,v->free+1,(--v->nfree)*sizeof *v->free); VDecImage* vi=vdec_image(v,id); if(!vi || vi->state!=1) continue;
+    if(vi->has_release && vi->release_id<192) syncpt_wait(vi->release_id,vi->release_val,100000000);
+    vi->has_release=0;
+    VDecFrame f=v->frames[0]; memmove(v->frames,v->frames+1,(--v->nframes)*sizeof *v->frames); u32 w=0,h=0; int wrote=vdec_write(v,vi,&f,&w,&h);
+    if(!wrote){ vi->state=2; WARN("switch 2 video: image %u lost its writable decoder memory\n",id); vdec_free_frame(v,&f); continue; }
+    vi->state=2; v->outputs[v->noutputs++]=(VDecOutput){id,w,h,f.pts,f.serial,f.end}; vdec_complete(v,vi->target); v->pictures++;
+    if(v->pictures==1 || !(v->pictures%120) || f.end) LOG("switch 2 video: frame %llu (%ux%u, pts %llu us%s) in image %u, %u queued, %llu dropped\n",(unsigned long long)v->pictures,w,h,(unsigned long long)f.pts,f.end? ", end" : "",id,v->nframes,(unsigned long long)v->dropped);
+    vdec_free_frame(v,&f); }
+  vdec_ready_update(v); }
+static void vdec_handout(VDec* v,IpcCtx* c,u32 id,u32 release_word,u32 release_val,int release){
+  VDecImage* vi=vdec_image(v,id); if(!vi && v->nimages<VDEC_IMAGES){ vi=&v->images[v->nimages++]; memset(vi,0,sizeof *vi); vi->id=id; }
+  if(!vi || vi->state==1){ out32(c,~0u); out32(c,0); out32(c,0); out32(c,0); return; }
+  vi->state=1; vi->target=v->sync_base+(++v->handed); vi->has_release=release && release_word!=~0u; vi->release_id=~release_word; vi->release_val=release_val; v->free[v->nfree++]=id;
+  out32(c,~v->syncpt); out32(c,0); out32(c,vi->target); out32(c,0); vdec_pump(v); }
+static void vdec_destroy(SvcObj* o){ VDec* v=o->data; pm_lock(&v->lock); vdec_complete_all(v); vdec_codec_close(v); vdec_clear_frames(v); pm_unlock(&v->lock); if(v->ready) kobj_unref(&v->ready->o); }
+static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data; int rc=0; pm_lock(&v->lock);
   switch(c->cmd){
-    case 3: out_copy_h(c,ev_h(vdec_ready(v))); return 0;                 /* GetEvent */
-    case 6: case 8: case 207: kevent_signal(vdec_ready(v)); return 0;    /* Start / Flush / Stop */
-    case 109: case 400: kevent_signal(vdec_ready(v)); out64(c,0); return 0; /* SubmitInputBuffer */
+    case 3: out_copy_h(c,ev_h(vdec_ready_event(v))); vdec_ready_update(v); break;
+    case 6: v->started=1; if(v->configured && !v->ctx_ok) vdec_codec_open(v); vdec_ready_event(v); vdec_ready_update(v); break;
+    case 8: case 207: vdec_complete_all(v); vdec_cancel_free(v); vdec_reset(v); v->noutputs=0; vdec_ready_event(v); vdec_ready_update(v); break;
+    case 115: vdec_complete_all(v); vdec_cancel_free(v); vdec_codec_close(v); vdec_clear_frames(v); v->started=0; v->ended=1; break;
+    case 200: case 201: case 202: case 210: break;
+    case 101: { u64 a=0,n=0; char name[32]={0}; if(buf_in(c,0,&a,&n) && n && guest_span_readable(a,n,1)){ u64 z=n<sizeof name-1?n:sizeof name-1; memcpy(name,GP(a),(size_t)z); }
+      v->width=in32(c,0); v->height=in32(c,4); v->rate=in32(c,8); if(!v->width || v->width>8192 || !v->height || v->height>8192) rc=K_INVSIZE;
+      else if(!strstr(name,"vp9")) rc=K_NOTIMPL; else { strncpy(v->codec,name,sizeof v->codec-1); v->configured=1; vdec_reset(v); if(!v->ctx_ok) rc=K_NOTIMPL; }
+      LOG("switch 2 video: configure codec \"%s\" %ux%u rate %u (%x)\n",name,v->width,v->height,v->rate,rc); break; }
+    case 311: { u32 id=in32(c,0); NsImage* im=image_find(id); u64 base=im?nvmap_addr(im->mem):0,msz=im?nvmap_size(im->mem):0;
+      if(!im || !im->decoder || !base || im->off>msz || im->size>msz-im->off || !guest_span_writable(base+im->off,im->size,1) || vdec_image(v,id) || v->nimages>=VDEC_IMAGES){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); }
+      else { vdec_handout(v,c,id,0,0,0); LOG("switch 2 video: registered output image %u on syncpoint %u value %u\n",id,v->syncpt,v->handed); } break; }
+    case 314: { u32 id=in32(c,0); VDecImage* vi=vdec_image(v,id); if(!vi || vi->state!=2){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); } else vdec_handout(v,c,id,in32(c,8),in32(c,16),1); break; }
+    case 212: { u32 id=in32(c,0); VDecImage* vi=vdec_image(v,id); if(!vi){ rc=K_NOTFOUND; break; } if(vi->state==1) vdec_complete(v,vi->target);
+      for(u32 i=0;i<v->nfree;i++) if(v->free[i]==id){ memmove(v->free+i,v->free+i+1,(--v->nfree-i)*sizeof *v->free); break; }
+      for(u32 i=0;i<v->noutputs;) if(v->outputs[i].image==id) memmove(v->outputs+i,v->outputs+i+1,(--v->noutputs-i)*sizeof *v->outputs); else i++;
+      *vi=v->images[--v->nimages]; break; }
+    case 213: if(!v->noutputs) rc=0x1c286f; else { VDecOutput q=v->outputs[0]; memmove(v->outputs,v->outputs+1,(--v->noutputs)*sizeof *v->outputs); u64 ns=q.pts*1000;
+      out32(c,q.image); out32(c,q.w); out32(c,q.h); out32(c,q.w); out32(c,q.h); out32(c,0); out32(c,(u32)ns); out32(c,(u32)(ns>>32)); out32(c,q.end?1:0); for(int i=0;i<7;i++) out32(c,0); } break;
+    case 109: case 400: { u64 a=0,n=0,pts=in64(c,0),last=0; int end=in8(c,8)!=0; if(!v->configured || !v->ctx_ok) rc=K_INVSTATE;
+      else if(!buf_in(c,0,&a,&n) || n>64u<<20 || (n && !guest_span_readable(a,n,1))) rc=K_INVSIZE;
+#ifdef SWR_HAVE_VP9
+      else { pm_lock(&g_vpx_lock); int e=vpx_codec_decode(&v->ctx,n?GP(a):NULL,(unsigned)n,(void*)(uintptr_t)(pts+1),0); vpx_codec_iter_t it=NULL; const vpx_image_t* im;
+        int cap=1; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break;
+        pm_unlock(&g_vpx_lock); vdec_pump(v);
+        if(!e && cap==1 && end){ pm_lock(&g_vpx_lock); e=vpx_codec_decode(&v->ctx,NULL,0,(void*)(uintptr_t)(pts+1),0); it=NULL; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break; pm_unlock(&g_vpx_lock); vdec_pump(v); }
+        if(e){ WARN("switch 2 video: VP9 decode failed: %s\n",vpx_codec_err_to_string((vpx_codec_err_t)e)); rc=K_INVSIZE; }
+        else if(cap!=1){ WARN("switch 2 video: decoded output could not be queued (%s, %u frames, %.1f MB)\n",cap<0? (cap==-1? "capacity" : "allocation") : "format",v->nframes,v->queue_bytes/1048576.0); rc= cap==-2? K_OUTOFRES : K_INVSIZE; }
+        else if(end){ if(last){ for(u32 i=0;i<v->nframes;i++) if(v->frames[i].serial==last) v->frames[i].end=1; for(u32 i=0;i<v->noutputs;i++) if(v->outputs[i].serial==last) v->outputs[i].end=1; }
+          else if(vdec_make_room(v,0,pts)){ VDecFrame* f=&v->frames[v->nframes++]; memset(f,0,sizeof *f); f->pts=pts; f->serial=++v->next_serial; f->end=1; }
+          v->ended=1; vdec_pump(v); }
+      }
+#else
+      else { (void)last; rc=K_NOTIMPL; }
+#endif
+      if(!rc){ u64 id=++v->submitted; out64(c,id); if(id<=24 || !(id%120)) LOG("switch 2 video: submit %llu, %llu bytes, pts %llu us%s, %llu output, %u queued (%.1f MB), %llu dropped\n",(unsigned long long)id,(unsigned long long)n,(unsigned long long)pts,end? ", end" : "",(unsigned long long)v->pictures,v->nframes,v->queue_bytes/1048576.0,(unsigned long long)v->dropped); }
+      vdec_ready_update(v);
+      break; }
+    default: pm_unlock(&v->lock); return ns2_unknown(o,c);
   }
-  return ns2_unknown(o,c); }
+  pm_unlock(&v->lock); return rc; }
 static int vdec_disp(SvcObj* o, IpcCtx* c){
-  if(c->cmd==1){ SvcObj* s=svcobj_new("IVideoDecoderService",vdec_svc_disp,sizeof(VDec)); s->destroy=vdec_destroy; return move_obj(c,s,0); }
+  if(c->cmd==1){ SvcObj* s=svcobj_new("IVideoDecoderService",vdec_svc_disp,sizeof(VDec)); VDec* v=s->data; pm_init(&v->lock); ns2_lock(); if(!g_vpx_lock_init){ pm_init(&g_vpx_lock); g_vpx_lock_init=1; } ns2_unlock(); v->syncpt=syncpt_alloc(); v->sync_base=syncpt_read(v->syncpt); s->destroy=vdec_destroy; return move_obj(c,s,0); }
   return ns2_unknown(o,c); }
 
 static int vi2_disp(SvcObj* o, IpcCtx* c){   /* IVi2Session */
@@ -397,20 +523,19 @@ static int gsv_disp(SvcObj* o, IpcCtx* c){
        ok to everything for now, its commands show up in the log */
     case 901: case 1001: break;                                        /* the video decoder's contexts */
     case 902: case 906: case 1002: rc=move_obj(c,svcobj_new("IVideoDecoderSession",vdec_disp,0),0); break;
-    /* 991: nn::codec::CalculateDecoderImagePoolBuffer, one block-linear NV12 frame: luma and chroma planes with
-       their heights rounded to 128 lines (640x360 -> 0x64000). The size words aren't known yet: logged, 640x360
-       unless the first words look like a size */
-    case 991: { u32 dims=W(c,4), w=(dims&0xFFFF)+1, h=(dims>>16)+1;   /* pref[2] packs (w-1)|(h-1)<<16, pref[1] is the layout code: 1/4 NV12, 2/5 BGRA, else RGBA */
-      if(w<16 || w>8192 || h<16 || h>8192){ w=640; h=360; }
-      u64 pitch=(w+63)&~63ull, sz=pitch*((h+127)&~127ull)+pitch*(((h+1)/2+127)&~127ull);
-      { static int said; if(said<sw2_cap(2)){ said++; LOG("switch 2: decoder image size {%x %x %x %x} -> %ux%u, %llx bytes\n",W(c,2),W(c,3),W(c,4),W(c,5),w,h,(unsigned long long)sz); } }
+    /* 991: nn::codec::CalculateDecoderImagePoolBuffer. NV12 planes have 64-byte rows and 128-row blocks. */
+    case 991: { u32 dims=W(c,4), w=(dims&0xFFFF)+1, h=(dims>>16)+1, count=W(c,18);   /* pref[2] packs (w-1)|(h-1)<<16 */
+      if(w<16 || w>8192 || h<16 || h>8192 || !count || count>VDEC_IMAGES){ rc=K_INVSIZE; out64(c,0); out64(c,0x8000); break; }
+      u64 pitch=(w+63)&~63ull, one=pitch*((h+127)&~127ull)+pitch*(((h+1)/2+127)&~127ull),sz=one*count;
+      { static int said; if(said<sw2_cap(2)){ said++; LOG("switch 2: decoder image size {%x %x %x %x}, count %u -> %ux%u, %llx bytes\n",W(c,2),W(c,3),W(c,4),W(c,5),count,w,h,(unsigned long long)sz); } }
       out64(c,sz); out64(c,0x8000); break; }
     /* 911: CreateDecoderImagePool {preference[16], count, memory}: count images sharing the pool memory, image i at
        offset layout.size*i, handle = first + i. The decoder writes NV12 into these (gsv 961 describes the layout). */
     case 911: { u32 p[16]; for(int i=0;i<16;i++) p[i]=W(c,2+i); u32 mem=W(c,19), count=W(c,18);
       u32 dims=p[2], w=(dims&0xFFFF)+1, h=(dims>>16)+1; if(w<16 || w>8192 || h<16 || h>8192){ w=640; h=360; }
       u64 pitch=(w+63)&~63ull, isz=pitch*((h+127)&~127ull)+pitch*(((h+1)/2+127)&~127ull);
-      if(!mem || !native_mem_has(mem) || !count || !isz){ rc=K_NOTFOUND; if(rc) out32(c,0); break; }
+      if(!mem || !native_mem_has(mem) || !nvmap_addr(mem)){ rc=K_NOTFOUND; out32(c,0); break; }
+      if(!count || count>VDEC_IMAGES || isz>nvmap_size(mem) || count>nvmap_size(mem)/isz){ rc=K_INVSIZE; out32(c,0); break; }
       if(g_nimg+count>1024) rc=K_OUTOFRES;
       else { u32 first=g_next_img; for(u32 i=0;i<count;i++){ NsImage* im=&g_img[g_nimg++]; memset(im,0,sizeof *im); im->id=g_next_img++; im->mem=mem; memcpy(im->pref,p,sizeof p); im->size=isz; im->off=(u64)i*isz; im->decoder=1; }
         out32(c,first); }

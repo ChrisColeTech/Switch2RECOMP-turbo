@@ -84,9 +84,10 @@ typedef DWORD (WINAPI *XSetState)(DWORD, XVIB*);
 static XSetState xset;
 static DWORD g_xuser=(DWORD)~0;                    /* the XInput user index that owns input */
 static volatile LONG g_vib_dirty; static WORD g_vib_left,g_vib_right; static u64 g_vib_last;
-static CRITICAL_SECTION g_vib_lock;
+static CRITICAL_SECTION g_vib_lock; static int g_vib_inited;
 
 static void xinput_load(void){
+  if(!g_vib_inited){ InitializeCriticalSection(&g_vib_lock); g_vib_inited=1; }
   const char* dl[]={"xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"};
   for(int i=0;i<3 && !xget;i++){ HMODULE h=LoadLibraryA(dl[i]); if(h){ xget=(XGetState)GetProcAddress(h,"XInputGetState");
     if(!xset) xset=(XSetState)GetProcAddress(h,"XInputSetState"); if(xget) break; } }
@@ -111,8 +112,6 @@ void backend_vibration_stop(void){
 /* called from the frontend poll: flushes at most one physical write per frame, stop always goes out immediately */
 void hid_vibration_flush(void){
   if(!xset || g_xuser==(DWORD)~0) return;
-  static int inited;
-  if(!inited){ inited=1; InitializeCriticalSection(&g_vib_lock); }
   int dirty=InterlockedExchange(&g_vib_dirty,0);
   if(!dirty) return;
   EnterCriticalSection(&g_vib_lock); XVIB v; v.wLeftMotorSpeed=g_vib_left; v.wRightMotorSpeed=g_vib_right; LeaveCriticalSection(&g_vib_lock);

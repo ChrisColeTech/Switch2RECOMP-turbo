@@ -321,6 +321,7 @@ Android (APK builds, touch controls, the GLES renderer) is gone from the code.
 - fps_limit=30 shows every other image while the game keeps running 60 steps a second.
 - Linux: copying a game's RomFS uses rsync when it's installed (only new or changed files), the Python copy otherwise.
 - VP9 WebM movies: the runtime indexes the .webm files the game reads and decodes the NVDEC VP9 jobs with libvpx (code adapted from Metroid Dread Recomp, AGPL-3.0; libvpx headers and license in runtime/vp9). libvpx 1.14.0 (VP9 decoder only, built from source with Ubuntu's security patches) is linked into the Linux and Windows runtimes.
+- Switch 2 video decoder sessions decode the VP9 packets submitted through GSV into their NV12 output image pools, with real syncpoint fences and end-of-stream output metadata. Their bounded decoded-frame queue drops old pictures overtaken by newer PTS values instead of aborting when a movie submits faster than it recycles its two output images.
 - Mario Kart World's virtual textures (8192x8192 arrays of 68 layers: the track and terrain) were a black 1x1
   stand-in. They're kept without their top mips (SWR_VT_TEXELS_LOG2, 26 by default), and a layer goes up again
   when its bytes change. The black normal maps gave NaN (black blocks and the red/white bokeh over the image).
