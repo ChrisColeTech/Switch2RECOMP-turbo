@@ -10,7 +10,7 @@ instruction templates). The runtime provides HLE kernel/services and a GL render
 
 Usage:
   python switchrecomp.py GAME_FOLDER                   (with exefs/ and romfs/ from hactool)
-  python switchrecomp.py game.nup                      (ExeFS materialized, RomFS read in place)
+  python switchrecomp.py game.nup|game.nsp             (ExeFS materialized, RomFS read in place)
   python switchrecomp.py game.nro                      (homebrew)
   python switchrecomp.py FOLDER -o Game --cc gcc -O 2 --jobs 8
 
@@ -31,7 +31,7 @@ import nxloader, codegen
 
 RT = os.path.join(HERE, 'runtime')
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'svc_ns2', 'sm86', 'gpu', 'gpu_engines',
-               'gpu_3d', 'loader', 'main', 'nup', 'nvn_hook', 'nvn_glue']
+               'gpu_3d', 'loader', 'main', 'nup', 'nsp', 'nvn_hook', 'nvn_glue']
 ABI = 1
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
 CC_DIRS = [os.path.join(HERE, *d) for d in (('tcc',), ('tools', 'tcc'), ('gcc', 'bin'), ('gcc', 'Library', 'bin'),
@@ -384,9 +384,11 @@ def sync_tree(src, dst):
 def copy_data(mods, npdm, romfs, entry, datadir, say):
     ex = os.path.join(datadir, 'exefs'); os.makedirs(ex, exist_ok=True)
     nup_marker = os.path.join(datadir, 'romfs.nup')
+    nsp_marker = os.path.join(datadir, 'romfs.nsp')
     romfs_image = os.path.join(datadir, 'romfs.bin')
     if os.path.isfile(entry) and entry.lower().endswith('.nro'):
         if os.path.exists(nup_marker): os.remove(nup_marker)
+        if os.path.exists(nsp_marker): os.remove(nsp_marker)
         shutil.copyfile(entry, os.path.join(ex, 'main.nro'))
         if isinstance(romfs, (bytes, bytearray)):
             with open(romfs_image, 'wb') as fo: fo.write(romfs)
@@ -399,6 +401,7 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
         return
     if hasattr(romfs, 'nup'):
         if os.path.exists(romfs_image): os.remove(romfs_image)
+        if os.path.exists(nsp_marker): os.remove(nsp_marker)
         for name, _, reader in romfs.nup.exefs():
             base = name.rstrip(' .').split('.', 1)[0].upper()
             reserved = {'CON', 'PRN', 'AUX', 'NUL'} | {'COM%d' % i for i in range(1, 10)} | {'LPT%d' % i for i in range(1, 10)}
@@ -416,7 +419,25 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
             fileobj.write(os.path.abspath(romfs.path) + '\n')
         say('RomFS: using %s in place' % romfs.path)
         return
+    if hasattr(romfs, 'nsp'):
+        if os.path.exists(romfs_image): os.remove(romfs_image)
+        if os.path.exists(nup_marker): os.remove(nup_marker)
+        for name, _, reader in romfs.nsp.exefs():
+            base = name.rstrip(' .').split('.', 1)[0].upper()
+            reserved = {'CON', 'PRN', 'AUX', 'NUL'} | {'COM%d' % i for i in range(1, 10)} | {'LPT%d' % i for i in range(1, 10)}
+            if (not name or name != name.rstrip(' .') or any(ch in name for ch in '/\\:')
+                    or name in ('.', '..') or base in reserved):
+                raise ValueError('unsafe ExeFS name in %s: %r' % (romfs.path, name))
+            dst = os.path.join(ex, name); data = reader()
+            current = open(dst, 'rb').read() if os.path.isfile(dst) else None
+            if current != data:
+                with open(dst, 'wb') as fileobj: fileobj.write(data)
+        with open(nsp_marker, 'w', encoding='utf-8', newline='\n') as fileobj:
+            fileobj.write(romfs.nsp.marker())
+        say('RomFS: using %s in place' % romfs.path)
+        return
     if os.path.exists(nup_marker): os.remove(nup_marker)
+    if os.path.exists(nsp_marker): os.remove(nsp_marker)
     if os.path.exists(romfs_image): os.remove(romfs_image)
     # compare contents, not sizes: after a game update main.npdm (and sometimes an NSO) keeps its
     # size, and the runtime refuses an NSO whose build id differs from the recompiled one
@@ -473,7 +494,7 @@ language=1
 
 def main():
     ap = argparse.ArgumentParser(description='Recompiles a Switch game into a native executable.')
-    ap.add_argument('input', nargs='?', help='game folder (exefs/ + romfs/), .nup package or .nro file')
+    ap.add_argument('input', nargs='?', help='game folder (exefs/ + romfs/), .nup/.nsp package or .nro file')
     ap.add_argument('-o', '--out', help='output name (no extension)')
     ap.add_argument('--outdir', help='output folder')
     ap.add_argument('--cc', help='C compiler (gcc, clang, tcc, x86_64-w64-mingw32-gcc)')
@@ -503,7 +524,7 @@ def main():
         build_runtime(cc, out, target_win, backend, say, a.O)
         say('Done: %s' % out)
         return
-    if not a.input: ap.error('the game folder, .nup package or .nro file is required')
+    if not a.input: ap.error('the game folder, .nup/.nsp package or .nro file is required')
     # check the compiler first, not after minutes of translation
     cc = None
     if not a.no_build:

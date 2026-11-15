@@ -82,10 +82,12 @@ The results go to `bin/`.
 ```sh
 python3 switchrecomp.py /path/to/game -o MyGame
 python3 switchrecomp.py /path/to/game.nup -o MyGame
+SWR_PROD_KEYS=/path/to/prod.keys python3 switchrecomp.py /path/to/game.nsp -o MyGame
 ```
 
 `/path/to/game` may hold extracted `exefs/` and `romfs/` folders, or the input may be an indexed Switch 2 `.nup`
-package. With a NUP, only ExeFS is materialized; the runtime reads RomFS directly from the original package. See
+or standard application `.nsp`. With either package, only ExeFS is materialized; the runtime reads RomFS directly
+from the original package. Install legally dumped keys from the launcher's Keys menu before adding an NSP. See
 `docs/NUP_IN_PLACE.md`, `docs/BUILD_ENVIRONMENT_GUIDE.md`, and `README.txt` for the full steps and options.
 
 ## License

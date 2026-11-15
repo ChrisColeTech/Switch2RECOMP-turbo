@@ -30,6 +30,7 @@ QString Game::dataDir() const { return QDir(buildDir).filePath(outputName + "_da
 QString Game::iniPath() const { return QDir(buildDir).filePath(outputName + ".ini"); }
 QString Game::format() const {
     if (source.endsWith(".nup", Qt::CaseInsensitive)) return "DIRECT NUP";
+    if (source.endsWith(".nsp", Qt::CaseInsensitive)) return "DIRECT NSP";
     if (source.endsWith(".nro", Qt::CaseInsensitive)) return "HOMEBREW";
     return source.isEmpty() ? "NATIVE BUILD" : "EXTRACTED";
 }
@@ -100,6 +101,7 @@ QProcessEnvironment Toolchain::environment() const {
     paths << env.value("PATH"); env.insert("PATH", paths.join(QDir::listSeparator()));
     if (!python.isEmpty()) env.insert("SWR_PYTHON", python);
     if (!dotnet.isEmpty()) env.insert("DOTNET_ROOT", QFileInfo(dotnet).absolutePath());
+    if (!keys.isEmpty()) env.insert("SWR_PROD_KEYS", keys);
 #ifdef Q_OS_LINUX
     QStringList libs{QDir(root).filePath("lib"), QDir(root).filePath("gcc/lib"), QDir(root).filePath("shader-tools/lib")};
     if (!env.value("LD_LIBRARY_PATH").isEmpty()) libs << env.value("LD_LIBRARY_PATH");
@@ -128,7 +130,7 @@ bool Library::load(QString* error) {
         return fail(error, "The library file is invalid or from an unsupported version. It was left untouched: " + path);
     }
     const auto o = doc.object();
-    toolRoot = o["toolRoot"].toString(); outputRoot = o["outputRoot"].toString();
+    toolRoot = o["toolRoot"].toString(); outputRoot = o["outputRoot"].toString(); keysPath = o["keysPath"].toString();
     jobs = qBound(1, o["jobs"].toInt(8), 64);
     viewMode = qBound(0, o["viewMode"].toInt(), 1);
     coverWidth = qBound(130, o["coverWidth"].toInt(180), 240);
@@ -150,7 +152,7 @@ bool Library::save(QString* error) const {
     if (!QDir().mkpath(QFileInfo(path).absolutePath())) return fail(error, "Cannot create the library directory.");
     QJsonArray entries;
     for (const auto& g : games) entries.append(g.json());
-    QJsonObject o{{"schema", 1}, {"games", entries}, {"toolRoot", toolRoot}, {"outputRoot", outputRoot}, {"jobs", jobs},
+    QJsonObject o{{"schema", 1}, {"games", entries}, {"toolRoot", toolRoot}, {"outputRoot", outputRoot}, {"keysPath", keysPath}, {"jobs", jobs},
         {"viewMode", viewMode}, {"coverWidth", coverWidth}, {"showBackground", showBackground},
         {"colorMode", colorMode}, {"accentColor", accentColor},
         {"geometry", QString::fromLatin1(geometry.toBase64())}, {"dockState", QString::fromLatin1(dockState.toBase64())}};
@@ -200,8 +202,9 @@ bool validSource(const QString& source, QString* error) {
     if (!file.open(QIODevice::ReadOnly)) return fail(error, file.errorString());
     const auto header = file.read(0x14);
     if (info.suffix().compare("nup", Qt::CaseInsensitive) == 0 && header.startsWith(QByteArray("NUP\1", 4))) return true;
+    if (info.suffix().compare("nsp", Qt::CaseInsensitive) == 0 && header.startsWith("PFS0")) return true;
     if (info.suffix().compare("nro", Qt::CaseInsensitive) == 0 && header.mid(0x10, 4) == "NRO0") return true;
-    return fail(error, "Select an indexed NUP package, an NRO, or an extracted ExeFS folder.");
+    return fail(error, "Select an indexed NUP, a standard application NSP, an NRO, or an extracted ExeFS folder.");
 }
 Game gameFromSource(const QString& source, const QString& outputRoot) {
     Game g;
@@ -221,6 +224,11 @@ bool gameFromExecutable(const QString& path, Game* game, QString* error) {
     if (!g.hasBuild()) return fail(error, "A native build needs its executable, matching code module, and _data folder together.");
     QFile marker(QDir(g.dataDir()).filePath("romfs.nup"));
     if (marker.open(QIODevice::ReadOnly)) g.source = QString::fromUtf8(marker.readLine()).trimmed();
+    if (g.source.isEmpty()) {
+        QFile nspMarker(QDir(g.dataDir()).filePath("romfs.nsp"));
+        if (nspMarker.open(QIODevice::ReadOnly) && nspMarker.readLine().trimmed() == "SWRNSP1")
+            g.source = QString::fromUtf8(nspMarker.readLine()).trimmed();
+    }
     g.builtSource = g.source; g.renderer = readRenderer(g.iniPath());
     for (const auto& name : {"icon.jpg", "icon.png", "icon_AmericanEnglish.dat"}) {
         const QString icon = QDir(g.dataDir()).filePath(name);
@@ -269,7 +277,7 @@ bool writeRenderer(const QString& ini, const QString& renderer, QString* error) 
 
 bool LibraryFilter::matches(const Game& game, bool running, bool building) const {
     if (!game.title.contains(text.trimmed(), Qt::CaseInsensitive)) return false;
-    const bool nup = game.source.endsWith(".nup", Qt::CaseInsensitive);
+    const bool nup = inPlacePackage(game.source);
     const bool nro = game.source.endsWith(".nro", Qt::CaseInsensitive);
     if (source == 1 && !nup) return false;
     if (source == 2 && !nro) return false;
@@ -280,13 +288,16 @@ bool LibraryFilter::matches(const Game& game, bool running, bool building) const
     if (state == 3 && !running) return false;
     return true;
 }
+bool inPlacePackage(const QString& path) {
+    return path.endsWith(".nup", Qt::CaseInsensitive) || path.endsWith(".nsp", Qt::CaseInsensitive);
+}
 int LibraryFilter::activeCount() const { return (!text.trimmed().isEmpty() ? 1 : 0) + (state != 0 ? 1 : 0) + (source != 0 ? 1 : 0); }
 
 CardState cardState(const Game& game, bool running, bool building, bool otherBuild, bool toolsReady) {
     if(building)return {"Cancel build","Building",true,false,true,false};
     if(running)return {"Stop","Running",true,false,false,true};
     if(game.hasBuild()){
-        if(game.source.endsWith(".nup",Qt::CaseInsensitive)&&!game.sourceAvailable())
+        if(inPlacePackage(game.source)&&!game.sourceAvailable())
             return {"Play","Source offline",false,true,false,false};
         return {"Play","Ready to play",true,false,false,false};
     }

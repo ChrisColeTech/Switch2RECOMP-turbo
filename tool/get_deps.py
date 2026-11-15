@@ -5,7 +5,7 @@
 # password, nothing installed on the system): GCC/G++ from conda-forge into gcc/, and on linux SDL2 into lib/ (from the
 # pysdl2-dll wheel on PyPI). started by Install.bat (windows, after it got python) or Install.sh (linux).
 #   get_deps.py           everything that's missing
-#   get_deps.py gcc|sdl   only that
+#   get_deps.py gcc|sdl|hactool   only that
 import hashlib, io, json, os, shutil, sys, tarfile, tempfile, time, urllib.request, zipfile
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,6 +64,9 @@ SDL_WHEEL = ('https://files.pythonhosted.org/packages/5d/6e/07ec92ba241b2aa941ab
              'pysdl2_dll-2.32.10-py2.py3-none-manylinux2014_x86_64.whl',
              '12b136c38114ae0f8a85453a879795ba5d61663d98673ba19c36c3008ff00353')
 LIB = os.path.join(HERE, 'lib')
+HACTOOL = os.path.join(HERE, 'tools', 'hactool')
+HACTOOL_ZIP = ('https://github.com/SciresM/hactool/releases/download/1.4.0/hactool-1.4.0-win.zip',
+               '36e9a221c8a7949c86ada9388eb703c90663aedfe9f65b6032429614c5e1abe8')
 
 
 def fetch(url, sha, cache, tries=4):
@@ -235,6 +238,27 @@ def install_sdl():
     return 0 if sdl_ok() else 1
 
 
+def install_hactool():
+    print('hactool (reads the encrypted header of user-provided NSP files)')
+    if not WIN:
+        if shutil.which('hactool'):
+            print('  using %s\n' % shutil.which('hactool')); return 0
+        print('  hactool is not installed; direct NSP builds currently require it on Linux\n'); return 1
+    exe = os.path.join(HACTOOL, 'hactool.exe')
+    if os.path.isfile(exe):
+        print('  already there\n'); return 0
+    try:
+        data = fetch(HACTOOL_ZIP[0], HACTOOL_ZIP[1], os.path.join(HACTOOL, '_downloads', 'hactool.zip'))
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        payload = archive.read('hactool.exe')
+        os.makedirs(HACTOOL, exist_ok=True)
+        open(exe, 'wb').write(payload)
+        shutil.rmtree(os.path.join(HACTOOL, '_downloads'), ignore_errors=True)
+    except Exception as e:
+        print('  the download failed: %s\n' % e); return 1
+    print('  done\n'); return 0
+
+
 def system_gcc():
     # linux: a gcc the system already has is enough, SwitchRecomp uses it when gcc/ isn't there
     return not WIN and shutil.which('gcc') is not None
@@ -266,11 +290,12 @@ def install_gcc(force=False):
 
 
 def main():
-    what = sys.argv[1:] or (['gcc'] if WIN else ['sdl', 'gcc'])
+    what = sys.argv[1:] or (['gcc', 'hactool'] if WIN else ['sdl', 'gcc'])
     print('SwitchRecomp: installing what is missing (into the SwitchRecomp folder, nothing goes on the system)\n')
     r = 0
     if 'sdl' in what and not WIN: r |= install_sdl()
     if 'gcc' in what: r |= install_gcc(force=os.environ.get('SWR_OWN_GCC') == '1')
+    if 'hactool' in what: r |= install_hactool()
     print('All done!' if not r else 'Something failed, see above.')
     return r
 

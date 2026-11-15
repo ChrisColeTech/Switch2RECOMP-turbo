@@ -39,7 +39,7 @@ struct Game {
 };
 
 struct Toolchain {
-    QString root, python, compiler, runtime, dotnet;
+    QString root, python, compiler, runtime, dotnet, keys;
     bool canBuild() const;
     QString problem() const;
     QProcessEnvironment environment() const;
@@ -56,7 +56,7 @@ public:
     const Game* find(const QString& id) const;
     bool add(Game game);
     QString path;
-    QString toolRoot, outputRoot;
+    QString toolRoot, outputRoot, keysPath;
     int jobs = 8;
     int viewMode = 0, coverWidth = 180;
     bool showBackground = true;
@@ -75,11 +75,12 @@ bool gameFromExecutable(const QString& path, Game* game, QString* error);
 bool writeRenderer(const QString& ini, const QString& renderer, QString* error);
 QString readRenderer(const QString& ini);
 bool samePath(const QString& left, const QString& right);
+bool inPlacePackage(const QString& path);
 
 struct LibraryFilter {
     QString text;
     int state = 0; // All, Ready, Needs build, Running.
-    int source = 0; // All, NUP, NRO, extracted, existing native build.
+    int source = 0; // All, package, NRO, extracted, existing native build.
     bool matches(const Game& game, bool running = false, bool building = false) const;
     int activeCount() const;
 };

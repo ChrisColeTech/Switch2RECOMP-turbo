@@ -44,10 +44,12 @@ provides portable packages. Re-running setup is safe: already installed componen
 | `scripts\setup.bat` | Installs portable Windows Python and GCC |
 | `scripts\build-runtime.bat` | Builds `bin\runtime_win64_win32.exe` |
 | `scripts\build-from-nup.bat` | Recompiles a NUP for Windows and leaves its RomFS in the package |
+| `scripts\build-from-nsp.bat` | Recompiles a supported application NSP for Windows and leaves its RomFS in the package |
 | `scripts\build-launcher.bat [-QtPrefix path]` | Builds/tests the Qt desktop launcher and deploys Qt to `bin\launcher` |
 | `scripts/setup.sh` | Installs Linux dependencies |
 | `scripts/build-runtime.sh` | Builds `bin/runtime_linux_x11` |
 | `scripts/build-from-nup.sh` | Recompiles a NUP for Linux and leaves its RomFS in the package |
+| `scripts/build-from-nsp.sh` | Recompiles a supported application NSP for Linux when hactool is installed |
 
 Every runnable script exits 0 on success and nonzero on failure. All arguments after the NUP path are passed to
 `switchrecomp.py`, including `-o`, `--outdir`, `-O`, `--jobs`, `--runtime`, and `--native`.
@@ -80,6 +82,9 @@ python\python.exe switchrecomp.py --build-runtime --target win64 --backend win32
 ```
 
 ## 5. Build From A NUP
+
+For NSP inputs, install `prod.keys` from the Qt launcher's **Keys > Install keys** menu, or set
+`SWR_PROD_KEYS`, then use the matching `build-from-nsp` script. See [NSP_IN_PLACE.md](NSP_IN_PLACE.md).
 
 Use a stable output directory. The generated executable, native code module, settings, saves, and caches live there;
 the original NUP remains the only RomFS copy.

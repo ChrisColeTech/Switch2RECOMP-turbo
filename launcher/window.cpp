@@ -18,6 +18,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QHeaderView>
@@ -35,12 +36,14 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStatusBar>
+#include <QStandardPaths>
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
@@ -124,6 +127,8 @@ Window::Window(const QString& file,const QString& root,bool isDemo):library(file
     setWindowTitle("SwitchRecomp");resize(1280,800);setMinimumSize(920,600);setAcceptDrops(true);
     setDockOptions(QMainWindow::AllowTabbedDocks|QMainWindow::AnimatedDocks);
     QString error;library.load(&error);
+    const QString installedKeys=QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)).filePath("keys/prod.keys");
+    if(library.keysPath.isEmpty()&&QFileInfo(installedKeys).isFile())library.keysPath=installedKeys;
     if(!root.isEmpty())library.toolRoot=QFileInfo(root).absoluteFilePath();
     if(library.toolRoot.isEmpty())library.toolRoot=Toolchain::discoverRoot();
     Theme::apply(*qApp,library.colorMode,library.accentColor);
@@ -172,8 +177,8 @@ Window::Window(const QString& file,const QString& root,bool isDemo):library(file
 
 void Window::createActions(){
     auto make=[this](const QString& name,const QString& icon,const QString& tip){auto* a=new QAction(commandIcon(icon),name,this);a->setProperty("iconKind",icon);a->setToolTip(tip);return a;};
-    addAction=make("Add game","add","Add a NUP package or NRO (Ctrl+O)");addAction->setShortcut(QKeySequence("Ctrl+O"));
-    connect(addAction,&QAction::triggered,this,[this]{for(const auto& p:QFileDialog::getOpenFileNames(this,"Add game",{},"Game packages (*.nup *.nro)"))importSource(p);});
+    addAction=make("Add game","add","Add a NUP/NSP package or NRO (Ctrl+O)");addAction->setShortcut(QKeySequence("Ctrl+O"));
+    connect(addAction,&QAction::triggered,this,[this]{for(const auto& p:QFileDialog::getOpenFileNames(this,"Add game",{},"Game packages (*.nup *.nsp *.nro)"))importSource(p);});
     addFolderAction=make("Add extracted folder…","folder","Add a folder containing ExeFS and RomFS");
     connect(addFolderAction,&QAction::triggered,this,[this]{auto p=QFileDialog::getExistingDirectory(this,"Add extracted game folder");if(!p.isEmpty())importSource(p);});
     importAction=make("Import build…","import","Add an already compiled game to your library");
@@ -184,6 +189,7 @@ void Window::createActions(){
     propertiesAction=make("Properties","properties","Game files, build options, renderer, and artwork (Alt+Enter)");propertiesAction->setShortcut(QKeySequence("Alt+Return"));connect(propertiesAction,&QAction::triggered,this,[this]{showProperties();});
     buildOptionsAction=new QAction("Build options…",this);connect(buildOptionsAction,&QAction::triggered,this,[this]{showProperties(1);});
     settingsAction=make("Settings","settings","Toolkit paths, defaults, and appearance");connect(settingsAction,&QAction::triggered,this,[this]{showSettings();});
+    installKeysAction=new QAction("Install keys…",this);connect(installKeysAction,&QAction::triggered,this,&Window::installKeys);
     folderAction=make("Open build folder","folder","Open generated game files");connect(folderAction,&QAction::triggered,this,[this]{openFolder();});
     saveFolderAction=new QAction("Open save folder",this);connect(saveFolderAction,&QAction::triggered,this,[this]{openFolder(true);});
     logAction=make("View game log","log","Open the runtime log");connect(logAction,&QAction::triggered,this,[this]{openGameFile(".log");});
@@ -203,6 +209,7 @@ void Window::createMenusAndToolbar(){
     auto* file=menuBar()->addMenu("&File");file->addAction(addAction);file->addAction(addFolderAction);file->addAction(importAction);file->addSeparator();file->addAction("Exit",QKeySequence("Alt+F4"),this,&QWidget::close);
     auto* game=menuBar()->addMenu("&Game");game->addAction(playAction);game->addAction(stopAction);game->addSeparator();game->addAction(propertiesAction);game->addAction(folderAction);game->addAction(saveFolderAction);game->addAction(logAction);game->addSeparator();game->addAction(removeAction);
     auto* build=menuBar()->addMenu("&Build");build->addAction(buildAction);build->addAction(buildOptionsAction);build->addAction("Show build output",QKeySequence("Ctrl+L"),this,&Window::showBuildOutput);
+    auto* keys=menuBar()->addMenu("&Keys");keys->addAction(installKeysAction);keys->addAction("Open keys folder",this,[this]{const auto path=QFileInfo(library.keysPath).absolutePath();if(QDir(path).exists())QDesktopServices::openUrl(QUrl::fromLocalFile(path));});
     auto* view=menuBar()->addMenu("&View");view->setObjectName("ViewMenu");view->addAction(galleryAction);view->addAction(tableAction);view->addSeparator();view->addAction(filterAction);view->addAction(backgroundAction);
     view->addAction("Refresh library",QKeySequence("F5"),this,[this]{invalidateArtwork();refreshTools();refreshLibrary();});
     auto* toolsMenu=menuBar()->addMenu("&Tools");toolsMenu->addAction(settingsAction);toolsMenu->addAction("Open toolkit folder",this,[this]{QDesktopServices::openUrl(QUrl::fromLocalFile(library.toolRoot));});
@@ -352,6 +359,16 @@ void Window::setViewMode(int mode){
 }
 void Window::showBuildOutput(){buildDock->show();resizeDocks({buildDock},{190},Qt::Vertical);buildDock->raise();}
 void Window::showFilters(){if(filters&&filterAnchor)filters->openBelow(filterAnchor);}
+void Window::installKeys(){
+    const QString source=QFileDialog::getOpenFileName(this,"Install Nintendo keys",{},"Nintendo key file (prod.keys);;All files (*)");if(source.isEmpty())return;
+    QFile input(source);if(!input.open(QIODevice::ReadOnly)){message("Cannot install keys",input.errorString(),true);return;}
+    const QByteArray data=input.readAll();
+    if(!data.contains("header_key")&&!data.contains("header_key_source")){message("Invalid key file","This file does not contain the NCA header keys required for NSP packages.",true);return;}
+    const QString destination=QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)).filePath("keys/prod.keys");
+    if(!QDir().mkpath(QFileInfo(destination).absolutePath())){message("Cannot install keys","The launcher could not create its keys folder.",true);return;}
+    QSaveFile output(destination);if(!output.open(QIODevice::WriteOnly)||output.write(data)!=data.size()||!output.commit()){message("Cannot install keys",output.errorString(),true);return;}
+    library.keysPath=destination;save();refreshTools();message("Keys installed","prod.keys was installed in the launcher data folder. Key contents are never copied into builds or release packages.");
+}
 void Window::setAppearance(const QString& mode,const QString& accent){
     Theme::apply(*qApp,mode,accent);
     for(auto* action:findChildren<QAction*>()){const auto kind=action->property("iconKind").toString();if(!kind.isEmpty())action->setIcon(commandIcon(kind));}
@@ -362,9 +379,9 @@ void Window::setAppearance(const QString& mode,const QString& accent){
 }
 
 void Window::refreshTools(){
-    tools=Toolchain::find(library.toolRoot);dotnetReady=false;const int generation=++toolsGeneration;
+    tools=Toolchain::find(library.toolRoot);tools.keys=library.keysPath;dotnetReady=false;const int generation=++toolsGeneration;
     const auto state=[](const QString& p){return p.isEmpty()?QString("Missing"):QDir::toNativeSeparators(p);};
-    healthText=QString("Python: %1\nGCC: %2\nRuntime: %3\n.NET 10: checking…").arg(state(tools.python),state(tools.compiler),state(tools.runtime));
+    healthText=QString("Python: %1\nGCC: %2\nRuntime: %3\nKeys: %4\n.NET 10: checking…").arg(state(tools.python),state(tools.compiler),state(tools.runtime),state(tools.keys));
     toolStatus->setText(tools.canBuild()?"Toolkit ready":"Setup needed");toolStatus->setToolTip(tools.canBuild()?displayPath(tools.root):tools.problem());
     emit toolsChanged();
     if(tools.dotnet.isEmpty()){healthText.replace("checking…","Not found");emit toolsChanged();return;}
@@ -382,10 +399,10 @@ bool Window::editGame(Game& game,int tab,bool adding){
     QDialog dialog(this);dialog.setWindowTitle(adding?"Add game":game.title+" — Properties");dialog.resize(670,400);
     auto* layout=new QVBoxLayout(&dialog);layout->setContentsMargins(10,10,10,10);auto* tabs=new QTabWidget;layout->addWidget(tabs,1);
     auto* general=tabForm(tabs,"General");auto* title=new QLineEdit(game.title);auto* source=new QLineEdit(game.source.isEmpty()?QString{}:displayPath(game.source));
-    general->addRow("Display name",title);auto* sourceField=browseField(source,&dialog,"Choose source","Game packages (*.nup *.nro);;All files (*)");sourceField->setEnabled(!locked);general->addRow("Source",sourceField);
+    general->addRow("Display name",title);auto* sourceField=browseField(source,&dialog,"Choose source","Game packages (*.nup *.nsp *.nro);;All files (*)");sourceField->setEnabled(!locked);general->addRow("Source",sourceField);
     auto* folder=new QPushButton("Choose extracted folder…");folder->setEnabled(!locked);general->addRow("",folder);connect(folder,&QPushButton::clicked,&dialog,[&dialog,source]{auto p=QFileDialog::getExistingDirectory(&dialog,"Choose extracted game folder");if(!p.isEmpty())source->setText(QDir::toNativeSeparators(p));});
     general->addRow("Format",textLabel(game.format()));general->addRow("Status",textLabel(adding?"Not built":statusFor(game)));
-    auto* pathsNote=textLabel("NUP game data stays in the original package. Changing the source requires a rebuild.","Muted");pathsNote->setWordWrap(true);general->addRow(pathsNote);
+    auto* pathsNote=textLabel("NUP/NSP game data stays in the original package. Changing the source requires a rebuild.","Muted");pathsNote->setWordWrap(true);general->addRow(pathsNote);
     auto* build=tabForm(tabs,"Build");auto* destination=new QLineEdit(displayPath(game.buildDir));build->addRow("Build folder",browseField(destination,&dialog,"Choose build output folder",{},true));
     auto* name=new QLineEdit(game.outputName);name->setReadOnly(!adding);build->addRow("Executable name",name);
     auto* workers=new QSpinBox;workers->setRange(0,64);workers->setSpecialValueText("Use default");workers->setValue(game.workers);build->addRow("Compiler workers",workers);
@@ -478,7 +495,7 @@ void Window::activateGame(){if(auto* game=selected()){if(game->hasBuild())play()
 void Window::cardAction(const QString& id){selectGame(id);if(demo)return;auto* game=selected();if(!game)return;if((builder.busy()&&builder.gameId()==id)||running.contains(id))stop();else if(game->hasBuild())play();else startBuild();}
 void Window::play(){
     auto* game=selected();if(!game||demo||!game->hasBuild()||running.contains(game->id)||(builder.busy()&&builder.gameId()==game->id))return;
-    if(game->source.endsWith(".nup",Qt::CaseInsensitive)&&!game->sourceAvailable()){message("Source unavailable","Reconnect the drive containing the NUP, or update the source in Properties and rebuild.",true);return;}
+    if(inPlacePackage(game->source)&&!game->sourceAvailable()){message("Source unavailable","Reconnect the drive containing the source package, or update the source in Properties and rebuild.",true);return;}
     if(game->renderer=="vulkan"&&(!dotnetReady||tools.python.isEmpty())){message("Shader tools need setup","Vulkan requires Python and .NET 10. Check Tools → Settings → Toolkit.",true);return;}
     if(game->renderer=="vulkan"&&!QFileInfo(QDir(game->buildDir).filePath("tools/nxshader/nxs_live.py")).exists()){
         message("Shader tools are missing","Rebuild this game with the current toolkit to stage its Vulkan shader tools before playing.",true);return;

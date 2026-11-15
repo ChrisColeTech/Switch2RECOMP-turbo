@@ -13,6 +13,7 @@ to each automated release. `build-info.json` identifies the tested commit.
 | .NET runtime 10.0.12 | `dotnet/LICENSE.txt` and `dotnet/ThirdPartyNotices.txt`; https://github.com/dotnet/runtime/tree/v10.0.12. |
 | SPIRV-Tools 2026.4 | `shader-tools/licenses/` contains notices and the exact source/build recipe. https://github.com/KhronosGroup/SPIRV-Tools. |
 | Shader translator | `tools/nxshader/xlate_bin/LICENSE-*`; translator dependencies and their versions are listed in `dmsh_xlate.deps.json`. Existing project notices apply. |
+| hactool 1.4.0 | ISC license in `tools/hactool/LICENSE`; used only to decrypt and inspect NCA headers supplied by the user. Source: https://github.com/SciresM/hactool/tree/1.4.0. |
 | Native runtime dependencies | Notices remain with the vendored source under `runtime/`, including NVN, zstd, texture decoders, and their third-party directories. |
 | Linux SDL2 and related libraries | `lib/licenses/`, from the checksum-pinned pysdl2-dll distribution. https://github.com/libsdl-org/SDL and https://github.com/py-sdl/py-sdl2-dll. |
 | Linux system libraries copied into the bundle | `linux-libraries.json` records the selected files; `licenses/linux/` retains available distribution copyright/source references. Ubuntu sources are available from https://archive.ubuntu.com/ubuntu/pool/. |

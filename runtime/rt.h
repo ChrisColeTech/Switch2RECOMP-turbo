@@ -321,6 +321,7 @@ extern u64 g_code_lo, g_code_hi;
 
 /* romfs / files */
 typedef struct Nup Nup;
+typedef struct Nsp Nsp;
 Nup* nup_open(const char* path);
 void nup_close(Nup* nup);
 int nup_is_file(Nup* nup, u32 entry);
@@ -328,6 +329,11 @@ const char* nup_name(Nup* nup, u32 entry, u32* length);
 int nup_children(Nup* nup, u32 entry, u32* first, u32* count);
 u64 nup_file_size(Nup* nup, u32 entry);
 int nup_pread(Nup* nup, u32 entry, void* dst, u64 size, u64 off);
+Nsp* nsp_open_marker(const char* marker);
+void nsp_close(Nsp* nsp);
+u64 nsp_size(Nsp* nsp);
+const char* nsp_path(Nsp* nsp);
+int nsp_pread(Nsp* nsp, void* dst, u64 size, u64 off);
 void romfs_init(void);
 u64  romfs_size(void);
 int  romfs_read(u64 off, void* dst, u64 size);

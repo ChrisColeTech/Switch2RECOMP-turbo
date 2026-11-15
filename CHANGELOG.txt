@@ -1,5 +1,11 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Standard application NSP files can be recompiled directly. The build materializes ExeFS while the runtime reads
+  a plaintext IVFC RomFS range from the original NSP; BKTR update-only and encrypted-section packages are rejected.
+- The Qt launcher has a Keys menu that installs the user's prod.keys in its private application-data folder for NSP
+  builds. Keys and derived content keys are never copied into game builds or release packages.
+- Native Vulkan validation is opt-in. The old Vulkan SDK 1.3.268 validation layer crashed Mario Kart World 1.8.0
+  during a valid queue submission on NVIDIA's Vulkan 1.4.351 driver; validation-off ran past 2,100 presented frames.
 - Added all-in-one Windows/Linux release packaging and a main-branch release workflow, with checksum-pinned tools,
   Qt/MSVC deployment, dependency notices, and a relocated synthetic-NUP build check before publishing.
 - Qt builds and imports native Linux games, detects their running processes, and cancels Linux compiler process groups.

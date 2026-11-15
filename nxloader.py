@@ -347,10 +347,15 @@ def load_program(entry):
     if os.path.isfile(entry) and entry.lower().endswith('.nro'):
         m = load_nro(entry); mods = [m]; romfs = nro_romfs(m)
     elif os.path.isfile(entry):
-        import nup
-        if not nup.is_nup(entry):
-            raise ValueError('%s is not an NRO or NUP file' % entry)
-        package = nup.load(entry)
+        import nup, nsp
+        if nup.is_nup(entry):
+            package = nup.load(entry)
+            romfs = nup.NupRomfs(package)
+        elif nsp.is_nsp(entry):
+            package = nsp.load(entry)
+            romfs = nsp.NspRomfs(package)
+        else:
+            raise ValueError('%s is not an NRO, NUP or NSP file' % entry)
         exefs = {name: reader for name, _, reader in package.exefs()}
         for name in MODULE_ORDER:
             if name in exefs:
@@ -359,7 +364,6 @@ def load_program(entry):
             npdm = exefs['main.npdm']()
         if not mods:
             raise ValueError('%s has no loadable ExeFS modules' % entry)
-        romfs = nup.NupRomfs(package)
     else:
         ex = find_exefs(entry)
         if not ex:

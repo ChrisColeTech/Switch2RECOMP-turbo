@@ -29,7 +29,7 @@ FilterPopup::FilterPopup(QWidget* parent):QFrame(parent, Qt::Popup|Qt::Frameless
     search=new QLineEdit;search->setPlaceholderText("Type a game title…");search->setClearButtonEnabled(true);search->setAccessibleName("Search game titles");field("&Search",search);
     auto* divider=new QFrame;divider->setObjectName("FilterDivider");divider->setFixedHeight(1);layout->addWidget(divider);
     state=new QComboBox;state->addItems({"All states","Ready to play","Needs build","Running"});state->setAccessibleName("Filter by build state");field("&Status",state);
-    source=new QComboBox;source->addItems({"All sources","NUP packages","NRO homebrew","Extracted folders","Native builds"});source->setAccessibleName("Filter by source format");field("S&ource",source);
+    source=new QComboBox;source->addItems({"All sources","NUP / NSP packages","NRO homebrew","Extracted folders","Native builds"});source->setAccessibleName("Filter by source format");field("S&ource",source);
     sort=new QComboBox;sort->addItems({"Name (A–Z)","Last played (newest first)","Build status"});sort->setPlaceholderText("Custom table order");sort->setAccessibleName("Sort games");field("Sort &by",sort);
     auto* viewLabel=new QLabel("Library view");viewLabel->setObjectName("FieldLabel");layout->addWidget(viewLabel);
     auto* choices=new QHBoxLayout;galleryButton=new QToolButton;listButton=new QToolButton;

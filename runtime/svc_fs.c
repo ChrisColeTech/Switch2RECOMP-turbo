@@ -18,6 +18,7 @@ static u8* rmeta; static u64 rmeta_size;        /* header + tables sit at the st
 static u64 rdata_off, rtotal;
 static FILE* rraw;                               /* plain romfs.bin */
 static Nup* rnup;                                /* original NUP package */
+static Nsp* rnsp;                                /* plaintext RomFS range inside an NSP */
 
 char g_romfs_dir_override[1024];
 
@@ -128,6 +129,9 @@ void romfs_init(void){
   pm_init(&g_romlock);
   char p[1200];
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
+  snprintf(p,sizeof p,"%sromfs.nsp",g_datadir); const char* nsp_override=getenv("SWR_ROMFS_NSP");
+  rnsp=nsp_open_marker(nsp_override&&nsp_override[0]?nsp_override:p);
+  if(rnsp){ rtotal=nsp_size(rnsp); LOG("RomFS: NSP %s (read in place, %.1f MB)\n",nsp_path(rnsp),(double)rtotal/1048576.0); return; }
   char nup_path[2048]={0}; const char* override=getenv("SWR_ROMFS_NUP");
   if(override && override[0]){ strncpy(nup_path,override,sizeof nup_path-1); }
   else { snprintf(p,sizeof p,"%sromfs.nup",g_datadir); FILE* marker=fopen(p,"rb");
@@ -145,7 +149,7 @@ void romfs_init(void){
   char q[1200]; snprintf(q,sizeof q,"%sexefs/main.nro",g_datadir);
   if(!plat_file_size(q)){
     char m[1600]; snprintf(m,sizeof m,"The game's romfs is missing (the data: models, textures, sound).\n\n"
-      "Provide the original NUP through romfs.nup, or extract with hactool (--romfsdir=romfs) and copy the folder to:\n%s\n\nThe game will close when it tries to read its data.",p);
+      "Provide the original NUP/NSP package marker, or extract with hactool (--romfsdir=romfs) and copy the folder to:\n%s\n\nThe game will close when it tries to read its data.",p);
 #if defined(_WIN32)
     extern void win_fatal_box(const char*); win_fatal_box(m);
 #else
@@ -168,6 +172,7 @@ static FILE* rf_open(const char* path){
 
 int romfs_read(u64 off, void* dst, u64 size){
   u8* d=dst;
+  if(rnsp){ pm_lock(&g_romlock); int r=nsp_pread(rnsp,d,size,off); pm_unlock(&g_romlock); return r; }
   if(rraw){ pm_lock(&g_romlock); int r=plat_pread(rraw,d,size,off); pm_unlock(&g_romlock); return r<0? -1 : 0; }
   if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size; memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
   pm_lock(&g_romlock);

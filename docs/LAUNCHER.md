@@ -20,7 +20,7 @@ If you relocate the frontend separately, choose the toolkit under **Tools → Se
 
 ## Add, build, play
 
-1. **Add game:** select a `.nup` or `.nro`, or drop it into the library. The dropdown also accepts extracted
+1. **Add game:** select a `.nup`, supported `.nsp`, or `.nro`, or drop it into the library. The dropdown also accepts extracted
    game folders and existing native builds.
 2. Choose the display name and build location in Properties. Per-game compiler settings are under **Build**.
 3. Click **Build** on the game's card. Live output appears in a dock that can be resized, hidden, or undocked. Progress stays
@@ -34,6 +34,8 @@ To add a game you already compiled, choose **File → Import build…** and sele
 matching `_code.so`. NUP sources are recovered from `_data/romfs.nup` when present.
 
 The original NUP must remain accessible while playing. Changing the source in Properties requires a rebuild.
+The same applies to direct NSP builds. Before adding an NSP, choose **Keys > Install keys** and select your legally
+dumped `prod.keys`. The launcher copies it to its private application-data folder, not the toolkit or game build.
 Removing a library entry does not delete its game, source, saves, or caches. Cancelled/failed builds are kept
 marked as needing a build rather than treating partially overwritten artifacts as ready.
 

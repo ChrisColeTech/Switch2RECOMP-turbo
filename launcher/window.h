@@ -60,6 +60,7 @@ private:
     void openFolder(bool saves = false);
     bool editGame(Game& game, int tab = 0, bool adding = false);
     void showSettings(int tab = 0);
+    void installKeys();
     void removeGame();
     void showContextMenu(const QPoint& global);
     void message(const QString& title, const QString& text, bool error = false);
@@ -93,5 +94,6 @@ private:
     QAction *addAction = nullptr, *addFolderAction = nullptr, *importAction = nullptr, *playAction = nullptr,
         *buildAction = nullptr, *stopAction = nullptr, *propertiesAction = nullptr, *removeAction = nullptr,
         *folderAction = nullptr, *logAction = nullptr, *saveFolderAction = nullptr, *settingsAction = nullptr,
-        *galleryAction = nullptr, *tableAction = nullptr, *backgroundAction = nullptr, *buildOptionsAction = nullptr;
+        *galleryAction = nullptr, *tableAction = nullptr, *backgroundAction = nullptr, *buildOptionsAction = nullptr,
+        *installKeysAction = nullptr;
 };

@@ -6,7 +6,7 @@ the release until it is fixed or explained. Report the results with the template
 | Level | What | Who runs it | Time |
 | --- | --- | --- | --- |
 | 0 | The four runtimes and the tool build, packages are complete | developer | 5 min |
-| 1 | Unit tests (audio, recording clock, direct NUP) | developer | 1 min |
+| 1 | Unit tests (audio, recording clock, direct NUP/NSP) | developer | 1 min |
 | 2 | Homebrew GPU test programs, screenshots compared with a baseline | developer, Linux | 5 min |
 | 3 | Games, scene by scene | user | 30 min |
 | 4 | Intel on Windows | user with an Intel GPU | 15 min |
@@ -39,8 +39,10 @@ The runtime prints the version `0.4.1` in the first line of every game log. A bu
 ```sh
 sh tests/run_audio.sh
 python3 tests/test_nup.py
+python3 tests/test_nsp.py
 python3 tests/test_nxs_parent.py
 sh tests/run_nup.sh
+sh tests/run_nsp.sh
 ```
 
 These build the audio, recording clock, and C direct-NUP reader tests with AddressSanitizer and

@@ -31,8 +31,9 @@ notice) that the recompiler and every recompiled game show when they start.
         hactool -k prod.keys --basenca=base.nca --exefsdir=exefs --romfsdir=romfs  update.nca
      You end up with a folder that has exefs\ and romfs\ inside.
 
-     Switch 2 indexed NUP dumps can instead be used directly. RomFS stays in the
-     package; see docs\NUP_IN_PLACE.md. From a terminal:
+     Switch 2 indexed NUP and supported application NSP dumps can instead be used
+     directly. RomFS stays in the package; see docs\NUP_IN_PLACE.md and
+     docs\NSP_IN_PLACE.md. Install prod.keys from the Qt launcher's Keys menu.
         scripts\build-from-nup.bat "D:\Games\Game.nup" --outdir "D:\Games\Game-build"
 
   b) Open SwitchRecomp.exe. It looks like the Switch HOME menu and works with
@@ -61,6 +62,7 @@ notice) that the recompiler and every recompiled game show when they start.
   Command line:
      python\python.exe switchrecomp.py C:\path\to\game -o MyGame
      scripts\build-from-nup.bat C:\path\to\game.nup --outdir C:\Games\MyGame-build -o MyGame
+     scripts\build-from-nsp.bat C:\path\to\game.nsp --outdir C:\Games\MyGame-build -o MyGame
      python\python.exe switchrecomp.py homebrew.nro
      Options: --native (optimize for your CPU)  -O 3  --jobs N  --cc tcc
 

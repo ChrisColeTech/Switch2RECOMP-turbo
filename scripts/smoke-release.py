@@ -57,6 +57,11 @@ def main():
         env['PATH'] = os.pathsep.join([str(cc.parent), str(root / 'bin/launcher'), str(shader_tools), env['PATH']])
         for tool in ('spirv-val', 'spirv-opt'):
             run([shader_tools / (tool + ('.exe' if win else '')), '--version'], temp, env)
+        if win:
+            probe = subprocess.run([root / 'tools/hactool/hactool.exe', '--help'], cwd=temp, env=env,
+                                   capture_output=True, text=True, timeout=30)
+            if probe.returncode not in (0, 1) or 'hactool' not in (probe.stdout + probe.stderr).lower():
+                raise RuntimeError('Bundled hactool did not start')
         run([python, '-I', '-c', 'from compression import zstd; import ctypes, ssl, multiprocessing'], temp, env)
         sha = run([dotnet, root / 'tools/nxshader/xlate_bin/dmsh_xlate.dll', '--source-sha'], temp, env).strip()
         if not re.fullmatch(r'[0-9a-f]{16}', sha): raise RuntimeError('Shader translator did not identify its source')

@@ -2,6 +2,7 @@
 // Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
 #include "buildmanager.h"
 #include <QDir>
+#include <QFileInfo>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QTimer>
@@ -43,6 +44,9 @@ QStringList BuildManager::arguments(const Game& game, const Toolchain& tools, in
 bool BuildManager::start(const Game& next, const Toolchain& tools, int jobs, QString* error) {
     if (active) { *error = "Another build is already running."; return false; }
     if (!tools.canBuild()) { *error = tools.problem(); return false; }
+    if (next.source.endsWith(".nsp", Qt::CaseInsensitive) && (tools.keys.isEmpty() || !QFileInfo(tools.keys).isFile())) {
+        *error = "NSP builds need prod.keys. Use Keys > Install keys first."; return false;
+    }
     if (!validSource(next.source, error)) return false;
     if (next.buildDir.isEmpty() || !QDir().mkpath(next.buildDir)) { *error = "Cannot create the build output folder."; return false; }
     game = next; cancelled = false; pending.clear();

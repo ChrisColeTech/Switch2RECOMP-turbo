@@ -16,7 +16,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIRS = {'runtime', 'launcher', 'scripts', 'tools', 'tool', 'tests', 'docs', '.github'}
-SOURCE_FILES = {'a64.py', 'brt.py', 'codegen.py', 'nup.py', 'nxloader.py', 'switchrecomp.py', 'tools_sym.py',
+SOURCE_FILES = {'a64.py', 'brt.py', 'codegen.py', 'nup.py', 'nsp.py', 'nxloader.py', 'switchrecomp.py', 'tools_sym.py',
                 'LICENSE.txt', 'NOTICE.txt', 'CHANGELOG.txt', 'README.md', 'README.txt', 'DEVELOPER_GUIDE.md',
                 'REGRESSION.md', 'Install.bat', 'Install.sh', '.gitattributes', '.gitignore'}
 JUNK = {'__pycache__', '_downloads', '.git', 'shader_cache', 'captures', 'logs'}
@@ -103,6 +103,7 @@ def main():
     stage.mkdir(parents=True, exist_ok=False)
     for path in source_files(): copy(ROOT / path, stage / path)
     for name in ('python', 'gcc', 'dotnet', 'shader-tools'): tree(args.deps / name, stage / name)
+    if platform == 'windows': tree(args.deps / 'tools/hactool', stage / 'tools/hactool')
     copy(args.deps / 'dependency-manifest.json', stage / 'dependency-manifest.json')
     tree(args.launcher, stage / 'bin/launcher')
     runtime = 'runtime_win64_win32.exe' if platform == 'windows' else 'runtime_linux_x11'
@@ -118,8 +119,9 @@ def main():
         wrapper = stage / 'Switch2RECOMP-turbo.sh'
         wrapper.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$root/lib:$root/gcc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\nexec "$root/bin/launcher/SwitchRecompLauncher" --root "$root" "$@"\n')
         wrapper.chmod(0o755)
-    required = ['switchrecomp.py', 'nup.py', 'runtime/rt.h', 'runtime/nvn/gfx/dmsh_abi.h',
+    required = ['switchrecomp.py', 'nup.py', 'nsp.py', 'runtime/rt.h', 'runtime/nvn/gfx/dmsh_abi.h',
                 'tools/nxshader/xlate_bin/dmsh_xlate.dll', 'tools/nxshader/nxs_live.py', 'NOTICE.txt']
+    if platform == 'windows': required.append('tools/hactool/hactool.exe')
     for name in required:
         if not (stage / name).is_file(): raise FileNotFoundError(name)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()

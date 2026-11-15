@@ -51,13 +51,14 @@ private slots:
         QTemporaryDir tmp; const QString file=tmp.filePath("nested/library.json");
         Library lib(file); Game game=gameFromSource(tmp.filePath("My Game [v1].nup"));
         game.cover="art.png"; game.background="wallpaper.png"; game.renderer="vulkan"; game.workers=3; game.optimization=1;
-        lib.add(game); lib.jobs=4; lib.viewMode=1; lib.coverWidth=220; lib.showBackground=false;lib.colorMode="light";lib.accentColor="violet";
+        lib.add(game); lib.jobs=4; lib.viewMode=1; lib.coverWidth=220; lib.showBackground=false;lib.colorMode="light";lib.accentColor="violet";lib.keysPath="D:/Keys/prod.keys";
         QString error; QVERIFY2(lib.save(&error),qPrintable(error));
         Library loaded(file); QVERIFY(loaded.load(&error)); QCOMPARE(loaded.games.size(),1); QCOMPARE(loaded.jobs,4);
         QCOMPARE(loaded.games.front().source,game.source); QCOMPARE(loaded.games.front().title,QString("My Game"));
         QCOMPARE(loaded.games.front().background,QString("wallpaper.png")); QCOMPARE(loaded.games.front().workers,3);
         QCOMPARE(loaded.viewMode,1); QCOMPARE(loaded.coverWidth,220); QVERIFY(!loaded.showBackground);
         QCOMPARE(loaded.colorMode,QString("light"));QCOMPARE(loaded.accentColor,QString("violet"));
+        QCOMPARE(loaded.keysPath,QString("D:/Keys/prod.keys"));
         QVERIFY(!loaded.add(game));
         {QFile f(file); QVERIFY(f.open(QIODevice::WriteOnly|QIODevice::Truncate)); f.write("bad json");}
         Library broken(file); QVERIFY(!broken.load(&error)); QVERIFY(!broken.save(&error));
@@ -106,6 +107,17 @@ private slots:
 #ifdef Q_OS_WIN
         QVERIFY(samePath("P:\\Games\\Title.nup","P:/Games/Title.nup"));
 #endif
+    }
+    void nspSourceClassification(){
+        QTemporaryDir tmp;const QString path=tmp.filePath("Game.nsp");
+        {QFile file(path);QVERIFY(file.open(QIODevice::WriteOnly));file.write("PFS0");file.write(QByteArray(16,'\0'));}
+        QString error;QVERIFY2(validSource(path,&error),qPrintable(error));
+        const auto game=gameFromSource(path);QCOMPARE(game.format(),QString("DIRECT NSP"));QVERIFY(inPlacePackage(path));
+        LibraryFilter filter;filter.source=1;QVERIFY(filter.matches(game));
+    }
+    void toolEnvironmentCarriesKeys(){
+        Toolchain tools;tools.keys="D:/Keys/prod.keys";
+        QCOMPARE(tools.environment().value("SWR_PROD_KEYS"),tools.keys);
     }
 };
 QTEST_GUILESS_MAIN(LauncherTests)

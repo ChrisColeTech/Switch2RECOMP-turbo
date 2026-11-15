@@ -89,13 +89,14 @@ def main():
         manifest['downloads'][name] = record
     # use the bundled 3.14 interpreter, including its built-in zstd decompressor
     python = dest / ('python/python.exe' if os.name == 'nt' else 'python/bin/python3')
-    code = "import sys; sys.path.insert(0, sys.argv[1]); import get_deps as d; d.HERE=sys.argv[2]; d.DEST=d.os.path.join(d.HERE,'gcc'); d.CC=d.os.path.join(d.DEST,'Library','bin','x86_64-w64-mingw32-gcc.exe') if d.WIN else d.os.path.join(d.DEST,'bin','x86_64-conda-linux-gnu-gcc'); d.LIB=d.os.path.join(d.HERE,'lib'); sys.exit(d.install_gcc(force=True) | (0 if d.WIN else d.install_sdl()))"
+    code = "import sys; sys.path.insert(0, sys.argv[1]); import get_deps as d; d.HERE=sys.argv[2]; d.DEST=d.os.path.join(d.HERE,'gcc'); d.CC=d.os.path.join(d.DEST,'Library','bin','x86_64-w64-mingw32-gcc.exe') if d.WIN else d.os.path.join(d.DEST,'bin','x86_64-conda-linux-gnu-gcc'); d.LIB=d.os.path.join(d.HERE,'lib'); d.HACTOOL=d.os.path.join(d.HERE,'tools','hactool'); sys.exit(d.install_gcc(force=True) | (d.install_hactool() if d.WIN else d.install_sdl()))"
     subprocess.run([str(python), '-c', code, str(ROOT / 'tool'), str(dest)], check=True)
     package, sha = SPIRV[platform]
     code = "import sys; sys.path.insert(0,sys.argv[1]); import get_deps as d; d.DEST=sys.argv[2]; d.os.makedirs(d.DEST,exist_ok=True); d.relocate(d.unpack(d.get(sys.argv[3],sys.argv[4]),sys.argv[3].split('/')[-1]),d.DEST)"
     subprocess.run([str(python), '-c', code, str(ROOT / 'tool'), str(dest / 'shader-tools'), package, sha], check=True)
     manifest['downloads']['spirv-tools'] = {'url': deps.URL + package, 'sha256': sha}
     manifest['downloads']['gcc'] = {deps.URL + p: {'sha256': sha} for p, sha in deps.PKGS.items()}
+    if platform == 'windows': manifest['downloads']['hactool'] = {'url': deps.HACTOOL_ZIP[0], 'sha256': deps.HACTOOL_ZIP[1]}
     if platform == 'linux': manifest['downloads']['sdl'] = {'url': deps.SDL_WHEEL[0], 'sha256': deps.SDL_WHEEL[1]}
     (dest / 'dependency-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 

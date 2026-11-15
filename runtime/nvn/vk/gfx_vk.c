@@ -39,11 +39,7 @@ static void ctl_passdump(long n) { vkr_passdump_next(n); VKLOG("DM_CTL passdump:
 static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
     const char *e;
-#ifdef NDEBUG
     int validation = 0;
-#else
-    int validation = 1;   // debug builds validate (docs/m5-vulkan.md §2)
-#endif
     if ((e = getenv("NXRT_VK_VALIDATION"))) validation = atoi(e) != 0;
     int headless = (e = getenv("NXRT_VK_HEADLESS")) && atoi(e);
     int mode = VKP_FIFO;
@@ -61,6 +57,7 @@ static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *c) {
         g_window = 1;
     }
     vk_dev_opts dopt = {validation, headless, getenv("NXRT_VK_DEVICE")};
+    VKLOG("Vulkan validation: %s%s",validation?"on":"off",validation?"":" (set NXRT_VK_VALIDATION=1 for diagnostics)");
     if (vk_dev_open(&dopt, ex, nx)) nxrt_die("--gfx vulkan: no usable Vulkan 1.3 device (see the log)");
     vkf_init(); vkf_log_table();
     if (vks_init() || vkpc_init() || vkm_init() || vkt_init() || vka_init(NULL) || vkr_init()) nxrt_die("--gfx vulkan: the backend could not start (see the log)");
