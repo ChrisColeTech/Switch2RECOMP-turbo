@@ -100,7 +100,16 @@ def main():
         shader_tools = root / ('shader-tools/Library/bin' if win else 'shader-tools/bin')
         env['NXSHADER_TOOLS'] = str(shader_tools)
         env['PATH'] = os.pathsep.join([str(cc.parent), str(root / 'bin/launcher'), str(shader_tools), env['PATH']])
-        if not win: run(['sh', root / 'fix-gcc.sh'], temp, env)  # repoint the sysroot baked in at packaging time
+        if not win:
+            trace = subprocess.run(['sh', '-x', root / 'fix-gcc.sh'], cwd=temp, env=env, capture_output=True,
+                                   text=True, timeout=120)
+            print(trace.stdout + trace.stderr)
+            if trace.returncode: raise RuntimeError(f'fix-gcc.sh exited {trace.returncode}\n{trace.stdout}\n{trace.stderr}')
+            probe = subprocess.run([cc, '-print-sysroot', '-dumpmachine'], cwd=temp, env=env, capture_output=True,
+                                   text=True, timeout=60)
+            print('gcc sysroot probe:', probe.stdout, probe.stderr)
+            if probe.returncode or 'x86_64-conda-linux-gnu' not in probe.stdout:
+                raise RuntimeError(f'Relocated GCC is unusable: {probe.stdout}{probe.stderr}')
         for tool in ('spirv-as', 'spirv-val', 'spirv-opt'):
             run([shader_tools / (tool + ('.exe' if win else '')), '--version'], temp, env)
         if win:
