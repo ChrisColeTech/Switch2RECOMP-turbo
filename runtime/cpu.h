@@ -304,8 +304,10 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
 #define STLR_(T,a,v) __atomic_store_n((T*)MP(a),(T)(v),__ATOMIC_SEQ_CST)
 #define DMB_LD()     __atomic_thread_fence(__ATOMIC_ACQUIRE)
 #endif
+/* LDXR/LDAXR read with LDAR_: an LDAXR that only checks (a lock already taken, no STXR after it) must not let the
+   compiler reuse older loads either */
 SWR_INLINE u64 ldx(CPU* c, u8* M, u64 a, u32 sz){
-  u64 v; switch(sz){ case 0: v=RD8(a); break; case 1: v=RD16(a); break; case 2: v=RD32(a); break; default: v=RD64(a); }
+  u64 v; switch(sz){ case 0: v=LDAR_(u8,a); break; case 1: v=LDAR_(u16,a); break; case 2: v=LDAR_(u32,a); break; default: v=LDAR_(u64,a); }
   c->excl_addr=a; c->excl_val=v; c->excl_size=sz; c->excl_on=1; return v; }
 
 SWR_INLINE u32 stx(CPU* c, u8* M, u64 a, u32 sz, u64 v){

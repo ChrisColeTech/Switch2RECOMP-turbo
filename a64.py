@@ -579,8 +579,12 @@ def _(g):
         if L: return '{ u64 v1_,v2_; ldxp(c,M,%s,%d,&v1_,&v2_); %s %s }' % (A, size, g.setX('rt', 'v1_'), g.setX('rt2', 'v2_'))
         return g.setW('rs', 'stxp(c,M,%s,%d,%s,%s)' % (A, size, g.X('rt'), g.X('rt2')))
     if o2 and not o1:
-        if L: return g.setX('rt', '*(volatile %s*)MP(%s)' % (['u8', 'u16', 'u32', 'u64'][size], A))
-        return '{ %s(%s,%s); SWR_FENCE(); }' % (WR[size], A, g.X('rt'))
+        # LDAR / STLR: atomic accesses (cpu.h), not a volatile one plus a fence. a volatile access doesn't order the
+        # plain loads and stores around it, so GCC could reuse a load from before an LDAR or move a store past an
+        # STLR, and a lock-free queue saw a flag before the data it published (Pokemon Legends Z-A stalled at boot)
+        T = ['u8', 'u16', 'u32', 'u64'][size]
+        if L: return g.setX('rt', 'LDAR_(%s,%s)' % (T, A))
+        return 'STLR_(%s,%s,%s);' % (T, A, g.X('rt'))
     # CAS, CASA, CASL, CASAL (LSE) in every size: Rs gets the old value, memory gets Rt when it held Rs
     if g.static and g.v('rt2') != 31: return None
     return g.setX('rs', 'swr_casv(M,%s,%d,%s,%s)' % (A, size, g.X('rs'), g.X('rt')))
@@ -589,7 +593,7 @@ def _(g):
 # LDAPR (ARMv8.3 RCpc): a load-acquire, LDAR's code
 @ins('LDAPR', 'xx 111000 101 11111 110000 xxxxx xxxxx', spec=('size',))
 def _(g):
-    return g.setX('rt', '*(volatile %s*)MP(%s)' % (['u8', 'u16', 'u32', 'u64'][g.v('size')], g.XS('rn')))
+    return g.setX('rt', 'LDAR_(%s,%s)' % (['u8', 'u16', 'u32', 'u64'][g.v('size')], g.XS('rn')))
 
 
 # LSE atomics (ARMv8.1): LDADD LDCLR LDEOR LDSET LDSMAX LDSMIN LDUMAX LDUMIN (o3=0, opc) and SWP (o3=1, opc=0), with
