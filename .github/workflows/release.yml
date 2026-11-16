@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Which bundle to build'
+        type: choice
+        default: all
+        options: [all, windows, linux]
 
 permissions:
   contents: read
@@ -29,6 +35,7 @@ jobs:
             qt_arch: linux_gcc_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == matrix.platform
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -136,7 +143,7 @@ jobs:
 
   release:
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all')
     runs-on: ubuntu-24.04
     permissions:
       contents: write

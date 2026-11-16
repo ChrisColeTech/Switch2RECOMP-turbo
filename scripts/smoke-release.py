@@ -108,6 +108,9 @@ def main():
             probe = subprocess.run([cc, '-print-sysroot', '-dumpmachine'], cwd=temp, env=env, capture_output=True,
                                    text=True, timeout=60)
             print('gcc sysroot probe:', probe.stdout, probe.stderr)
+            expanded = subprocess.run([cc, '-###', '-E', '-x', 'c', '-'], cwd=temp, env=env, capture_output=True,
+                                      text=True, timeout=60, input='')
+            print('gcc expansion:', expanded.stdout, expanded.stderr)
             if probe.returncode or 'x86_64-conda-linux-gnu' not in probe.stdout:
                 raise RuntimeError(f'Relocated GCC is unusable: {probe.stdout}{probe.stderr}')
         for tool in ('spirv-as', 'spirv-val', 'spirv-opt'):
