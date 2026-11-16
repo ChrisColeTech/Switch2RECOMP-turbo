@@ -100,6 +100,7 @@ def main():
         shader_tools = root / ('shader-tools/Library/bin' if win else 'shader-tools/bin')
         env['NXSHADER_TOOLS'] = str(shader_tools)
         env['PATH'] = os.pathsep.join([str(cc.parent), str(root / 'bin/launcher'), str(shader_tools), env['PATH']])
+        if not win: run(['sh', root / 'fix-gcc.sh'], temp, env)  # repoint the sysroot baked in at packaging time
         for tool in ('spirv-as', 'spirv-val', 'spirv-opt'):
             run([shader_tools / (tool + ('.exe' if win else '')), '--version'], temp, env)
         if win:

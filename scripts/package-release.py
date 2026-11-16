@@ -160,6 +160,22 @@ def digest(path):
     with path.open('rb') as stream: return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+GCC_FIXUP = '''#!/bin/sh
+# The bundled conda GCC resolves its sysroot through absolute paths recorded when this release was packaged;
+# after the bundle is extracted somewhere else those paths are dead. Re-point them at this copy.
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cfg="$root/gcc/bin/x86_64-conda-linux-gnu.cfg"
+if [ ! -f "$cfg" ]; then exit 0; fi
+want="$root/gcc"
+have=$(sed -n 's|^--sysroot=\\(.*\\)/x86_64-conda-linux-gnu/sysroot$|\\1|p' "$cfg")
+if [ -z "$have" ] || [ "$have" = "$want" ]; then exit 0; fi
+for f in "$cfg" "$root"/gcc/lib/gcc/x86_64-conda-linux-gnu/*/specs "$root"/gcc/x86_64-conda-linux-gnu/lib/ldscripts/*; do
+    if [ -f "$f" ]; then sed -i "s|$have|$want|g" "$f"; fi
+done
+'''
+
+
 def dereference_symlinks(stage):
     """Toolchain archives carry absolute symlinks (e.g. GCC's libgomp.so recorded against the toolchain's
     original build directory, which never exists on the packaging machine); a relocated bundle cannot follow
@@ -217,8 +233,13 @@ def main():
         linux_libraries(stage, args.qt)
         (stage / 'bin/launcher/qt.conf').write_text('[Paths]\nPlugins=plugins\n')
         wrapper = stage / 'Switch2RECOMP-turbo.sh'
-        wrapper.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$root/lib:$root/gcc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\nexec "$root/bin/launcher/SwitchRecompLauncher" --root "$root" "$@"\n')
+        wrapper.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+                           'if [ -x "$root/fix-gcc.sh" ]; then "$root/fix-gcc.sh"; fi\n'
+                           'export LD_LIBRARY_PATH="$root/lib:$root/gcc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n'
+                           'export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\n'
+                           'exec "$root/bin/launcher/SwitchRecompLauncher" --root "$root" "$@"\n')
         wrapper.chmod(0o755)
+        fixup = stage / 'fix-gcc.sh'; fixup.write_text(GCC_FIXUP); fixup.chmod(0o755)
     dereference_symlinks(stage)
     validate_contents(stage, platform)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()

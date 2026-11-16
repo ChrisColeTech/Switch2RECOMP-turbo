@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -131,6 +132,23 @@ class ReleaseChecks(unittest.TestCase):
             link.symlink_to(target)
             with self.assertRaisesRegex(RuntimeError, 'Non-relocatable'): package.validate_contents(root, 'linux')
             link.unlink()
+
+    @unittest.skipIf(os.name == 'nt', 'Unix shell contract')
+    def test_fix_gcc_script_repoints_packaged_sysroot(self):
+        old = self.root / 'packaging-machine-gcc'; (old / 'bin').mkdir(parents=True)
+        root = self.bundle('linux')
+        cfg = root / 'gcc/bin/x86_64-conda-linux-gnu.cfg'; cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % old)
+        specs = root / 'gcc/lib/gcc/x86_64-conda-linux-gnu/16.2.0/specs'; specs.parent.mkdir(parents=True, exist_ok=True)
+        specs.write_text('*link: -L%s/lib\n' % old)
+        script = root / 'fix-gcc.sh'; script.write_text(package.GCC_FIXUP); script.chmod(0o755)
+        subprocess.run(['sh', script], check=True)
+        self.assertEqual(cfg.read_text(), '--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % (root / 'gcc'))
+        self.assertEqual(specs.read_text(), '*link: -L%s/lib\n' % (root / 'gcc'))
+        subprocess.run(['sh', script], check=True)  # idempotent
+        cfg.write_text('--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % (root / 'gcc'))
+        (root / 'gcc/bin/other.cfg').write_text('unrelated\n')
+        subprocess.run(['sh', script], check=True)  # already correct: no sed, no crash
 
     @unittest.skipIf(os.name == 'nt', 'Unix symlink archive contract')
     def test_dereference_replaces_nonrelocatable_links_with_target_copies(self):
