@@ -108,6 +108,12 @@ def main():
             probe = subprocess.run([cc, '-print-sysroot', '-dumpmachine'], cwd=temp, env=env, capture_output=True,
                                    text=True, timeout=60)
             print('gcc sysroot probe:', probe.stdout, probe.stderr)
+            sysroot = root / 'gcc/x86_64-conda-linux-gnu/sysroot'
+            listing = run(['sh', '-c',
+                           'echo "== sysroot lib64 =="; ls -la "$1/usr/lib64" | sed -n "1,12p"; '
+                           'echo "== Scrt1.o =="; ls -l "$1/usr/lib64/Scrt1.o"; '
+                           'echo "== alias =="; ls -l /tmp/switchrecomp-toolchains/', 'sh', sysroot], temp, env)
+            print(listing)
             expanded = subprocess.run([cc, '-###', '-E', '-x', 'c', '-'], cwd=temp, env=env, capture_output=True,
                                       text=True, timeout=60, input='')
             print('gcc expansion:', expanded.stdout, expanded.stderr)
@@ -127,6 +133,10 @@ def main():
         if not re.fullmatch(r'[0-9a-f]{16}', sha): raise RuntimeError('Shader translator did not identify its source')
         cpp = temp / 'probe.cpp'; cpp.write_text('#include <vector>\nint main(){std::vector<int> v{42};return v[0]!=42;}\n')
         probe = temp / ('probe.exe' if win else 'probe')
+        if not win:
+            link = subprocess.run([cc, '-###', cpp, '-lstdc++', '-o', probe], cwd=temp, env=env, capture_output=True,
+                                  text=True, timeout=60)
+            print('gcc link expansion:', link.stdout, link.stderr)
         run([cc, cpp, '-lstdc++', '-o', probe], temp, env)
         run([probe], temp, env)
         source = temp / 'Synthetic [v0] & input.nup'
