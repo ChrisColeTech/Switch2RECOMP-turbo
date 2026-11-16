@@ -1,5 +1,11 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Windows: DualSense/DualShock 4 lights and rumble work. The native HID output open denied shared write access,
+  which Windows refuses (error 32) whenever any other handle on the pad can write, so every session silently fell
+  back to read-only input. Switch 2 games (Mario Kart World, Donkey Kong Bananza) send all rumble through
+  hid 214 SendVibrationValuesInMode, which was a no-op stub; 213 and 220 are handled too. DualSense firmware
+  2.21+ gets the improved rumble emulation flag. fatal errors and timed exits stop rumble first.
+  SWR_CONTROLLER_SELFTEST=1 pulses both motors in game; tests/test_controllers.py --rumble checks a pad directly.
 - Switch 2 NSOs with ZBIC-compressed segments (NSO flag bit 7, e.g. Ocarina of Time) load: zbic.py rewrites ZBIC's
   interpolative-coded FSE table headers into standard zstd and decodes with the stock zstd in Python 3.14 (or the
   zstandard package). Without a zstd decoder the error says ZBIC is not supported instead of calling the dump corrupt.

@@ -13,8 +13,9 @@ No games, keys, or firmware are included. Use your own legally obtained dumps an
 ## What Turbo adds
 
 Direct NUP and NSP recompilation with in-place RomFS reads, native NVN/Vulkan work, shader-cache and frame-time
-diagnostics, and Windows controller work for DualSense/DualShock 4 input, player lights and classic rumble. Physical
-output verification remains pending; see [controller status](docs/CONTROLLERS_WIN32.md). The runtime also has queued
+diagnostics, and Windows DualSense/DualShock 4 input, player lights and classic rumble (Switch 2 games' rumble
+included; USB DualSense rumble confirmed by hand, Bluetooth and DualShock 4 untested on hardware); see
+[controller status](docs/CONTROLLERS_WIN32.md). The runtime also has queued
 stereo audio with smooth slowdown; some Switch 2 audio/video paths remain incomplete. The SwitchRECOMP startup splash
 is broken and disabled in this fork (build with `-DSWR_STARTUP_SPLASH` to re-enable it).
 
