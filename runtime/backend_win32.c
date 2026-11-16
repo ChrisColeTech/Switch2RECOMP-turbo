@@ -9,7 +9,10 @@
 #include <math.h>
 #include <mmsystem.h>  /* timeBeginPeriod (windows.h leaves it out with WIN32_LEAN_AND_MEAN) */
 #include "controller_sony_win32.h"
+/* Startup splash: broken and disabled in the turbo fork. Build with -DSWR_STARTUP_SPLASH to re-enable. */
+#ifdef SWR_STARTUP_SPLASH
 #include "splash_img.h"
+#endif
 
 static HWND g_hwnd; static HDC g_hdc; static HGLRC g_ctx, g_wctx[3]; static volatile int g_wnext;
 static volatile int g_ww=1280, g_wh=720; static u64 keys_held; static int g_fullscreen=0, g_want_fs=1;
@@ -367,10 +370,15 @@ static u64 keymap(WPARAM k){
     case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47; }
   return 0; }
 
+#ifdef SWR_STARTUP_SPLASH
 static u8* g_startup_px;
 static void startup_end(void){ free(g_startup_px); g_startup_px=NULL; }
+#else
+static void startup_end(void){ }
+#endif
 static void startup_paint(HWND h){
   PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps);
+#ifdef SWR_STARTUP_SPLASH
   if(g_startup_px){
     RECT r; GetClientRect(h,&r); FillRect(dc,&r,(HBRUSH)GetStockObject(BLACK_BRUSH));
     struct { BITMAPINFOHEADER hdr; RGBQUAD colors[256]; } bi={0};
@@ -382,6 +390,9 @@ static void startup_paint(HWND h){
     SetStretchBltMode(dc,HALFTONE); SetBrushOrgEx(dc,0,0,NULL);
     StretchDIBits(dc,(ww-dw)/2,(wh-dh)/2,dw,dh,0,0,SPLASH_W,SPLASH_H,g_startup_px,(BITMAPINFO*)&bi,DIB_RGB_COLORS,SRCCOPY);
   }
+#else
+  { RECT r; GetClientRect(h,&r); FillRect(dc,&r,(HBRUSH)GetStockObject(BLACK_BRUSH)); }
+#endif
   EndPaint(h,&ps); }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
@@ -439,8 +450,10 @@ static void win_thread(void* arg){ (void)arg;
   wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName="SwitchRecompWnd";
   RegisterClassA(&wc);
   RECT r={0,0,1280,720}; AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
+#ifdef SWR_STARTUP_SPLASH
   g_startup_px=malloc(SPLASH_W*SPLASH_H); if(!g_startup_px) fatal("Could not allocate the startup screen.");
   splash_unpack(g_startup_px);
+#endif
   g_hwnd=CreateWindowA("SwitchRecompWnd",g_title,WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,NULL,NULL,hi,NULL);
   UpdateWindow(g_hwnd);
   RAWINPUTDEVICE rid={1,2,0,g_hwnd}; RegisterRawInputDevices(&rid,1,sizeof rid);
@@ -467,7 +480,7 @@ void video_init(const char* title){
     HMODULE nt=GetModuleHandleA("ntdll.dll"); if(nt && GetProcAddress(nt,"wine_get_version"))
       LOG("Proton/Wine detected: for more FPS put   mesa_glthread=true %%command%%   in the game's Steam launch options (moves the OpenGL driver work to another core)\n"); }
   { extern int g_gpu_nvn; extern void nvn_window_set(void*);
-    /* the window thread keeps pumping while native Vulkan's notice is visible. OpenGL has splash_play(1.0). */
+    /* the window thread keeps pumping while native Vulkan's notice is visible. OpenGL has splash_play(1.0) when SWR_STARTUP_SPLASH is built in. */
     if(g_gpu_nvn) Sleep(1000);
     SendMessageA(g_hwnd,WM_APP+9,0,0);
     if(g_gpu_nvn){ nvn_window_set(g_hwnd); return; } }

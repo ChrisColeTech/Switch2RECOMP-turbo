@@ -3764,6 +3764,8 @@ static void frame_stats(void){
 /* ============================================================ startup screen
    SwitchRECOMP's logo and the copyright notice on black for a second, then it vanishes: it fades out while it grows
    a little. NOTICE.txt (AGPL section 7 terms) says copies and forks keep it */
+/* Startup splash: broken and disabled in the turbo fork. Build with -DSWR_STARTUP_SPLASH to re-enable. */
+#ifdef SWR_STARTUP_SPLASH
 #include "splash_img.h"
 static void splash_play(double secs){
   int ww=0, wh=0; backend_window_size(&ww,&wh); if(ww<=0 || wh<=0) return;
@@ -3797,6 +3799,7 @@ static void splash_play(double secs){
     glBindFramebuffer(GL_FRAMEBUFFER,0); glViewport(0,0,ww,wh); glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT); screen_swap(); }
   if(a) glDeleteShader(a); if(b) glDeleteShader(b); if(pr) glDeleteProgram(pr);
   glDeleteTextures(1,&tex); glUseProgram(0); state_dirty(); mb_reset(); }
+#endif
 
 /* SWR_GPU_PROF=1: where the GPU thread spends its time. a helper thread stops it ~1000 times a second, notes its pc
    and writes the busiest addresses to gpu_profile.txt every 10 s (module + offset, the runtime's go through its
@@ -3875,7 +3878,9 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
   warm_load();
   g_gl=1; g_gl_ready=1;
   { extern void (*g_sub_done)(u32,u32); g_sub_done=sub_done; }
+#ifdef SWR_STARTUP_SPLASH
   splash_play(1.0);
+#endif
   { /* renderer=vulkan: Eden's Vulkan renderer takes the window; OpenGL stays set up and is used if it can't start */
     extern int g_edenvk_want, g_edenvk_on; extern int edenvk_start(int,void*,void*,u32,u32); extern int backend_vk_window(void**,void**,int*,int*);
     extern void gmmu_replay(void (*)(u64,u64,u64)); extern void edenvk_map(u64,u64,u64);
