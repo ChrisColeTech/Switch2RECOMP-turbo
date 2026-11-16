@@ -162,12 +162,15 @@ def digest(path):
 
 def dereference_symlinks(stage):
     """Toolchain archives carry absolute symlinks (e.g. GCC's libgomp.so -> libgomp.so.1.0.0 recorded against
-    the extraction directory); a relocated bundle cannot follow them, so replace every link with a copy of its
-    target wherever that target resolves. Only unreadable targets fail; validate_contents still runs afterwards."""
+    the toolchain's original build directory, which never exists on the packaging machine); a relocated bundle
+    cannot follow them, so replace every link with a copy of its target. When the recorded target is unreadable,
+    fall back to the versioned sibling carrying the same basename (standard SONAME layout)."""
     for path in [p for p in stage.rglob('*') if p.is_symlink()]:
         target = Path(os.readlink(path))
-        resolved = target if target.is_absolute() else Path(os.path.normpath(path.parent / target))
-        if not resolved.is_file():
+        candidates = [target] if target.is_absolute() else [Path(os.path.normpath(path.parent / target))]
+        candidates.append(path.parent / target.name)
+        resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if resolved is None:
             raise RuntimeError('Non-relocatable symlink with unreadable target: ' + str(path.relative_to(stage)))
         path.unlink()
         shutil.copy2(resolved, path)
