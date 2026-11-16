@@ -1181,7 +1181,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if ((fsv & VKSH_FS_ALPHA) && atest) { static int n; if (!n++) VKLOG("alpha test: function %u, reference %g (shader %s's alpha test variant)", S->color.alpha_func, S->alpha_ref, fs->key); }
     if (!g_vkp_dyn.logic_op_enable) k.logic_en = (uint8_t)logic;
     if (!g_vkp_dyn.logic_op) k.logic_op = (uint8_t)(logic ? vkp_logic_op(S->color.logic_op) : VK_LOGIC_OP_COPY);
-    if (!g_vkp_dyn.a2c) k.a2c = S->ms.a2c != 0;
+    if (!g_vkp_dyn.a2c) k.a2c = S->ms.a2c != 0 && vkc_int("a2c", 1);   // "gamectl set a2c 0" / NXRT_VK_A2C=0: alpha to coverage off (diagnostics)
     if (!g_vkp_dyn.polygon_mode) k.poly = (uint8_t)S->poly.mode;
     if (!g_vkp_dyn.depth_clamp) k.depth_clamp = S->depth_clamp != 0 && g_vk.f10.depthClamp;
     uint32_t used; int use_zero;
@@ -1239,7 +1239,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     if (g_vkp_dyn.logic_op_enable) DS_U(cb, DS_LOGIC_EN, logic_en, logic, vkCmdSetLogicOpEnableEXT(cb, (VkBool32)v_));
     if (g_vkp_dyn.logic_op) DS_U(cb, DS_LOGIC, logic, logic ? vkp_logic_op(S->color.logic_op) : VK_LOGIC_OP_COPY, vkCmdSetLogicOpEXT(cb, (VkLogicOp)v_));
-    if (g_vkp_dyn.a2c) DS_U(cb, DS_A2C, a2c, S->ms.a2c != 0, vkCmdSetAlphaToCoverageEnableEXT(cb, (VkBool32)v_));
+    if (g_vkp_dyn.a2c) DS_U(cb, DS_A2C, a2c, S->ms.a2c != 0 && vkc_int("a2c", 1), vkCmdSetAlphaToCoverageEnableEXT(cb, (VkBool32)v_));
     if (g_vkp_dyn.polygon_mode) DS_U(cb, DS_POLY, poly, vkp_polygon_mode(S->poly.mode), vkCmdSetPolygonModeEXT(cb, (VkPolygonMode)v_));
     if (g_vkp_dyn.depth_clamp) DS_U(cb, DS_DCLAMP, dclamp, S->depth_clamp != 0 && g_vk.f10.depthClamp, vkCmdSetDepthClampEnableEXT(cb, (VkBool32)v_));
     bind_vertex_buffers(cb, used, use_zero);

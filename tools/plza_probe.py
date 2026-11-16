@@ -172,6 +172,28 @@ def native_stacks(pid, out):
     atomic(out, '\n'.join(lines) + '\n')
 
 
+def ctl(command):
+    """one command on the runtime's control pipe (runtime/nvn/vk/vk_ctl.c), its reply; errors come back as text"""
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.WriteFile.argtypes = k.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    end = time.monotonic() + 5
+    while True:
+        h = k.CreateFileW(r'\\.\pipe\swr_ctl', 0xC0000000, 0, None, 3, 0, None)   # GENERIC_READ|WRITE, OPEN_EXISTING
+        if h and h != wintypes.HANDLE(-1).value: break
+        if time.monotonic() > end: return f'control pipe not available (error {ctypes.get_last_error()})'
+        time.sleep(.2)
+    try:
+        data = (command + '\n').encode(); n = wintypes.DWORD()
+        if not k.WriteFile(h, data, len(data), ctypes.byref(n), None): return f'write failed (error {ctypes.get_last_error()})'
+        out = b''; buf = ctypes.create_string_buffer(65536)
+        while k.ReadFile(h, buf, len(buf), ctypes.byref(n), None) and n.value: out += buf.raw[:n.value]
+        return out.decode(errors='replace')
+    finally: k.CloseHandle(h)
+
+
 def worker(run):
     config = json.loads((run / 'config.json').read_text())
     exe, log = game_files(config['game'])
@@ -240,6 +262,14 @@ def worker(run):
                 record(**request)
                 if action == 'stop':
                     reason = 'requested stop'; atomic(run / f'{ident}.done.json', json.dumps(dict(stopping=True))); break
+                if action == 'ctl':
+                    reply = ctl(request['ctl'])
+                    record(ctl=request['ctl'], reply=reply.strip()[:2000])
+                    time.sleep(request['settle'])
+                    image = shot('ctl-' + re.sub(r'[^A-Za-z0-9]+', '_', request['ctl'])[:40])
+                    atomic(run / f'{ident}.done.json', json.dumps(dict(screenshot=image, reply=reply.strip()[:2000])))
+                    next_shot = time.monotonic() + config['shot_every']
+                    continue
                 if action in BUTTONS:
                     inp = run / 'input.txt'
                     if inp.exists(): raise RuntimeError('pending input request; refusing overwrite')
@@ -292,8 +322,9 @@ def main():
     p.add_argument('--wait', action='store_true', help='block until the run ends, then print the report')
     p = sub.add_parser('worker'); p.add_argument('run', type=Path)
     p = sub.add_parser('report'); p.add_argument('run', type=Path)
-    p = sub.add_parser('action'); p.add_argument('run', type=Path); p.add_argument('action', choices=[*BUTTONS, 'shot', 'stop'])
+    p = sub.add_parser('action'); p.add_argument('run', type=Path); p.add_argument('action', choices=[*BUTTONS, 'shot', 'ctl', 'stop'])
     p.add_argument('--observed', required=True); p.add_argument('--hold-ms', type=int, default=200); p.add_argument('--settle', type=float, default=1.5)
+    p.add_argument('--ctl', default='', help='with action ctl: a control pipe command, e.g. "set a2c 0", "texat 34a000000", "flight"')
     a = ap.parse_args()
     if a.cmd == 'worker': return worker(a.run.resolve())
     if a.cmd == 'report': return report(a.run.resolve())
@@ -316,7 +347,8 @@ def main():
     if (run / 'result.json').exists(): ap.error('run has ended')
     if (run / 'command.json').exists(): ap.error('a command is pending')
     ident = str(time.time_ns())
-    atomic(run / 'command.json', json.dumps(dict(id=ident, action=a.action, observed_before=a.observed, hold_ms=a.hold_ms, settle=a.settle)))
+    if a.action == 'ctl' and not a.ctl: ap.error('action ctl needs --ctl "<command>"')
+    atomic(run / 'command.json', json.dumps(dict(id=ident, action=a.action, observed_before=a.observed, hold_ms=a.hold_ms, settle=a.settle, ctl=a.ctl)))
     end = time.monotonic() + 45; done = run / f'{ident}.done.json'
     while not done.exists() and time.monotonic() < end:
         if (run / 'result.json').exists(): raise RuntimeError((run / 'result.json').read_text())

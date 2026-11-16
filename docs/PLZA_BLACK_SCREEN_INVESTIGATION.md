@@ -6,10 +6,11 @@
 Status 2026-11-16: **fixed (renders).** Pokemon Legends Z-A Switch 2 Edition (`0100F43008C44000`, built by
 RecompLauncher with turbo a9a4add) opened a black window with working audio and never rendered. The cause was a
 concurrency failure in the game's job/resource system under this runtime: loading jobs stalled partway and every
-thread went to sleep. The root cause is the LL/SC emulation: LDXR/STXR were a compare-and-swap on the value with no
-exclusive monitor, so the game's lock-free structures lost updates (ABA) when its threads really ran at once. With the
-global exclusive monitor (`runtime/cpu.h`) and the game recompiled, it reaches the Language Selection screen at a
-steady 30 FPS. The scheduler work below was needed to find this but is not part of the fix (it stays opt-in). Branch
+thread went to sleep. Two engine bugs: the LL/SC emulation (LDXR/STXR were a compare-and-swap on the value with no
+exclusive monitor, so the game's lock-free structures lost updates when its threads really ran at once), and a
+condvar race (`svc_wait_cv` released the mutex before marking the condvar as waited on, so a signal could be skipped).
+With the global exclusive monitor (`runtime/cpu.h`, the game recompiled) and the condvar fix (`runtime/kernel.c`)
+it runs the Language Selection and Appearance screens at a steady 30 FPS. The scheduler work below was needed to find this but is not part of the fix (it stays opt-in). Branch
 `plza-blackscreen`. Remaining issues are in [Open items](#open-items) (text in some UI fonts is garbled).
 
 ## Symptom
@@ -165,6 +166,23 @@ at 3.9 s, `[vk] textures: 93 images, 214 MB`, `[vk] pacing: 30.00 FPS`, 1723 fra
 screen on screen. A second run: the same, 30 FPS from the start. The value-only LL/SC was the cause. The guest core
 scheduler is not needed for this game and stays opt-in.
 
+**Second stall: a condvar wait race (runtime fix).** With the monitor the game rendered, but some runs froze
+after a few seconds to two minutes of the language screen (frames 143, 480, 698). In the frozen state main waited
+for the write side of an `nn::os::ReaderWriterLock` (state word `3488061f0`: low 32 bits the lock word, high 32 bits
+the counters; readers 0, read waiters 2, writer waiting 1, both condvar keys 1) and the read waiters (93, 94) waited
+behind it. The last reader had left without waking the writer. `svc_wait_cv` released the guest mutex before it
+stored the condvar key (1 = a thread waits). The SDK's Signal/Broadcast (`e2c78c0`, `e2c78d4`) skip the SVC while the
+key reads 0, so a thread on another core could take the lock in that window, leave, read key 0 and not signal.
+Horizon writes the key before releasing the mutex, and now so does the runtime. After the fix: 5401 frames in 184 s
+at 30 FPS, 4201 frames in 150 s, no stall, and A on the language screen reaches the Appearance screen.
+
+**Harness.** `tools/plza_probe.py` follows `tools/mkw_probe.py`. It starts any build folder windowed through the
+command line (`--fullscreen=0`, `-v` with `--verbose`), so the ini is untouched. It takes runtime screenshots
+(`NXRT_VK_SHOT_FILE`) periodically and after every action, presses buttons (`SWR_INPUT_FILE`), sends control-pipe
+commands (`action RUN ctl --ctl "set a2c 0"`), and writes `progress.jsonl` (frames, FPS, textures from the log).
+At each stall it saves `threads.txt` with the log's dump block, and with `--stacks` native stacks (cdb, nm). It only
+closes processes it started. Runs go to `build/plza-investigation/`.
+
 ## Switches and diagnostics
 
 | Switch | Effect |
@@ -201,9 +219,14 @@ game recompiled from the NUP with `efa9b2a`). The owner's build folder and the N
 
 ## Open items
 
-- **Garbled UI text.** On the Language Selection screen the language names are drawn as broken glyphs, while
-  the question line is clean (the title's look may be the game's own glitch style). Likely one of the bitmap (`.bffnt`) or Fontworks (`.bfotf`)
-  font paths, i.e. a texture format or glyph-cache upload; not investigated yet.
+- **Garbled UI labels and portraits.** On the Language Selection screen the language names are broken, while the
+  question line is clean. On the Appearance screen the character portraits break up the same way, so it is not a
+  font-only problem. At native resolution (runtime screenshots) each glyph is cut into horizontal strips, groups of
+  rows missing or displaced in a regular rhythm. That points at a texture whose tiled (block-linear) layout is read
+  with the wrong parameters (block height, pitch vs block-linear) rather than at the text. Ruled out: alpha to
+  coverage (`gamectl set a2c 0`, a new live switch, changes nothing). Next: find the label/portrait textures (flight
+  recorder draw list, `texat`) and compare their NVN descriptions (`DM_NVN_TEXINFO=WxH`) with how the backend
+  deswizzles them.
 - **Other games.** The monitor and `efa9b2a` change every game's generated code on its next recompile. Mario Kart
   World and Donkey Kong Bananza should be recompiled and run before this is merged (not done here). The monitor adds
   one atomic per STXR.
