@@ -4,6 +4,7 @@ build/
 *.o
 *.a
 !runtime/vp9/win/libvpx.a
+!runtime/vp9/lin/libvpx.a
 *.exe
 *.dll
 *.so
