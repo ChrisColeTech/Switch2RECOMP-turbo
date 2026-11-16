@@ -183,12 +183,32 @@ commands (`action RUN ctl --ctl "set a2c 0"`), and writes `progress.jsonl` (fram
 At each stall it saves `threads.txt` with the log's dump block, and with `--stacks` native stacks (cdb, nm). It only
 closes processes it started. Runs go to `build/plza-investigation/`.
 
+## Regression check (Mario Kart World, Donkey Kong Bananza)
+
+Both games were rebuilt with the merged engine into their library folders and run with `tools/plza_probe.py`.
+- **Donkey Kong Bananza**: boots, title screen and main menu (A at "PRESS A"), clean text and textures in the
+  Switch 2 GOB order, no stall. 8401 frames in 151 s at 60.0 FPS on the local display.
+- **Mario Kart World**: boots, title course, L+R and A reach the Single Player and Grand Prix menus, clean. With
+  the exclusive monitor on it lost about a third of its frames (1201 vs 1801 frames by about 70 s, same DLL and
+  script, `SWR_NO_XMON=1` A/B). The monitor is therefore on only for Switch 1 programs (title not `04…`), and
+  `SWR_XMON` / `SWR_NO_XMON` override. A build from unmodified `origin/turbo` (old code generation and runtime,
+  same settings and shader cache) ran the same script at 30.3 FPS with 758 slow frames; the final build ran at
+  32.0 FPS. No regression.
+- **About 30 FPS in all later runs**: the Windows session had become a Remote Desktop session; the only display was
+  the "Microsoft Remote Display Adapter" at 32 Hz. With FIFO vsync every game presents at that rate (the log's
+  `slow frame … GPU waits 46 ms` with GPU time about 1 ms, and `SyncWait` about 20 ms a frame). Measure
+  performance on the local display.
+- A new game DLL with an old runtime is not a valid combination (the old `RtAPI` has no `excl_mon` field, the DLL
+  reads past it): one such run crashed (exit `0x1`).
+
 ## Switches and diagnostics
 
 | Switch | Effect |
 | --- | --- |
 | `SWR_CORE_SCHED=1` | turn on the experimental guest core scheduler (one thread per core, floating threads migrate) |
 | `SWR_CORE_SPIN_MS=n` | overtake a core holder after n ms without a blocking SVC (default 500) |
+| `SWR_XMON=1` / `SWR_NO_XMON=1` | exclusive monitor on / off (default: on for Switch 1 programs, off for `04…` titles) |
+| `NXRT_TEX_ORDER=tx1` / `switch2` | in-GOB texture byte order (default: tx1 for Switch 1 programs) |
 | `SWR_CORE_PREEMPT=1` | also preempt worse priority holders in game code with SuspendThread (known to deadlock) |
 | cdb (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe -pv -p <pid> -c "~*kn 14; qd"`) | native stacks of a hung game without stopping it; resolve runtime offsets with `x86_64-w64-mingw32-nm -n bin/runtime_win64_win32.exe` (the runtime has a symbol table, no debug info; addr2line prints `??`) |
 | `start "" /affinity 1 "<Game>.exe"` | the whole game on one host CPU, the strongest serialization available |
