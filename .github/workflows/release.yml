@@ -38,28 +38,51 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build glslang-tools libx11-dev libgl-dev libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
+          sudo apt-get install -y build-essential cmake ninja-build nasm dpkg-dev glslang-tools libx11-dev libgl-dev libegl1 libopengl0 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
       - uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.3'
           arch: ${{ matrix.qt_arch }}
-          modules: qtimageformats
+          modules: qtimageformats   # qtsvg ships inside qtbase's desktop package; its sources/licenses are packaged separately
           cache: true
       - name: Download bundled tools and license sources
         run: python scripts/release-deps.py --dest build/release-deps
       - name: Python regression tests
         run: python -m unittest discover -s tests -p "test_n*.py"
+      - name: Python selection tests
+        run: python tests/test_python_selection.py -v
+      - name: Packaging regression tests
+        run: python tests/test_release.py -v
+      - name: Linux audio regression tests
+        if: runner.os == 'Linux'
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/release-deps/lib
+        run: sh tests/run_audio.sh
+      - name: Windows launcher build dependencies
+        if: runner.os == 'Windows'
+        run: python -m pip install cmake==3.31.10 ninja==1.13.2
       - name: Windows shader compiler
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           git clone --depth 1 --branch 15.1.0 https://github.com/KhronosGroup/glslang.git build/glslang-src
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake -S build/glslang-src -B build/glslang -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DBUILD_TESTING=OFF
+          cmake -S build/glslang-src -B build/glslang -G "Visual Studio 17 2022" -A x64 -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DBUILD_TESTING=OFF -DENABLE_GLSLANG_BINARIES=ON
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build/glslang --config Release --parallel 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           (Resolve-Path build/glslang/StandAlone/Release).Path >> $env:GITHUB_PATH
+      - name: Windows controller and shader regression tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd\build\release-deps\gcc\Library\bin;$env:PATH"
+          $env:NXSHADER_TOOLS = "$pwd\build\release-deps\shader-tools\Library\bin"
+          New-Item -ItemType Directory -Force build/mkw-investigation | Out-Null
+          python tests/test_controllers.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/test_mkw_runtime.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Windows runtime and launcher
         if: runner.os == 'Windows'
         shell: pwsh
@@ -67,6 +90,7 @@ jobs:
           $env:PATH = "$pwd\build\release-deps\gcc\Library\bin;$env:PATH"
           python tools/build_nvn.py --jobs 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not (Test-Path build/nvn/libnvn.a)) { throw 'NVN archive missing' }
           python switchrecomp.py --build-runtime --target win64 --backend win32 --cc "$pwd\build\release-deps\gcc\Library\bin\x86_64-w64-mingw32-gcc.exe"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ./scripts/build-launcher.ps1 -QtPrefix $env:QT_ROOT_DIR -Jobs 4
@@ -74,6 +98,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python tools/build_nvn.py --linux --jobs 4
+          test -s build/nvn_lin/libnvn.a
+          test -s runtime/vp9/lin/libvpx.a
           python switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
           SWR_QT_PREFIX="$QT_ROOT_DIR" SWR_JOBS=4 sh scripts/build-launcher.sh
       - name: Package Windows
@@ -105,6 +131,8 @@ jobs:
           path: |
             logs/
             build/launcher-*/Testing/Temporary/LastTest.log
+            build/controllers-*/checks.log
+            build/release-deps/native/libvpx-build/config.log
 
   release:
     needs: build
@@ -128,4 +156,5 @@ jobs:
         run: |
           tag="turbo-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
           git archive --format=tar.gz --prefix=Switch2RECOMP-turbo-source/ -o "release/Switch2RECOMP-turbo-source.tar.gz" "$GITHUB_SHA"
+          (cd release && sha256sum Switch2RECOMP-turbo-source.tar.gz > Switch2RECOMP-turbo-source.tar.gz.sha256)
           gh release create "$tag" release/*.zip release/*.tar.gz release/*.sha256 --target "$GITHUB_SHA" --title "Switch2RECOMP turbo build ${GITHUB_RUN_NUMBER}" --notes-file docs/RELEASE_NOTES.md --latest

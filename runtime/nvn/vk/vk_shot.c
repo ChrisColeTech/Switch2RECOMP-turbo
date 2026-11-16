@@ -124,9 +124,14 @@ void vks_shot_present(const tex_t *t, uint64_t frame, const int crop[4]) {
     if (*g_file) {
         wchar_t wf[1100]; MultiByteToWideChar(CP_UTF8, 0, g_file, -1, wf, 1100);
         if (GetFileAttributesW(wf) != INVALID_FILE_ATTRIBUTES) {
-            want = 1;
             FILE *f = _wfopen(wf, L"rb");
-            if (f) { size_t k = fread(path, 1, sizeof path - 1, f); path[k] = 0; fclose(f); for (char *q = path; *q; q++) if (*q == '\r' || *q == '\n') { *q = 0; break; } }
+            // A transient sharing failure must not consume the request and write
+            // to a different filename. The bounded probe waits for its named PNG.
+            if (!f) return;
+            size_t k = fread(path, 1, sizeof path - 1, f); int bad = ferror(f); fclose(f);
+            if (bad) return;
+            path[k] = 0; for (char *q = path; *q; q++) if (*q == '\r' || *q == '\n') { *q = 0; break; }
+            want = 1;
             DeleteFileW(wf);
         }
     }

@@ -2,8 +2,9 @@
 
 Looked for in this order: inside the repository (as Install.bat and tools/get_external.py put them: gcc/, python/, external/),
 then beside it (../gcc, ../SwitchRecomp/python, ../external: an older layout), then the PATH and the Vulkan SDK (%VULKAN_SDK%).
+Python uses SWR_PYTHON, .venv, venv, the portable bundle, then the current interpreter.
 S2R_EXTERNAL picks another external folder. Every tool imports this instead of naming a folder of its own."""
-import os, shutil, sys
+import os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARENT = os.path.dirname(ROOT)
@@ -34,8 +35,19 @@ def gcc_tool(name):
 
 
 def python():
-    """The Python that builds games: the one Install.bat downloads, else this one."""
-    return _first(os.path.join(ROOT, 'python', 'python.exe'), os.path.join(PARENT, 'SwitchRecomp', 'python', 'python.exe')) or sys.executable
+    """Explicit override, checkout venv, portable bundle, then this interpreter."""
+    override = os.environ.get('SWR_PYTHON')
+    suffix = ('Scripts', 'python.exe') if os.name == 'nt' else ('bin', 'python3')
+    bundle = ('python', 'python.exe') if os.name == 'nt' else ('python', 'bin', 'python3')
+    choices = [override] if override else [os.path.join(ROOT, v, *suffix) for v in ('.venv', 'venv')] + [os.path.join(ROOT, *bundle), sys.executable]
+    for candidate in choices:
+        path = shutil.which(candidate)
+        if not path: continue
+        try:
+            if subprocess.run([path, '-c', 'import sys; sys.exit(sys.version_info < (3, 8))'], capture_output=True, timeout=5).returncode == 0:
+                return os.path.abspath(path)
+        except (OSError, subprocess.TimeoutExpired): pass
+    raise RuntimeError('SWR_PYTHON is invalid' if override else 'No runnable Python 3 interpreter found')
 
 
 def ext(*parts):

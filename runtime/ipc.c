@@ -184,7 +184,10 @@ void ipc_handle(KThread* t, u32 handle, u64 msg_addr){
   c->th=t; c->msg=GP(msg_addr); c->msg_addr=msg_addr; c->sess=s;
   parse(c);
   cpu->x[0]=0;
-  if(c->type==2 || c->type==15){ /* client closes the handle itself afterwards */ free(c); return; }
+  if(c->type==2 || c->type==15){ /* the server closes without a reply; SDK teardown expects SessionClosed, then closes its client handle */
+    cpu->x[0]=0xF601;
+    if((g_title_id>>56)==0x04 && ipc_warn_once("session close",c->type)) LOG("ipc: %s close type %u -> SessionClosed\n",s->o.name,c->type);
+    free(c); return; }
   if(c->type==5 || c->type==7){ /* control */
     switch(c->cmd){
       case 0: { s->is_domain=1; if(!s->domain){ Domain* d=calloc(1,sizeof *d); pm_init(&d->lk); d->refs=1; s->domain=d; s->obj->refs++; domain_add(d,s->obj); } out32(c,1); break; }

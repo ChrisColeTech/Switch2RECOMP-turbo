@@ -167,6 +167,7 @@ int vk_dev_open(const vk_dev_opts *o, const char *const *inst_exts, uint32_t n_i
         {VK_EXT_4444_FORMATS_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT, sizeof(VkPhysicalDevice4444FormatsFeaturesEXT), &h->fmt_4444},
         {VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, sizeof(VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT), &h->vertex_input_dynamic},   // the replay (M5-C)
         {VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT, sizeof(VkPhysicalDeviceImageViewMinLodFeaturesEXT), &h->view_min_lod},   // tile levels left out (vk_sparse.inc)
+        {VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT, sizeof(VkPhysicalDeviceImage2DViewOf3DFeaturesEXT), &h->image_2d_of_3d},
         {VK_EXT_DEVICE_MEMORY_REPORT_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_MEMORY_REPORT_FEATURES_EXT, sizeof(VkPhysicalDeviceDeviceMemoryReportFeaturesEXT), &h->mem_report},
         {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, sizeof(VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR), &h->pipe_exec},   // NXRT_VK_PIPE_STATS only (vk_pipe.c)
         {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, NULL, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, sizeof(VkPhysicalDeviceFaultFeaturesEXT), &h->device_fault},   // vk_lost's report
@@ -248,6 +249,8 @@ int vk_dev_open(const vk_dev_opts *o, const char *const *inst_exts, uint32_t n_i
     if (rob) VKLOG("robustness for the freeze test: robust image access %d, robustness2 %s", f13.robustImageAccess, rob >= 2 ? "asked" : "off");
     for (int i = 0; i < NEF; i++) {
         if (!fs[i]) continue;
+        if (ef[i].st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT) {
+            VkPhysicalDeviceImage2DViewOf3DFeaturesEXT *x = (void *)fs[i]; h->image_2d_of_3d = x->image2DViewOf3D; h->sampler_2d_of_3d = x->sampler2DViewOf3D; continue; }
         if (ef[i].st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT) {   // task and mesh shaders alone: the others need features this device set does not ask for
             VkPhysicalDeviceMeshShaderFeaturesEXT *ms = (void *)fs[i]; ms->multiviewMeshShader = 0; ms->primitiveFragmentShadingRateMeshShader = 0; ms->meshShaderQueries = 0; h->mesh_shader = ms->meshShader && ms->taskShader; continue; }
         if (ef[i].st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
@@ -308,6 +311,7 @@ int vk_dev_open(const vk_dev_opts *o, const char *const *inst_exts, uint32_t n_i
           h->fs_interlock, h->gpl, h->mirror_clamp_edge, h->minmax_filter, f12.bufferDeviceAddress, en.shaderInt64, f12.shaderFloat16);
     VKLOG("if the GPU stops responding: checkpoints %s, the driver's fault report %s", h->checkpoints == 2 ? "before every dispatch and draw" : h->checkpoints ? "before every dispatch" : "off",
           h->device_fault ? "on" : "not available");
+    VKLOG("3D slice descriptors: storage %d sampled %d", h->image_2d_of_3d, h->sampler_2d_of_3d);
     for (uint32_t i = 0; i < g_vk.memp.memoryHeapCount; i++)
 
         VKLOG("memory heap %u: %.0f MB%s", i, g_vk.memp.memoryHeaps[i].size / 1048576.0, g_vk.memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device local" : "");

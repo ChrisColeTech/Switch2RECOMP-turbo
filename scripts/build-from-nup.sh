@@ -7,7 +7,7 @@ if [ "$#" -lt 1 ]; then
 fi
 [ -f "$1" ] || { echo "[NUP BUILD] FAILED - file not found: $1" >&2; exit 1; }
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-python=${SWR_PYTHON:-python3}
+. "$root/scripts/_env.sh"
 if [ -n "${SWR_CC:-}" ]; then cc=$SWR_CC
 elif [ -x "$root/gcc/bin/x86_64-conda-linux-gnu-gcc" ]; then cc=$root/gcc/bin/x86_64-conda-linux-gnu-gcc
 else cc=gcc

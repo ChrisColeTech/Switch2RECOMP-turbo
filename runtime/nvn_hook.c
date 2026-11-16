@@ -132,16 +132,24 @@ static void nvn_hle_install(u64 (*find)(const char*)){
     static const char* up[]={"","../","../../","../../../"}; char sc[1400]="", py[1400]="", x[1400];
     for(int i=0;i<4 && !sc[0];i++){ snprintf(x,sizeof x,"%s%stools" SWR_SEP "nxshader" SWR_SEP "nxs_live.py",g_exedir,up[i]); FILE* f=fopen(x,"rb"); if(f){ fclose(f); snprintf(sc,sizeof sc,"%s",x); }
       if(!sc[0]){ snprintf(x,sizeof x,"%s%snxshader" SWR_SEP "nxs_live.py",g_exedir,up[i]); f=fopen(x,"rb"); if(f){ fclose(f); snprintf(sc,sizeof sc,"%s",x); } } }
+    { const char* override=getenv("SWR_PYTHON"); if(override && *override) snprintf(py,sizeof py,"%s",override); }
 #ifdef _WIN32
-    for(int i=0;i<4 && !py[0];i++){ snprintf(x,sizeof x,"%s%spython\\python.exe",g_exedir,up[i]); FILE* f=fopen(x,"rb"); if(f){ fclose(f); snprintf(py,sizeof py,"%s",x); } }
+    const char* candidates[]={".venv\\Scripts\\python.exe","venv\\Scripts\\python.exe","python\\python.exe"};
+#else
+    const char* candidates[]={".venv/bin/python3","venv/bin/python3","python/bin/python3"};
+#endif
+    /* a checkout venv wins over a staged portable interpreter at any ancestor */
+    for(int c=0;c<3 && !py[0];c++) for(int i=0;i<4 && !py[0];i++){
+      snprintf(x,sizeof x,"%s%s%s",g_exedir,up[i],candidates[c]); FILE* f=fopen(x,"rb"); if(f){ fclose(f); snprintf(py,sizeof py,"%s",x); } }
     if(!py[0] && sc[0]){ snprintf(x,sizeof x,"%s",sc); char* slash=strrchr(x,'\\'); if(!slash) slash=strrchr(x,'/');
       if(slash){ snprintf(slash+1,(size_t)(x+sizeof x-(slash+1)),"python.path"); FILE* f=fopen(x,"rb");
-        if(f){ if(fgets(py,sizeof py,f)){ size_t n=strlen(py); while(n && (py[n-1]=='\r'||py[n-1]=='\n')) py[--n]=0; } fclose(f); } } }
+        if(f){ if(fgets(py,sizeof py,f)){ size_t n=strlen(py); while(n && (py[n-1]=='\r'||py[n-1]=='\n')) py[--n]=0; } fclose(f);
+          FILE* check=py[0]?fopen(py,"rb"):NULL; if(check) fclose(check); else py[0]=0; } } }
+#ifdef _WIN32
     if(!py[0]) snprintf(py,sizeof py,"python");
 #else
-    snprintf(py,sizeof py,"python3");
+    if(!py[0]) snprintf(py,sizeof py,"python3");
 #endif
-    if(getenv("SWR_PYTHON")) snprintf(py,sizeof py,"%s",getenv("SWR_PYTHON"));
     if(!sc[0] || getenv("SWR_NO_NXS_LIVE")) LOG("nvn: no live shader translator (tools/nxshader/nxs_live.py not found): only shaders already in the cache are drawn\n");
     else { const char* cache=getenv("NXRT_SHADER_CACHE"); char dump[1300]; snprintf(dump,sizeof dump,"%s" SWR_SEP "dumps",cache);
       _putenv("SWR_NXS_LIVE=1"); { char e2[1400]; snprintf(e2,sizeof e2,"NXRT_SHADER_DUMP=%s",dump); _putenv(e2); }
@@ -149,7 +157,7 @@ static void nvn_hle_install(u64 (*find)(const char*)){
 #ifdef _WIN32
       char cmd[6000]; snprintf(cmd,sizeof cmd,"\"%s\" -I \"%s\" --dump \"%s\" --cache \"%s\" --parent %s",py,sc,dump,cache,pid);
       STARTUPINFOA si; PROCESS_INFORMATION pi; memset(&si,0,sizeof si); si.cb=sizeof si;
-      if(CreateProcessA(NULL,cmd,NULL,NULL,FALSE,CREATE_NO_WINDOW|BELOW_NORMAL_PRIORITY_CLASS,NULL,NULL,&si,&pi)){ CloseHandle(pi.hThread); CloseHandle(pi.hProcess); LOG("nvn: live shader translator started (%s)\n",sc); }
+      if(CreateProcessA(NULL,cmd,NULL,NULL,FALSE,CREATE_NO_WINDOW|BELOW_NORMAL_PRIORITY_CLASS,NULL,NULL,&si,&pi)){ CloseHandle(pi.hThread); CloseHandle(pi.hProcess); LOG("nvn: live shader translator started (%s), Python: %s\n",sc,py); }
       else LOG("nvn: the live shader translator didn't start (error %lu): is Python there? (%s)\n",GetLastError(),py);
 #else
       { extern char** environ; pid_t p; char* av[]={py,"-I",sc,"--dump",dump,"--cache",(char*)cache,"--parent",pid,NULL};
@@ -162,7 +170,7 @@ void swr_nvn_log(const char* s){ logf_(1,"%s",s); }
 int swr_nvn_native_mem(u32 h, u64* a, u64* n){ extern int ns2_native_image_mem(u32,u64*,u64*); return ns2_native_image_mem(h,a,n) && *a; }   /* h: a native image id */
 void swr_nvn_fatal(const char* s){ fatal("%s",s); }
 u64 swr_nvn_slot_addr(unsigned i){ return g_nvn_lo+(u64)i*4; }
-const char* swr_nvn_log_dir(void){ static char p[1200]; if(!p[0]) snprintf(p,sizeof p,"%s%s.log",g_exedir,g_exename); return p; }
+const char* swr_nvn_log_dir(void){ static char p[1200]; if(!p[0]){ const char* e=getenv("SWR_NVN_DIAGNOSTIC_PREFIX"); if(e && *e) snprintf(p,sizeof p,"%s",e); else snprintf(p,sizeof p,"%s%s.log",g_exedir,g_exename); } return p; }
 void swr_nvn_vi_crop(int c[4]){ extern volatile i32 g_vi_crop[4]; for(int i=0;i<4;i++) c[i]=g_vi_crop[i]; }
 void* swr_nvn_cur_cpu(void){ KThread* t=kthread_cur(); return t? (void*)&t->cpu : NULL; }
 u64 swr_nvn_guest_ns(void){ extern u64 guest_ns(void); return guest_ns(); }

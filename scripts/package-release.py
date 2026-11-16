@@ -19,7 +19,81 @@ SOURCE_DIRS = {'runtime', 'launcher', 'scripts', 'tools', 'tool', 'tests', 'docs
 SOURCE_FILES = {'a64.py', 'brt.py', 'codegen.py', 'nup.py', 'nsp.py', 'nxloader.py', 'switchrecomp.py', 'tools_sym.py',
                 'LICENSE.txt', 'NOTICE.txt', 'CHANGELOG.txt', 'README.md', 'README.txt', 'DEVELOPER_GUIDE.md',
                 'REGRESSION.md', 'Install.bat', 'Install.sh', '.gitattributes', '.gitignore'}
-JUNK = {'__pycache__', '_downloads', '.git', 'shader_cache', 'captures', 'logs'}
+JUNK = {'__pycache__', '_downloads', '.git', '.venv', 'venv', '.pytest_cache', 'shader_cache',
+        'captures', 'logs', 'games', 'saves', 'savedata', 'firmware'}
+PRIVATE_NAMES = {'library.json', 'python.path', 'performance.txt', 'threads.txt', 'prod.keys', 'title.keys'}
+PRIVATE_SUFFIXES = {'.log', '.pyc', '.nup', '.nsp', '.xci', '.keys', '.nca', '.nso', '.nro'}
+
+
+def excluded(path):
+    return (any(part.lower() in JUNK for part in path.parts) or path.name.lower() in PRIVATE_NAMES
+            or path.suffix.lower() in PRIVATE_SUFFIXES)
+
+
+def required_files(platform):
+    common = ['switchrecomp.py', 'nup.py', 'nsp.py', 'runtime/rt.h', 'runtime/audio.h',
+              'runtime/audio_limit.h', 'runtime/audio_queue.h', 'runtime/controller_sony.h',
+              'runtime/controller_sony_win32.h', 'runtime/nvn/gfx/dmsh_abi.h',
+              'runtime/nvn/vk/vk_perf.c', 'runtime/nvn/vk/vk_perf.h', 'tools/build_nvn.py',
+              'tools/s2r_paths.py', 'tools/nxshader/s2r_paths.py', 'tools/nxshader/nxs_live.py',
+              'tools/nxshader/nxs_cache.py', 'tools/nxshader/nxs_front.py', 'tools/nxshader/nxshader.py',
+              'tools/nxshader/nxs_refl.py', 'tools/nxshader/nxs_spv.py', 'tools/nxshader/dmsh_abi.py',
+              'tools/nxshader/dmsh_ampere.py', 'tools/nxshader/dmsh_meshstage.py',
+              'tools/nxshader/xlate_bin/dmsh_xlate.dll', 'tools/nxshader/xlate_bin/dmsh_xlate.deps.json',
+              'tools/nxshader/xlate_bin/dmsh_xlate.runtimeconfig.json',
+              'tools/nxshader/xlate_bin/LICENSE-Ryujinx.txt', 'tools/nxshader/xlate_bin/LICENSE-nxnative.txt',
+              'LICENSE.txt', 'NOTICE.txt', 'docs/THIRD_PARTY.md', 'docs/RELEASES.md',
+              'dependency-manifest.json', 'dotnet/LICENSE.txt', 'dotnet/ThirdPartyNotices.txt',
+              'runtime/vp9/LICENSE-libvpx.txt', 'runtime/vp9/PATENTS-libvpx.txt',
+              'sources/libvpx_1.14.0-1ubuntu2.3.dsc', 'sources/libvpx_1.14.0.orig.tar.xz',
+              'sources/libvpx_1.14.0-1ubuntu2.3.debian.tar.xz']
+    common += ['sources/' + module + '-everywhere-src-6.8.3.tar.xz' for module in ('qtbase', 'qtimageformats', 'qtsvg')]
+    if platform == 'windows':
+        return common + ['Switch2RECOMP-turbo.cmd', 'python/python.exe', 'python/LICENSE.txt',
+                         'gcc/Library/bin/x86_64-w64-mingw32-gcc.exe', 'dotnet/dotnet.exe',
+                         'tools/hactool/hactool.exe', 'tools/hactool/LICENSE', 'scripts/_python.bat',
+                         'runtime/vp9/win/libvpx.a', 'bin/runtime_win64_win32.exe',
+                         'bin/launcher/SwitchRecompLauncher.exe', 'bin/launcher/Qt6Core.dll',
+                         'bin/launcher/Qt6Gui.dll', 'bin/launcher/Qt6Widgets.dll',
+                         'bin/launcher/platforms/qwindows.dll', 'bin/launcher/platforms/qoffscreen.dll',
+                         'bin/launcher/imageformats/qwebp.dll', 'bin/launcher/msvcp140.dll',
+                         'bin/launcher/vcruntime140.dll', 'bin/launcher/vcruntime140_1.dll'] + [
+                         'shader-tools/Library/bin/' + tool + '.exe' for tool in ('spirv-as', 'spirv-val', 'spirv-opt')]
+    return common + ['Switch2RECOMP-turbo.sh', 'python/bin/python3', 'dotnet/dotnet', 'scripts/_env.sh',
+                     'gcc/bin/x86_64-conda-linux-gnu-gcc', 'runtime/vp9/lin/libvpx.a', 'bin/runtime_linux_x11',
+                     'bin/launcher/SwitchRecompLauncher', 'bin/launcher/plugins/platforms/libqxcb.so',
+                     'bin/launcher/plugins/platforms/libqoffscreen.so', 'bin/launcher/plugins/imageformats/libqwebp.so',
+                     'lib/libSDL2-2.0.so.0', 'lib/libQt6Core.so.6', 'linux-libraries.json',
+                     'licenses/python/PYTHON.json', 'licenses/python/licenses/LICENSE.cpython.txt'] + [
+                     'shader-tools/bin/' + tool for tool in ('spirv-as', 'spirv-val', 'spirv-opt')]
+
+
+def validate_contents(stage, platform):
+    for path in stage.rglob('*'):
+        relative = path.relative_to(stage)
+        if excluded(relative): raise RuntimeError('Personal/generated release input: ' + str(relative))
+        if path.is_symlink() and (os.path.isabs(os.readlink(path)) or not path.exists()
+                                  or not path.resolve().is_relative_to(stage.resolve())):
+            raise RuntimeError('Non-relocatable symlink: ' + str(relative))
+    for name in required_files(platform):
+        if not (stage / name).is_file() or not (stage / name).stat().st_size: raise FileNotFoundError(name)
+    for name in ('licenses/qt/qtbase', 'licenses/qt/qtimageformats', 'licenses/qt/qtsvg', 'gcc/licenses', 'shader-tools/licenses'):
+        if not any(p.is_file() for p in (stage / name).rglob('*')): raise FileNotFoundError(name)
+    manifest = json.loads((stage / 'dependency-manifest.json').read_text())
+    if manifest['platform'] != platform:
+        raise RuntimeError('Dependency manifest platform mismatch')
+    vpx = manifest['downloads']['libvpx']
+    lib = stage / 'runtime/vp9' / ('win' if platform == 'windows' else 'lin') / 'libvpx.a'
+    if digest(lib) != vpx['sha256']: raise RuntimeError('VP9 archive does not match dependency provenance')
+    for name, record in vpx['sources'].items():
+        if digest(stage / 'sources' / name) != record['sha256']: raise RuntimeError('VP9 source checksum: ' + name)
+    runtime = stage / ('bin/runtime_win64_win32.exe' if platform == 'windows' else 'bin/runtime_linux_x11')
+    data = runtime.read_bytes()
+    # these strings live in the linked decoder, telemetry and controller implementations, not build scripts
+    markers = [b'WebM Project VP9 Decoder', b'frame telemetry:']
+    if platform == 'windows': markers += [b'hid.dll', b'setupapi.dll']
+    for marker in markers:
+        if marker not in data: raise RuntimeError('Native runtime feature missing: ' + marker.decode())
 
 
 def copy(src, dst):
@@ -38,7 +112,7 @@ def source_files():
     for name in sorted(set(paths)):
         p = Path(name)
         if not name or not (p.parts[0] in SOURCE_DIRS or name in SOURCE_FILES): continue
-        if any(part in JUNK for part in p.parts) or p.suffix in {'.log', '.pyc', '.nup', '.nsp', '.xci', '.keys'}: continue
+        if excluded(p): continue
         if (ROOT / p).is_file(): yield p
 
 
@@ -48,7 +122,9 @@ def linux_libraries(stage, qt):
                  'imageformats/libqjpeg.so', 'imageformats/libqsvg.so', 'xcbglintegrations/libqxcb-glx-integration.so'):
         copy(qt / 'plugins' / name, plugins / name)
     env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(map(str, [qt / 'lib', stage / 'lib', stage / 'gcc/lib'])))
-    queue = [stage / 'bin/launcher/SwitchRecompLauncher', stage / 'bin/runtime_linux_x11', *plugins.rglob('*.so')]
+    queue = [stage / 'bin/launcher/SwitchRecompLauncher', stage / 'bin/runtime_linux_x11',
+             stage / 'python/bin/python3', stage / 'dotnet/dotnet', *plugins.rglob('*.so'),
+             *stage.glob('lib/*.so*'), *[stage / 'shader-tools/bin' / tool for tool in ('spirv-as', 'spirv-val', 'spirv-opt')]]
     # .NET loads ICU/OpenSSL dynamically; SDL loads audio/display backends from the host desktop
     for pattern in ('libicu*.so.*', 'libssl.so.*', 'libcrypto.so.*'):
         queue.extend(Path('/usr/lib/x86_64-linux-gnu').glob(pattern))
@@ -108,6 +184,9 @@ def main():
     tree(args.launcher, stage / 'bin/launcher')
     runtime = 'runtime_win64_win32.exe' if platform == 'windows' else 'runtime_linux_x11'
     copy(ROOT / 'bin' / runtime, stage / 'bin' / runtime)
+    # Linux VP9 is generated by release-deps and ignored by Git; never silently drop it.
+    vp9 = Path('runtime/vp9') / ('win' if platform == 'windows' else 'lin') / 'libvpx.a'
+    copy(ROOT / vp9, stage / vp9)
     tree(args.deps / 'licenses', stage / 'licenses')
     tree(args.deps / 'sources', stage / 'sources')
     if platform == 'windows':
@@ -119,13 +198,9 @@ def main():
         wrapper = stage / 'Switch2RECOMP-turbo.sh'
         wrapper.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$root/lib:$root/gcc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\nexec "$root/bin/launcher/SwitchRecompLauncher" --root "$root" "$@"\n')
         wrapper.chmod(0o755)
-    required = ['switchrecomp.py', 'nup.py', 'nsp.py', 'runtime/rt.h', 'runtime/nvn/gfx/dmsh_abi.h',
-                'tools/nxshader/xlate_bin/dmsh_xlate.dll', 'tools/nxshader/nxs_live.py', 'NOTICE.txt']
-    if platform == 'windows': required.append('tools/hactool/hactool.exe')
-    for name in required:
-        if not (stage / name).is_file(): raise FileNotFoundError(name)
+    validate_contents(stage, platform)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    dirty = bool(subprocess.check_output(['git', 'diff', '--numstat'], cwd=ROOT))
+    dirty = bool(subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=normal'], cwd=ROOT))
     (stage / 'build-info.json').write_text(json.dumps({'commit': commit, 'platform': platform, 'local_changes': dirty,
         'source': 'https://github.com/ChrisColeTech/Switch2RECOMP-turbo/tree/' + commit}, indent=2) + '\n')
     files = sorted(p for p in stage.rglob('*') if p.is_file())

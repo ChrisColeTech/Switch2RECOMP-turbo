@@ -4,6 +4,7 @@
 #include "vk_flight.h"
 #include "vk_submit.h"
 #include "vk_window.h"
+#include "vk_perf.h"
 #include "present_vert.h"
 #include "present_frag.h"
 #include <math.h>
@@ -27,6 +28,8 @@ static struct {
     _Atomic uint64_t count, dropped, stall_ns;
     struct { uint64_t n; double t; } tring[TRING];
     double st_iv[STAT_N]; int st_n; uint64_t st_t0, last_t, acq_ns, src_frames, pattern_frames;
+    vkperf_row perf;
+    char pacing[160];
     // capture
     _Atomic int cap_want; int cap_ok, cap_w, cap_h; VkBuffer cap_buf; vk_alloc cap_mem; HANDLE cap_ev; uint32_t *cap_px;
     int sharp; float sharpness;   // NXRT_VK_UPSCALE=sharp (the default) / standard, NXRT_VK_SHARPNESS 0..1: present.frag's sharp upscale when the window is larger
@@ -142,11 +145,17 @@ static void stats(uint64_t now) {
     g_p.last_t = now;
     if (g_p.st_n < STAT_N) return;
     double secs = (now - g_p.st_t0) / 1e9, *v = g_p.st_iv;
+    unsigned miss=0, s33=0, s50=0, s100=0;
+    for (int i=0; i<STAT_N; i++) { miss += v[i] > 1000.0/60; s33 += v[i] > 33; s50 += v[i] > 50; s100 += v[i] > 100; }
     qsort(v, STAT_N, sizeof *v, dcmp);
     VKLOG("present: %llu shown (%llu dropped), %.2f per s; interval p50 %.2f / p95 %.2f / p99 %.2f / max %.2f ms; acquire %.2f ms per frame; window %ux%u; "
           "%llu game frames, %llu test pattern", (unsigned long long)atomic_load(&g_p.count), (unsigned long long)atomic_load(&g_p.dropped), STAT_N / secs,
           v[STAT_N / 2], v[STAT_N * 95 / 100], v[STAT_N * 99 / 100], v[STAT_N - 1], g_p.acq_ns / 1e6 / STAT_N, g_p.ext.width, g_p.ext.height,
-          (unsigned long long)g_p.src_frames, (unsigned long long)g_p.pattern_frames);
+           (unsigned long long)g_p.src_frames, (unsigned long long)g_p.pattern_frames);
+    AcquireSRWLockExclusive(&g_p.lk);
+    snprintf(g_p.pacing, sizeof g_p.pacing, "%.2f FPS | p95 %.2f p99 %.2f max %.2f ms | >16.67 %u >33/50/100 %u/%u/%u", STAT_N/secs, v[STAT_N*95/100], v[STAT_N*99/100], v[STAT_N-1], miss,s33,s50,s100);
+    VKLOG("pacing: %s (last %d intervals)", g_p.pacing, STAT_N);
+    ReleaseSRWLockExclusive(&g_p.lk);
     g_p.st_n = 0; g_p.acq_ns = 0;
 }
 
@@ -178,10 +187,13 @@ static int present_one(const pq_item *it) {
     if (!g_p.sc) return 1;
     vkf_poll();
     frame_t *f = &g_p.fr[g_p.fi]; g_p.fi = (g_p.fi + 1) % NFR;
+    uint64_t ft = vkperf_enabled ? now_ns() : 0;
     if (f->used) { vkWaitForFences(g_vk.dev, 1, &f->fence, VK_TRUE, UINT64_MAX); vkResetFences(g_vk.dev, 1, &f->fence); }
+    if (ft) g_p.perf.fence += now_ns() - ft;
     uint64_t a0 = now_ns(); uint32_t idx = 0;
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_p.sc, 250000000ull, f->acq, VK_NULL_HANDLE, &idx);
-    g_p.acq_ns += now_ns() - a0;
+    uint64_t acq = now_ns() - a0; g_p.acq_ns += acq;
+    if (vkperf_enabled) g_p.perf.acquire += acq;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { g_p.stale = 1; f->used = 0; vkDestroySemaphore(g_vk.dev, f->acq, NULL); VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; vkCreateSemaphore(g_vk.dev, &sci, NULL, &f->acq); return 1; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { f->used = 0; return 1; }
     if (r == VK_SUBOPTIMAL_KHR) g_p.stale = 1;
@@ -241,10 +253,12 @@ static int present_one(const pq_item *it) {
     // On one queue a wait for work behind it never ends, so the frame's value must be on the queue first: the flush in present_main can come while the frame is still being recorded or
     // committed. (Not the long-race stall in CHANGES_SWITCH2RECOMP.md: that one outlived this)
     while (it->wait_value && atomic_load(&g_vk.tl_submitted) < it->wait_value && !atomic_load(&g_vk.lost)) { vks_flush(); if (atomic_load(&g_vk.tl_submitted) < it->wait_value) Sleep(1); }
+    uint64_t qt = vkperf_enabled ? now_ns() : 0;
     AcquireSRWLockExclusive(&g_vk.qlock);
     r = vkQueueSubmit2(g_vk.q, 1, &si, f->fence);
     VkResult pr = r == VK_SUCCESS ? vkQueuePresentKHR(g_vk.q, &pi) : r;
     ReleaseSRWLockExclusive(&g_vk.qlock);
+    if (qt) g_p.perf.queue += now_ns() - qt;
     f->used = r == VK_SUCCESS;
     if (r != VK_SUCCESS) { VKRED("present submit failed (%d)", r); vk_lost("a present", r); return -1; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) g_p.stale = 1;
@@ -274,7 +288,7 @@ static unsigned __stdcall present_main(void *arg) {
         static int dropping;
         int drop = !vkw_is_open() || vkw_minimized();
         if (drop != dropping) { dropping = drop; VKLOG("present: %s at present %llu", drop ? "window minimized, presents dropped from here" : "presenting again", (unsigned long long)n); }
-        if (drop) { atomic_fetch_add(&g_p.dropped, 1); finish_item(n, 1); continue; }
+        if (drop) { atomic_fetch_add(&g_p.dropped, 1); g_p.last_t = 0; g_p.st_n = 0; g_p.acq_ns = 0; last_present = 0; finish_item(n, 1); continue; }
         uint64_t st = atomic_load(&g_p.stall_ns); if (st) sleep_until(now_ns() + st);
         // The game's present period on a fixed cadence: a present is not handed over before its slot (k periods after the first), so a producer that runs
         // ahead is held to the period on any display rate (FIFO then shows it at the next vsync); late frames go at once and the cadence restarts from them
@@ -284,11 +298,18 @@ static unsigned __stdcall present_main(void *arg) {
             else { sleep_until(last_present - 500000); }
             last_present += per;
         }
+        uint64_t pt = vkperf_enabled ? now_ns() : 0;
+        if (pt) memset(&g_p.perf, 0, sizeof g_p.perf);
         int r = present_one(&it);
         if (r == 1) r = present_one(&it);   // the swapchain was out of date: once more at the new size
         if (r) { if (!atomic_fetch_add(&g_p.dropped, 1)) VKLOG("present %llu dropped (no usable swapchain: %d)", (unsigned long long)n, r); finish_item(n, 1); continue; }
         uint64_t now = now_ns();
         atomic_fetch_add(&g_p.count, 1); atomic_fetch_add(&g_vk.presents, 1);
+        if (pt) {
+            g_p.perf.time = now; g_p.perf.frame = it.frame; g_p.perf.interval = g_p.last_t ? now-g_p.last_t : 0;
+            g_p.perf.cpu = now-pt; g_p.perf.enqueue = now-it.t_enq; g_p.perf.dropped = atomic_load(&g_p.dropped);
+            vkperf_push(VKPERF_PRESENT, &g_p.perf);
+        }
         stats(now);
         finish_item(n, 0);
     }
@@ -407,8 +428,9 @@ void vkp_info(int *w, int *h, int *mode, VkFormat *fmt) {
     if (fmt) *fmt = g_p.fmt;
 }
 void vkp_stats_line(char *out, size_t n) {
-    snprintf(out, n, "%llu presents shown, %llu dropped, window %ux%u", (unsigned long long)atomic_load(&g_p.count), (unsigned long long)atomic_load(&g_p.dropped),
-             g_p.ext.width, g_p.ext.height);
+    AcquireSRWLockShared(&g_p.lk);
+    snprintf(out, n, "%s | %llu dropped, %ux%u", g_p.pacing, (unsigned long long)atomic_load(&g_p.dropped), g_p.ext.width, g_p.ext.height);
+    ReleaseSRWLockShared(&g_p.lk);
 }
 
 int vkp_capture_next(uint32_t **pixels, int *w, int *h, int *bgr, uint32_t timeout_ms) {

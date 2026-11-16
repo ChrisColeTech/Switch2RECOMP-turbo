@@ -582,16 +582,28 @@ static int SDLCALL job_reader(void *arg)
 static int find_python(char *out, size_t n)
 {
 #ifndef _WIN32
-    /* the package's own python first, then the system's */
     char p[MAX_PATH];
-    snprintf(p, sizeof p, "%spython/bin/python3", px(app.here));
-    if (!access(p, X_OK)) { px_quote(out, n, p); return 1; }
+    const char* override=getenv("SWR_PYTHON");
+    if(override && *override){ px_quote(out,n,override); return 1; }
+    const char* candidates[]={".venv/bin/python3","venv/bin/python3","python/bin/python3"};
+    for(int i=0;i<3;i++){
+        snprintf(p,sizeof p,"%s%s",px(app.here),candidates[i]);
+        if(!access(p,X_OK)){px_quote(out,n,p);return 1;}
+    }
     if (!system("command -v python3 >/dev/null 2>&1")) { snprintf(out, n, "python3"); return 1; }
     return 0;
 #else
     char p[MAX_PATH];
-    snprintf(p, sizeof p, "%spython\\python.exe", app.here);
-    if (file_exists(p)) { snprintf(out, n, "\"%s\"", p); return 1; }
+    const char* override=getenv("SWR_PYTHON");
+    if(override && *override){
+        if(!SearchPathA(NULL,override,".exe",MAX_PATH,p,NULL))return 0;
+        snprintf(out,n,"\"%s\"",p);return 1;
+    }
+    const char* candidates[]={".venv\\Scripts\\python.exe","venv\\Scripts\\python.exe","python\\python.exe"};
+    for(int i=0;i<3;i++){
+        snprintf(p,sizeof p,"%s%s",app.here,candidates[i]);
+        if(file_exists(p)){snprintf(out,n,"\"%s\"",p);return 1;}
+    }
     const char *c[] = { "py.exe", "python.exe", "python3.exe" };
     for (int i = 0; i < 3; i++)
         if (SearchPathA(NULL, c[i], NULL, MAX_PATH, p, NULL)) {

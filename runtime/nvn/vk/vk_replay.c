@@ -54,6 +54,8 @@ static subres g_sub;
 // GPU time: a timestamp before and after each submission's replay, read at its completion
 enum { NTQ = 256 };
 static VkQueryPool g_tqp; static uint32_t g_tq_next; static _Atomic uint64_t g_gpu_ns, g_gpu_subs;
+#include "vk_perf.h"
+static uint64_t g_perf_cpu;
 static rchunk *g_free_chunks; static rdpool *g_free_pools; static SRWLOCK g_free_lk = SRWLOCK_INIT;
 
 static void subres_done(void *arg) {
@@ -669,12 +671,13 @@ static VkImageView tex_view(int tid, const vks_bind *b, VkImageLayout *layout, v
     if (!v.set_format && im->d.format != r.t.d.format) { v.set_format = 1; v.format = (uint16_t)r.t.d.format; use = 1; }   // the texture is the image's twin in another format (vk_tex.c key_of)
     VkImageViewType have = v.set_target ? view_type_of_target(v.target, im->vtype) : im->vtype;
     if (have != b->vtype) { v.set_target = 1; v.target = (uint8_t)nvn_target_of(b->vtype, b->ms); use = 1; }
-    if ((have == VK_IMAGE_VIEW_TYPE_3D) != (b->vtype == VK_IMAGE_VIEW_TYPE_3D)) {
-        // a 3D image read as 2D/2D-array is legal: the image carries VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT and
-        // vkt_view maps that level's depth slices to layers (mkw reads volumetric data this way; the old code
-        // bound null here and the shader read 0)
-        if (have == VK_IMAGE_VIEW_TYPE_3D && b->vtype != VK_IMAGE_VIEW_TYPE_CUBE && b->vtype != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
-            if (b->vtype == VK_IMAGE_VIEW_TYPE_2D && !v.set_layers) { v.set_layers = 1; v.min_layer = 0; v.nlayers = 1; }
+    if ((im->vtype == VK_IMAGE_VIEW_TYPE_3D) != (b->vtype == VK_IMAGE_VIEW_TYPE_3D)) {
+        // 2D_ARRAY_COMPATIBLE alone only permits attachment views. sampled slices need the EXT feature and image flag;
+        // 2D-array descriptors of 3D images remain forbidden (VUID-VkDescriptorImageInfo-imageView-06712).
+        if (im->vtype == VK_IMAGE_VIEW_TYPE_3D && b->vtype == VK_IMAGE_VIEW_TYPE_2D && g_vk.has.sampler_2d_of_3d) {
+            if (!v.set_layers) { v.set_layers = 1; v.min_layer = 0; v.nlayers = 1; }
+            { static int n; if (n++ < 12) VKLOG("sampled 3D slice: ser%llu %ux%ux%u mip %u layer %u shader %s binding %u", (unsigned long long)im->serial,
+                im->w, im->h, im->depth, v.set_levels ? v.base_level : 0, v.min_layer, g_cur_sh ? g_cur_sh->key : "?", b->binding); }
         } else {
             RED_ONCE(31, "a 3D texture read as another type, or the reverse (texture ID %d, ser%llu %ux%ux%u view type %d; shader %s binding %u declares view type %d): it reads 0", tid,
                      (unsigned long long)im->serial, im->w, im->h, im->depth, (int)have, g_cur_sh ? g_cur_sh->key : "?", b->binding, (int)b->vtype);
@@ -1878,7 +1881,9 @@ void vkr_exec(const uint8_t *handle) {
     if (!handle) { op_hdr z = {0, 0}; bad_record(handle, z, "a null command handle"); return; }
     if (!S) S = rs_get(0);
     uint64_t budget = 1u << 24;
+    uint64_t tp = vkperf_enabled ? now_ns() : 0;
     PH0(); walk(handle, 0, &budget); PH1(PH_EXEC);
+    if (tp) g_perf_cpu += now_ns() - tp;
 }
 
 // ---------- Submissions, queues ----------
@@ -1976,6 +1981,13 @@ static void slow_frame(uint64_t frame) {
     static uint64_t t0, pb, pn, pw, pu, pp, pd; static int nlog; uint64_t now = now_ns(), b = atomic_load(&g_t_bind), n = atomic_load(&g_n_bind), w = atomic_load(&g_t_gpuwait), u = vkt_up_ns();
     vkp_stats_t ps; vkp_stats(&ps); struct { uint64_t up_ns; } ms = {vkm_up_ns()};   // not vkm_stats: it walks every pool under the lock, every frame
     static int slow_ms = -1; if (slow_ms < 0) slow_ms = vkc_int("slow_ms", 50);   // NXRT_VK_SLOW_MS: frames longer than this get a line (tools/stutter.py reads them)
+    if (vkperf_enabled) {
+        void vkm_perf(uint64_t *, uint64_t *); uint64_t vka_perf_ns(void), vkpc_perf_ns(void);
+        vkperf_row r = {.time=now, .frame=frame, .interval=t0 ? now-t0 : 0, .cpu=g_perf_cpu,
+            .sparse=b, .wait=w, .texture=u, .pipeline=ps.create_ns, .pool=ms.up_ns, .gpu=atomic_load(&g_gpu_ns),
+            .astc=vka_perf_ns(), .cache=vkpc_perf_ns()};
+        vkm_perf(&r.writeback, &r.wb_bytes); vkperf_push(VKPERF_REPLAY, &r);
+    }
     if (t0 && now - t0 > (uint64_t)slow_ms * 1000000 && nlog++ < 20000) VKLOG("slow frame %llu: %.0f ms: sparse binds %.0f ms (%llu), GPU waits %.0f ms, texture uploads %.0f ms, pipelines %.0f ms, pool copies %.0f ms", (unsigned long long)frame, (now - t0) / 1e6, (b - pb) / 1e6, (unsigned long long)(n - pn), (w - pw) / 1e6, (u - pu) / 1e6, (ps.create_ns - pp) / 1e6, (ms.up_ns - pd) / 1e6);
     t0 = now; pb = b; pn = n; pw = w; pu = u; pp = ps.create_ns; pd = ms.up_ns;
 }
@@ -2008,7 +2020,7 @@ void vkr_frame(uint64_t frame) {
     // number, so a pixel can be traced to its shader (tools/pass_pair.py). By time: a moment's frame number changes from run to run
     { static uint64_t t0, at[16]; static int nat = -1, cur;
       if (nat < 0) { nat = 0; t0 = now_ns(); for (const char *e = getenv("NXRT_VK_DUMP_AT_S"); e && *e && nat < 16; ) { char *q; at[nat++] = strtoull(e, &q, 10); e = *q ? q + 1 : q; } }
-      if (cur < nat && now_ns() - t0 >= at[cur] * 1000000000ull) { cur++; g_td_frame = frame; g_id_mode = !getenv("NXRT_VK_DUMP_RAW"); g_no_tex = g_id_mode; VKLOG("dump by time: frame %llu", (unsigned long long)frame); } }
+      if (cur < nat && now_ns() - t0 >= at[cur] * 1000000000ull) { cur++; g_td_frame = g_pd_frame = g_pd_last = frame; g_id_mode = !getenv("NXRT_VK_DUMP_RAW"); g_no_tex = g_id_mode; VKLOG("dump by time: frame %llu", (unsigned long long)frame); } }
     g_pd = g_pd_frame && frame >= g_pd_frame && frame <= g_pd_last;
     if (g_td_frame && frame == g_td_frame + 1 && g_ntd) {   // the dump frame's images, now that its work is done
         vks_finish();

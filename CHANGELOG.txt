@@ -1,5 +1,29 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Qt launcher and native Vulkan startup now show the original SwitchRECOMP logo and copyright artwork on black
+  for one second. Win32 startup painting stops before renderer handoff so later repaints cannot cover the scene.
+- Native Vulkan frame telemetry can write bounded, background-buffered CSV with present intervals and replay,
+  GPU, upload, pipeline, sparse-bind and writeback timings. Logs report FPS and stutter counts; MKW performance
+  probes keep screenshot readbacks outside the measured race interval.
+- Vulkan writeback shadow updates skip unchanged pages instead of scanning every word again. Changed-word and
+  CPU-write preservation semantics are retained; NXRT_VK_WB_SHADOW_SKIP=0 allows a measured old-path comparison.
+- MKW probes now close verified identity-mapping startup relaunches as well as their owned parent, and retain
+  screenshot requests when a control-file read fails instead of writing to an unexpected fallback filename.
+- Development launchers, build scripts and shader helpers prefer SWR_PYTHON and the project venv before bundled
+  Python. Portable releases still use their bundle; launcher builds no longer create a venv or install packages.
+- The Qt library can discover completed builds in a selected folder. Importing a build attaches it to an unbuilt
+  source entry without losing artwork or settings, and preserves separate completed builds of the same source.
+- Mario Kart World live compute shaders used 1x1x1 workgroups because the translator omitted the NVN2 launch
+  dimensions and shared-memory size. Reading them from the control header restores the missing 3D scene and lighting.
+- Shader-helper startup now rebuilds stale or incomplete published entries after a translator generation change.
+- MKW aborted after its course movie when the SDK closed the decoder session. IPC close requests now return
+  SessionClosed, as the SDK expects, allowing course selection and the race countdown to proceed.
+- Vulkan integer fragment outputs now preserve register bits and use valid scalar access-chain types. Reads through
+  those outputs retain their original type, and fragment variant keys no longer alias target 3's format bits.
+- Vulkan 2D slices of 3D images enable the required extension features and image flag, retain the requested slice,
+  and use one mip. Failed view creation no longer substitutes an incompatible original view.
+- WinMM shoulder buttons now map to Switch L/R, and stick clicks map to StickL/StickR. Added acknowledged scripted
+  input and bounded MKW probes with per-action screenshots, run-specific logs, shader hashes and raw pass analysis.
 - Standard application NSP files can be recompiled directly. The build materializes ExeFS while the runtime reads
   a plaintext IVFC RomFS range from the original NSP; BKTR update-only and encrypted-section packages are rejected.
 - The Qt launcher has a Keys menu that installs the user's prod.keys in its private application-data folder for NSP

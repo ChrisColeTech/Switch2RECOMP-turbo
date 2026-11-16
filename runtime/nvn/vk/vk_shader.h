@@ -66,7 +66,7 @@ const vks_shader *vksh_vin_variant(const vks_shader *vs, uint32_t mask, const ui
 // M6 phase B: a fragment shader for dual-source blending (VKSH_FS_DUAL: output 1 as target 0's second source), the alpha test (VKSH_FS_ALPHA: colour 0's alpha
 // compared with the reference by NVN's function, both in fragment push constants {uint function; float reference;}, before each return; the fragment discarded when it
 // fails) and / or float outputs retyped into integer ones (bits 2 + 2 i: target i's kind, 1 = unsigned, 2 = signed, the kind its format asks for; every float store
-// to the output goes through a truncating OpConvertFToU / OpConvertFToS, because Vulkan converts nothing and Maxwell's ROP truncated towards zero). The base shader
+// to the output is bitcast to preserve the untyped GPU register, and loads are bitcast back). The base shader
 // when no variant can be made (logged once)
 enum { VKSH_FS_DUAL = 1, VKSH_FS_ALPHA = 2 };
 const vks_shader *vksh_fs_variant(const vks_shader *fs, int flags);

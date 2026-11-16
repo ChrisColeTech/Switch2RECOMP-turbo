@@ -83,6 +83,18 @@ class DumpCorpus:
         return st + '_live.bin', bytes(0x38) + code + ctl
 
 
+def current_keys(cache, chain):
+    done = set()
+    for name in os.listdir(os.path.join(cache.root, 'vk')):
+        if not name.endswith('.json') or len(name) != 21: continue
+        key = name[:-5]
+        try:
+            hit = cache.lookup(key, chain)
+            if hit and len(hit[0]) >= 20 and len(hit[0]) % 4 == 0: done.add(key)
+        except (OSError, ValueError): pass   # interrupted publication is a miss, not a completed shader
+    return done
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dump', required=True); ap.add_argument('--cache', required=True)
@@ -101,7 +113,7 @@ def main():
     b = N.Builder(DumpCorpus(a.dump, a.facts), cache, xl, w, validate=False)
     cache.set_chain(b.chain)
     say('ready: translator %s, chain %s, dumps %s' % (xl.id, b.chain, a.dump))
-    done = set(k[:-5] for k in os.listdir(os.path.join(a.cache, 'vk')) if k.endswith('.json'))
+    done = current_keys(cache, b.chain)
     failed = set()
     parent = ParentProcess(a.parent)
     try:

@@ -206,7 +206,15 @@ void Window::createActions(){
 }
 
 void Window::createMenusAndToolbar(){
-    auto* file=menuBar()->addMenu("&File");file->addAction(addAction);file->addAction(addFolderAction);file->addAction(importAction);file->addSeparator();file->addAction("Exit",QKeySequence("Alt+F4"),this,&QWidget::close);
+    auto* file=menuBar()->addMenu("&File");file->addAction(addAction);file->addAction(addFolderAction);file->addAction(importAction);
+    file->addAction("Discover builds…",this,[this]{
+        if(builder.busy()||!running.isEmpty()){message("Game is busy","Wait for builds and games to finish before discovering builds.");return;}
+        const auto folder=QFileDialog::getExistingDirectory(this,"Discover native builds",library.outputRoot.isEmpty()?QDir(library.toolRoot).filePath("build"):library.outputRoot);
+        if(folder.isEmpty()||demo)return;
+        const int count=library.discoverBuilds(folder);if(count)save();refreshLibrary();
+        message("Build discovery",QString("Imported %1 build(s) from this folder and its immediate subfolders.").arg(count));
+    });
+    file->addSeparator();file->addAction("Exit",QKeySequence("Alt+F4"),this,&QWidget::close);
     auto* game=menuBar()->addMenu("&Game");game->addAction(playAction);game->addAction(stopAction);game->addSeparator();game->addAction(propertiesAction);game->addAction(folderAction);game->addAction(saveFolderAction);game->addAction(logAction);game->addSeparator();game->addAction(removeAction);
     auto* build=menuBar()->addMenu("&Build");build->addAction(buildAction);build->addAction(buildOptionsAction);build->addAction("Show build output",QKeySequence("Ctrl+L"),this,&Window::showBuildOutput);
     auto* keys=menuBar()->addMenu("&Keys");keys->addAction(installKeysAction);keys->addAction("Open keys folder",this,[this]{const auto path=QFileInfo(library.keysPath).absolutePath();if(QDir(path).exists())QDesktopServices::openUrl(QUrl::fromLocalFile(path));});
@@ -481,9 +489,8 @@ bool Window::importSource(const QString& source,bool interactive,const QString& 
 }
 bool Window::importBuild(const QString& executable){
     QString error;Game game;if(!gameFromExecutable(executable,&game,&error)){message("Cannot import build",error,true);return false;}
-    for(const auto& g:library.games)if(samePath(g.executable(),game.executable())){selectedId=g.id;refreshLibrary();return true;}
-    if(!library.add(game)){message("Already in library","This source package already has a library entry.");return false;}
-    selectedId=game.id;save();refreshLibrary();return true;
+    for(const auto& g:library.games)if(samePath(g.source,game.source)&&(running.contains(g.id)||(builder.busy()&&builder.gameId()==g.id))){message("Game is busy","Wait for this game's build or run to finish before importing it.");return false;}
+    selectedId=library.importBuild(game);save();refreshLibrary();return true;
 }
 void Window::startBuild(){
     auto* game=selected();if(!game||demo||running.contains(game->id))return;

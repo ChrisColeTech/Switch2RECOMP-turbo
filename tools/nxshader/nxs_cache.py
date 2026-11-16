@@ -74,12 +74,13 @@ class Cache:
         """the runtime's lookup: (spv, meta) when vk/<key> exists and was made by the current chain, else None"""
         base = os.path.join(self.root, 'vk', key)
         if not (os.path.exists(base + '.spv') and os.path.exists(base + '.json')): return None
-        meta = json.load(open(base + '.json', encoding='utf-8'))
+        with open(base + '.json', encoding='utf-8') as f: meta = json.load(f)
         if chain is None:
             cp = os.path.join(self.root, 'vk', 'CHAIN')
-            chain = open(cp).read().strip() if os.path.exists(cp) else None
+            if os.path.exists(cp):
+                with open(cp) as f: chain = f.read().strip()
         if meta.get('cache', {}).get('chain') != chain: return None
-        return open(base + '.spv', 'rb').read(), meta
+        with open(base + '.spv', 'rb') as f: return f.read(), meta
 
     def gc(self):
         """drop the inner entries that no published shader refers to: → (files removed, bytes freed)"""

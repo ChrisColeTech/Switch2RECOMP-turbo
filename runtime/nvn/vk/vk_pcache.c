@@ -13,7 +13,7 @@ int vkpc_save_now(void);
 
 static struct {
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
-    _Atomic uint64_t created, saved_at_count, last_created_ns, saves, bytes;
+    _Atomic uint64_t created, saved_at_count, last_created_ns, saves, bytes, save_ns;
     uint64_t loaded;
     HANDLE thread, wake; _Atomic int stop;
     SRWLOCK lk;
@@ -85,6 +85,7 @@ void vkpc_note_created(int n) { atomic_fetch_add(&g_pc.created, (uint64_t)n); at
 // Writes the cache now (temporary file, flush, atomic replace); 0 on success
 int vkpc_save_now(void) {
     if (!g_vk.pcache || !g_pc.path[0]) return -1;
+    uint64_t t0 = now_ns();
     AcquireSRWLockExclusive(&g_pc.lk);
     uint64_t c = atomic_load(&g_pc.created);
     size_t n = 0; void *d = NULL; int ok = 0;
@@ -99,8 +100,10 @@ int vkpc_save_now(void) {
     free(d);
     if (ok) { atomic_store(&g_pc.saved_at_count, c); atomic_fetch_add(&g_pc.saves, 1); atomic_store(&g_pc.bytes, n); }
     ReleaseSRWLockExclusive(&g_pc.lk);
+    atomic_fetch_add(&g_pc.save_ns, now_ns() - t0);
     return ok ? 0 : -1;
 }
+uint64_t vkpc_perf_ns(void) { return atomic_load(&g_pc.save_ns); }
 
 void vkpc_shutdown(void) {
     if (g_pc.thread) { atomic_store(&g_pc.stop, 1); SetEvent(g_pc.wake); WaitForSingleObject(g_pc.thread, 5000); CloseHandle(g_pc.thread); g_pc.thread = NULL; CloseHandle(g_pc.wake); }

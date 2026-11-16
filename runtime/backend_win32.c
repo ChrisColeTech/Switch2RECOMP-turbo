@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <math.h>
 #include <mmsystem.h>  /* timeBeginPeriod (windows.h leaves it out with WIN32_LEAN_AND_MEAN) */
+#include "controller_sony_win32.h"
+#include "splash_img.h"
 
 static HWND g_hwnd; static HDC g_hdc; static HGLRC g_ctx, g_wctx[3]; static volatile int g_wnext;
 static volatile int g_ww=1280, g_wh=720; static u64 keys_held; static int g_fullscreen=0, g_want_fs=1;
@@ -84,41 +86,59 @@ typedef DWORD (WINAPI *XSetState)(DWORD, XVIB*);
 static XSetState xset;
 static DWORD g_xuser=(DWORD)~0;                    /* the XInput user index that owns input */
 static volatile LONG g_vib_dirty; static WORD g_vib_left,g_vib_right; static u64 g_vib_last;
-static CRITICAL_SECTION g_vib_lock; static int g_vib_inited;
+static CRITICAL_SECTION g_vib_lock; static INIT_ONCE g_vib_once=INIT_ONCE_STATIC_INIT;
+static int g_vib_accept,g_controller_shutdown;
+static BOOL CALLBACK vibration_init(PINIT_ONCE once,PVOID arg,PVOID* ctx){
+  (void)once; (void)arg; (void)ctx; InitializeCriticalSection(&g_vib_lock); return TRUE;
+}
+static void vibration_lock(void){ InitOnceExecuteOnce(&g_vib_once,vibration_init,NULL,NULL); EnterCriticalSection(&g_vib_lock); }
+static void controllers_shutdown(void){
+  vibration_lock(); g_controller_shutdown=1; g_vib_accept=0;
+  sony_close(&g_sony);
+  if(xset && g_xuser!=(DWORD)~0){ XVIB v={0}; xset(g_xuser,&v); }
+  g_xuser=(DWORD)~0; g_vib_left=g_vib_right=0; LeaveCriticalSection(&g_vib_lock);
+}
+/* renderer-owned immediate exits can call this before ExitProcess/TerminateProcess. */
+void backend_controller_shutdown(void){ controllers_shutdown(); }
 
 static void xinput_load(void){
-  if(!g_vib_inited){ InitializeCriticalSection(&g_vib_lock); g_vib_inited=1; }
+  vibration_lock(); LeaveCriticalSection(&g_vib_lock); atexit(controllers_shutdown);
   const char* dl[]={"xinput1_4.dll","xinput1_3.dll","xinput9_1_0.dll"};
   for(int i=0;i<3 && !xget;i++){ HMODULE h=LoadLibraryA(dl[i]); if(h){ xget=(XGetState)GetProcAddress(h,"XInputGetState");
     if(!xset) xset=(XSetState)GetProcAddress(h,"XInputSetState"); if(xget) break; } }
 }
 
 void backend_vibration_set(float low,float high){
-  if(!xset) return;
+  if(!isfinite(low) || low<0) low=0; if(low>1) low=1;
+  if(!isfinite(high) || high<0) high=0; if(high>1) high=1;
   WORD l=(WORD)(low*65535.0f+0.5f),r=(WORD)(high*65535.0f+0.5f);
-  if(l>65535) l=65535; if(r>65535) r=65535;
-  EnterCriticalSection(&g_vib_lock);
+  vibration_lock();
+  if(!g_vib_accept || g_controller_shutdown) l=r=0;
   if(l!=g_vib_left || r!=g_vib_right){ g_vib_left=l; g_vib_right=r; InterlockedExchange(&g_vib_dirty,1); }
   LeaveCriticalSection(&g_vib_lock);
 }
 
 void backend_vibration_stop(void){
-  if(!xset) return;
-  EnterCriticalSection(&g_vib_lock);
+  vibration_lock();
   if(g_vib_left || g_vib_right){ g_vib_left=0; g_vib_right=0; InterlockedExchange(&g_vib_dirty,1); }
   LeaveCriticalSection(&g_vib_lock);
 }
 
 /* called from the frontend poll: flushes at most one physical write per frame, stop always goes out immediately */
 void hid_vibration_flush(void){
-  if(!xset || g_xuser==(DWORD)~0) return;
+  vibration_lock();
   int dirty=InterlockedExchange(&g_vib_dirty,0);
-  if(!dirty) return;
-  EnterCriticalSection(&g_vib_lock); XVIB v; v.wLeftMotorSpeed=g_vib_left; v.wRightMotorSpeed=g_vib_right; LeaveCriticalSection(&g_vib_lock);
+  if(!dirty){ LeaveCriticalSection(&g_vib_lock); return; }
+  XVIB v; v.wLeftMotorSpeed=g_vib_left; v.wRightMotorSpeed=g_vib_right;
   u64 now=plat_ns();
-  if((v.wLeftMotorSpeed || v.wRightMotorSpeed) && now-g_vib_last<15000000ull) { InterlockedExchange(&g_vib_dirty,1); return; }   /* ~60 Hz for nonzero, stop is immediate */
-  DWORD r=xset(g_xuser,&v); g_vib_last=now;
-  if(r==ERROR_DEVICE_NOT_CONNECTED){ g_xuser=(DWORD)~0; LOG("controllers: vibration device disconnected\n"); }
+  if((v.wLeftMotorSpeed || v.wRightMotorSpeed) && now-g_vib_last<15000000ull) { InterlockedExchange(&g_vib_dirty,1); LeaveCriticalSection(&g_vib_lock); return; }
+  if(g_sony.h && !g_sony.output_failed) sony_write(&g_sony,v.wLeftMotorSpeed>>8,v.wRightMotorSpeed>>8,1,0);
+  else if(xset && g_xuser!=(DWORD)~0){
+    DWORD r=xset(g_xuser,&v); static int errors;
+    if(r && errors++<8) LOG("controllers: XInput output failed user=%lu error=%lu\n",(unsigned long)g_xuser,(unsigned long)r);
+    else if(getenv("SWR_CONTROLLER_TRACE")) LOG("controllers: XInput output user=%lu low=%u high=%u status=%lu\n",(unsigned long)g_xuser,v.wLeftMotorSpeed,v.wRightMotorSpeed,(unsigned long)r);
+  }
+  g_vib_last=now; LeaveCriticalSection(&g_vib_lock);
 }
 
 static i32 joy_axis(DWORD value,DWORD min,DWORD max,int invert){
@@ -135,6 +155,17 @@ static int joy_open(void){
   return 0;
 }
 
+static u64 joy_buttons(DWORD x,int sony){
+  u64 b=0;
+  if(x&(1u<<(sony?1:2))) b|=1ull<<0; if(x&(1u<<(sony?2:1))) b|=1ull<<1;
+  if(x&(1u<<3)) b|=1ull<<2; if(x&(1u<<0)) b|=1ull<<3;
+  if(x&(1u<<10)) b|=1ull<<4; if(x&(1u<<11)) b|=1ull<<5;
+  if(x&(1u<<4)) b|=1ull<<6; if(x&(1u<<5)) b|=1ull<<7;
+  if(x&(1u<<6)) b|=1ull<<8; if(x&(1u<<7)) b|=1ull<<9;
+  if(x&(1u<<(sony?9:8))) b|=1ull<<10; if(x&(1u<<(sony?8:9))) b|=1ull<<11;
+  return b;
+}
+
 static int joy_poll(u64* buttons,i32* lx,i32* ly,i32* rx,i32* ry){
   JOYINFOEX state; memset(&state,0,sizeof state); state.dwSize=sizeof state; state.dwFlags=JOY_RETURNALL;
   if(g_joy_id==UINT_MAX){ u64 now=plat_ns(); if(now<g_joy_next_scan) return 0; g_joy_next_scan=now+1000000000ull; if(!joy_open()) return 0; }
@@ -142,13 +173,7 @@ static int joy_poll(u64* buttons,i32* lx,i32* ly,i32* rx,i32* ry){
   DWORD x=state.dwButtons;
   /* WinMM numbers PlayStation face buttons square, cross, circle, triangle. PC players expect Cross to confirm;
      other DirectInput pads retain Switch's physical A/B positions. */
-  int sony=g_joy_caps.wMid==0x054c;
-  if(x&(1u<<(sony?1:2))) *buttons|=1ull<<0; if(x&(1u<<(sony?2:1))) *buttons|=1ull<<1;
-  if(x&(1u<<3)) *buttons|=1ull<<2; if(x&(1u<<0)) *buttons|=1ull<<3;
-  if(x&(1u<<4)) *buttons|=1ull<<4; if(x&(1u<<5)) *buttons|=1ull<<5;
-  if(x&(1u<<10)) *buttons|=1ull<<6; if(x&(1u<<11)) *buttons|=1ull<<7;
-  if(x&(1u<<6)) *buttons|=1ull<<8; if(x&(1u<<7)) *buttons|=1ull<<9;
-  if(x&(1u<<(sony?9:8))) *buttons|=1ull<<10; if(x&(1u<<(sony?8:9))) *buttons|=1ull<<11;
+  *buttons|=joy_buttons(x,g_joy_caps.wMid==0x054c);
   if(state.dwPOV!=JOY_POVCENTERED){ DWORD pov=state.dwPOV;
     if(pov>=31500 || pov<=4500) *buttons|=1ull<<13;
     if(pov>=4500 && pov<=13500) *buttons|=1ull<<14;
@@ -169,6 +194,7 @@ static void pad_source(int source){
   if(source==1) LOG("controllers: XInput controller connected\n");
   else if(source==2) LOG("controllers: native Windows controller connected (vendor %04x product %04x, %u axes, %u buttons)\n",
     g_joy_caps.wMid,g_joy_caps.wPid,g_joy_caps.wNumAxes,g_joy_caps.wNumButtons);
+  else if(source==3) LOG("controllers: player 1 using Sony native-HID (Cross=A, Circle=B, L1/R1=L/R, L3/R3=stick clicks)\n");
   else if(g_pad_source) LOG("controllers: disconnected\n");
   g_pad_source=source;
 }
@@ -238,7 +264,7 @@ void backend_rec_state(int on){ if(g_hwnd) PostMessageA(g_hwnd,WM_APP+8,(WPARAM)
 static const char* inversion_names[]={"Normal", "Left / right inverted", "Up / down inverted", "Both inverted"};
 static const char* const cw_keys[][2]={
   {"D-Pad","Arrows"}, {"Left stick","W A S D"}, {"Right stick","I J K L (or the mouse)"}, {"A  B  X  Y","X/Space  Z  C  V"},
-  {"L  R  ZL  ZR","Q  E  1  3"}, {"+  -","Enter  Backspace"}, {"Controller","Xbox (XInput) pad"}};
+  {"L  R  ZL  ZR","Q  E  1  3"}, {"+  -","Enter  Backspace"}, {"Controller","Xbox / Sony / WinMM"}};
 static const char* const cw_fkeys[][2]={
   {"F1","This page"}, {"F3","Screenshot"}, {"F4","FPS limit on/off"}, {"F5","Diagnostic trace"},
   {"F7","Record video"}, {"F8","Full resolution capture"}, {"F11","Fullscreen"}, {"Esc","Quit the game"}};
@@ -341,21 +367,30 @@ static u64 keymap(WPARAM k){
     case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47; }
   return 0; }
 
+static u8* g_startup_px;
+static void startup_end(void){ free(g_startup_px); g_startup_px=NULL; }
 static void startup_paint(HWND h){
-  PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps); RECT r; GetClientRect(h,&r);
-  HBRUSH bg=CreateSolidBrush(RGB(18,22,29)); FillRect(dc,&r,bg); DeleteObject(bg);
-  SetBkMode(dc,TRANSPARENT); SetTextColor(dc,RGB(245,245,245));
-  HFONT title=CreateFontA(52,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,"Segoe UI");
-  HFONT body=CreateFontA(24,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,"Segoe UI");
-  HGDIOBJ old=SelectObject(dc,title); RECT t=r; t.bottom=r.bottom/2+20; DrawTextA(dc,"SwitchRecomp",-1,&t,DT_CENTER|DT_BOTTOM|DT_SINGLELINE);
-  SelectObject(dc,body); t.top=r.bottom/2+34; t.bottom=t.top+42; SetTextColor(dc,RGB(72,205,224)); DrawTextA(dc,"Starting the game...",-1,&t,DT_CENTER|DT_TOP|DT_SINGLELINE);
-  t.top=r.bottom-52; t.bottom=r.bottom-18; SetTextColor(dc,RGB(145,151,161)); DrawTextA(dc,"SwitchRecomp by MZ Labs",-1,&t,DT_CENTER|DT_BOTTOM|DT_SINGLELINE);
-  SelectObject(dc,old); DeleteObject(title); DeleteObject(body); EndPaint(h,&ps); }
+  PAINTSTRUCT ps; HDC dc=BeginPaint(h,&ps);
+  if(g_startup_px){
+    RECT r; GetClientRect(h,&r); FillRect(dc,&r,(HBRUSH)GetStockObject(BLACK_BRUSH));
+    struct { BITMAPINFOHEADER hdr; RGBQUAD colors[256]; } bi={0};
+    bi.hdr.biSize=sizeof bi.hdr; bi.hdr.biWidth=SPLASH_W; bi.hdr.biHeight=-SPLASH_H;
+    bi.hdr.biPlanes=1; bi.hdr.biBitCount=8; bi.hdr.biCompression=BI_RGB; bi.hdr.biClrUsed=256;
+    for(int i=0;i<256;i++) bi.colors[i].rgbRed=bi.colors[i].rgbGreen=bi.colors[i].rgbBlue=(BYTE)i;
+    int ww=r.right, wh=r.bottom, dw=ww, dh=ww*SPLASH_H/SPLASH_W;
+    if(dh>wh){ dh=wh; dw=wh*SPLASH_W/SPLASH_H; }
+    SetStretchBltMode(dc,HALFTONE); SetBrushOrgEx(dc,0,0,NULL);
+    StretchDIBits(dc,(ww-dw)/2,(wh-dh)/2,dw,dh,0,0,SPLASH_W,SPLASH_H,g_startup_px,(BITMAPINFO*)&bi,DIB_RGB_COLORS,SRCCOPY);
+  }
+  EndPaint(h,&ps); }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
   switch(m){
   case WM_PAINT: startup_paint(h); return 0;
-  case WM_CLOSE: LOG("window: closed by the user or the system\n"); g_quit=1; return 0;
+  case WM_ERASEBKGND: return 1; /* the startup painter or renderer owns the whole client area */
+  case WM_APP+9: startup_end(); return 0; /* retire GDI before renderer handoff */
+  case WM_CLOSE: LOG("window: closed by the user or the system\n"); controllers_shutdown(); g_quit=1; return 0;
+  case WM_ENDSESSION: if(w) controllers_shutdown(); break;
   case WM_QUERYENDSESSION: LOG("window: Windows is logging off / shutting down\n"); break;
   case WM_POWERBROADCAST: if(w==PBT_APMSUSPEND) LOG("window: the PC is going to sleep\n"); else if(w==PBT_APMRESUMEAUTOMATIC) LOG("window: the PC resumed from sleep\n"); break;
   case WM_MOVE: mouse_capture(); break;
@@ -367,7 +402,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
     /* a held key auto repeats (bit 30), the one shot actions below only fire on the first press or holding F7
        would start and stop the recording every frame */
     if((l&(1<<30)) && (w==VK_ESCAPE||w==VK_F1||w==VK_F3||w==VK_F4||w==VK_F5||w==VK_F7||w==VK_F8||w==VK_F11)) return 0;
-    if(w==VK_ESCAPE){ g_quit=1; return 0; }
+    if(w==VK_ESCAPE){ controllers_shutdown(); g_quit=1; return 0; }
     if(w==VK_F11){ set_fullscreen(!g_fullscreen); return 0; }
     if(w==VK_F1){ show_controls(); return 0; }
     if(w==VK_F3){ g_shot_req=1; return 0; }
@@ -404,6 +439,8 @@ static void win_thread(void* arg){ (void)arg;
   wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName="SwitchRecompWnd";
   RegisterClassA(&wc);
   RECT r={0,0,1280,720}; AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
+  g_startup_px=malloc(SPLASH_W*SPLASH_H); if(!g_startup_px) fatal("Could not allocate the startup screen.");
+  splash_unpack(g_startup_px);
   g_hwnd=CreateWindowA("SwitchRecompWnd",g_title,WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,NULL,NULL,hi,NULL);
   UpdateWindow(g_hwnd);
   RAWINPUTDEVICE rid={1,2,0,g_hwnd}; RegisterRawInputDevices(&rid,1,sizeof rid);
@@ -412,10 +449,11 @@ static void win_thread(void* arg){ (void)arg;
   pfd.cDepthBits=24; pfd.cStencilBits=8; pfd.iLayerType=PFD_MAIN_PLANE;
   SetPixelFormat(g_hdc,ChoosePixelFormat(g_hdc,&pfd),&pfd);
   if(g_want_fs) set_fullscreen(1);
+  RedrawWindow(g_hwnd,NULL,NULL,RDW_INVALIDATE|RDW_UPDATENOW);
   ls_launch(); mouse_capture();
   SetEvent(g_ready);
   MSG msg; while(GetMessageA(&msg,NULL,0,0)>0){ TranslateMessage(&msg); DispatchMessageA(&msg); }
-  g_quit=1;
+  controllers_shutdown(); g_quit=1;
 }
 
 void video_init(const char* title){
@@ -428,7 +466,11 @@ void video_init(const char* title){
   { /* under proton the driver is mesa, glthread has to be turned on from the steam launch options */
     HMODULE nt=GetModuleHandleA("ntdll.dll"); if(nt && GetProcAddress(nt,"wine_get_version"))
       LOG("Proton/Wine detected: for more FPS put   mesa_glthread=true %%command%%   in the game's Steam launch options (moves the OpenGL driver work to another core)\n"); }
-  { extern int g_gpu_nvn; extern void nvn_window_set(void*); if(g_gpu_nvn){ nvn_window_set(g_hwnd); return; } }   /* renderer=vulkan: the NVN layer draws on this window, no OpenGL */
+  { extern int g_gpu_nvn; extern void nvn_window_set(void*);
+    /* the window thread keeps pumping while native Vulkan's notice is visible. OpenGL has splash_play(1.0). */
+    if(g_gpu_nvn) Sleep(1000);
+    SendMessageA(g_hwnd,WM_APP+9,0,0);
+    if(g_gpu_nvn){ nvn_window_set(g_hwnd); return; } }
   extern void gpu_gl_start(void); gpu_gl_start();
 }
 
@@ -467,8 +509,34 @@ static i32 axis(u64 b, int neg, int pos){ return ((b>>pos)&1? 32767:0) - ((b>>ne
 
 static i32 dz(i32 v){ return (v>-7000 && v<7000)? 0 : v; }
 
+/* opt-in test input, independent of window focus like --script. the caller waits for the id acknowledgement
+   and the hold to finish before sending another request. no key messages or foreground-window changes. */
+static u64 probe_buttons(void){
+  static int init; static const char* path; static u64 next,until,held;
+  if(!init){ path=getenv("SWR_INPUT_FILE"); init=1; }
+  if(!path || !*path) return 0;
+  u64 now=plat_ns();
+  if(now>=next && now>=until){ next=now+10000000ull;
+    FILE* f=fopen(path,"rb");
+    if(f){ char id[64]={0}; unsigned long long mask=0; unsigned ms=0;
+      int n=fscanf(f,"%63s %llx %u",id,&mask,&ms); fclose(f);
+      if(n==3 && ms>0 && ms<=10000 && !(mask&~0xffffull)){
+        held=mask; until=now+(u64)ms*1000000ull;
+        LOG("input probe: id=%s buttons=%llx hold=%u ms\n",id,mask,ms);
+        char ack[1100]; snprintf(ack,sizeof ack,"%s.ack",path);
+        remove(path); f=fopen(ack,"wb"); if(f){ fprintf(f,"%s\n",id); fclose(f); }
+      } else { LOG("input probe: invalid request\n"); remove(path); }
+    }
+  }
+  return now<until?held:0;
+}
+
 void video_poll(void){
-  int focused=GetForegroundWindow()==g_hwnd && !g_controls_open;
+  static int probe_only=-1; if(probe_only<0) probe_only=getenv("SWR_INPUT_FILE") && getenv("SWR_INPUT_EXCLUSIVE") && atoi(getenv("SWR_INPUT_EXCLUSIVE"));
+  int focused=!probe_only && GetForegroundWindow()==g_hwnd && !g_controls_open;
+  static int background=-1,native=-1,trace=-1;
+  if(background<0){ background=getenv("SWR_CONTROLLER_BACKGROUND") && atoi(getenv("SWR_CONTROLLER_BACKGROUND")); native=!(getenv("SWR_NO_SONY_HID") && atoi(getenv("SWR_NO_SONY_HID"))); trace=getenv("SWR_CONTROLLER_TRACE") && atoi(getenv("SWR_CONTROLLER_TRACE")); }
+  int pad_active=!probe_only && !g_controls_open && (focused || background);
   u64 k=focused?keys_held:0, b=k&0xFFFFull;
   i32 lx=axis(k,40,42), ly=axis(k,43,41), rx=axis(k,44,46), ry=axis(k,47,45);
   if(g_mouse_mode){
@@ -484,10 +552,13 @@ void video_poll(void){
     }
     rx=(g_mouse_invert&1)?-g_mouse_rx:g_mouse_rx; ry=(g_mouse_invert&2)?-g_mouse_ry:g_mouse_ry;
   }
-  int source=0;
-  if(xget && focused){
+  int source=0; DWORD user=(DWORD)~0;
+  vibration_lock(); pad_active=pad_active && !g_controller_shutdown; g_vib_accept=pad_active;
+  { static int active=-1; if(active!=pad_active){ active=pad_active;
+      LOG("controllers: input %s (focus=%d background=%d exclusive-probe=%d controls=%d)\n",active?"enabled":"suppressed",focused,background,probe_only,g_controls_open); } }
+  if(xget && pad_active){
     for(DWORD i=0;i<4;i++){ XST s; if(xget(i,&s)) continue; XGP* g=&s.Gamepad; WORD x=g->wButtons;
-      g_xuser=i;   /* remember which pad owns input so vibration reaches the right device */
+      user=i;
       /* map by position like a Switch pad: A right (xbox B), B bottom (xbox A), X top, Y left */
       if(x&0x2000) b|=1<<0; if(x&0x1000) b|=1<<1; if(x&0x8000) b|=1<<2; if(x&0x4000) b|=1<<3;
       if(x&0x0040) b|=1<<4; if(x&0x0080) b|=1<<5; if(x&0x0100) b|=1<<6; if(x&0x0200) b|=1<<7;
@@ -497,26 +568,48 @@ void video_poll(void){
       if(!lx&&!ly){ lx=dz(g->sThumbLX); ly=dz(g->sThumbLY); } if(!rx&&!ry){ rx=dz(g->sThumbRX); ry=dz(g->sThumbRY); }
       source=1; break; }
   }
-  if(focused && !source && joy_poll(&b,&lx,&ly,&rx,&ry)) source=2;
-  if(focused) pad_source(source);
-  if(!focused || (source && source!=1)){ if(!focused) backend_vibration_stop(); if(source!=1) g_xuser=(DWORD)~0; }
+  if(!pad_active || source==1) sony_close(&g_sony);
+  if(pad_active && !source && native){
+    static u64 next; static unsigned scans;
+    if(!g_sony.h && plat_ns()>=next){ next=plat_ns()+1000000000ull;
+      if(sony_open(&g_sony,1,scans++<4)){
+        g_vib_left=g_vib_right=0; InterlockedExchange(&g_vib_dirty,1);
+        if(g_sony.writable && g_sony.model==SONY_DS5) sony_write(&g_sony,0,0,0,1);
+      } }
+    if(sony_poll(&g_sony)){
+      b|=g_sony.state.buttons;
+      if(!lx&&!ly){ lx=g_sony.state.lx; ly=g_sony.state.ly; }
+      if(!rx&&!ry){ rx=g_sony.state.rx; ry=g_sony.state.ry; }
+    }
+    if(g_sony.h) source=3;
+  }
+  if(pad_active && !source && joy_poll(&b,&lx,&ly,&rx,&ry)) source=2;
+  if(user!=g_xuser){
+    if(xset && g_xuser!=(DWORD)~0){ XVIB zero={0}; xset(g_xuser,&zero); }
+    g_xuser=user; g_vib_left=g_vib_right=0; InterlockedExchange(&g_vib_dirty,1);
+  }
+  if(!pad_active) backend_vibration_stop();
+  if(pad_active) pad_source(source);
   hid_vibration_flush();
+  LeaveCriticalSection(&g_vib_lock);
   /* stick-as-button bits 16..23 */
   if(lx<-16000) b|=1ull<<16; if(ly>16000) b|=1ull<<17; if(lx>16000) b|=1ull<<18; if(ly<-16000) b|=1ull<<19;
   if(rx<-16000) b|=1ull<<20; if(ry>16000) b|=1ull<<21; if(rx>16000) b|=1ull<<22; if(ry<-16000) b|=1ull<<23;
   if(g_script[0]){ /* test input like the X11 backend: "ms:hex,ms:hex,..." holds those buttons for 300 ms */
     u64 el=(plat_ns()-g_start)/1000000ull; const char* p=g_script;
     while(*p){ u64 t=strtoull(p,(char**)&p,10); if(*p!=':') break; p++; u64 m=strtoull(p,(char**)&p,16); if(el>=t && el<t+300) b|=m; if(*p==',') p++; } }
-  g_pad.buttons=b; g_pad.lx=lx; g_pad.ly=ly; g_pad.rx=rx; g_pad.ry=ry;
+  g_pad.buttons=b|probe_buttons(); g_pad.lx=lx; g_pad.ly=ly; g_pad.rx=rx; g_pad.ry=ry;
+  if(trace){ static u64 last; if(last!=g_pad.buttons){ last=g_pad.buttons; LOG("controllers: g_pad buttons=%016llx source=%d focus=%d sticks=%d,%d,%d,%d\n",(unsigned long long)last,source,focused,lx,ly,rx,ry); } }
 }
 
 void frontend_frame(void){
+  if(g_quit) controllers_shutdown();
   extern u64 gpu_gl_screenshot(const char* path);
   if(g_shot_req){ g_shot_req=0; char p[MAX_PATH]; SYSTEMTIME t; GetLocalTime(&t); CreateDirectoryA("captures",NULL);
     snprintf(p,sizeof p,"captures/screenshot_%04d%02d%02d_%02d%02d%02d",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond); gpu_gl_screenshot(p); }
   if(g_seconds && plat_ns()-g_start>=(u64)g_seconds*1000000000ull){
     u64 h=gpu_gl_screenshot(g_shot[0]? g_shot : NULL); fprintf(stderr,"\nframes=%d hash=%016llx\n",g_frames,(unsigned long long)h);
-    extern void save_hints(void); save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } fflush(NULL); ExitProcess(0); }
+    extern void save_hints(void); save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } controllers_shutdown(); fflush(NULL); ExitProcess(0); }
 }
 
 int backend_glq_ok(void){ return 1; }   /* GL calls go through glq */

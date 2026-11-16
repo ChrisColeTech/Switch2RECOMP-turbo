@@ -15,6 +15,7 @@
 #include "vk_replay.h"
 #include "vk_shot.h"
 #include "vk_flight.h"
+#include "vk_perf.h"
 #include "ctl_gfx.h"
 #include <process.h>
 #include <stdio.h>
@@ -59,7 +60,7 @@ static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *c) {
     vk_dev_opts dopt = {validation, headless, getenv("NXRT_VK_DEVICE")};
     VKLOG("Vulkan validation: %s%s",validation?"on":"off",validation?"":" (set NXRT_VK_VALIDATION=1 for diagnostics)");
     if (vk_dev_open(&dopt, ex, nx)) nxrt_die("--gfx vulkan: no usable Vulkan 1.3 device (see the log)");
-    vkf_init(); vkf_log_table();
+    vkperf_init(); vkf_init(); vkf_log_table();
     if (vks_init() || vkpc_init() || vkm_init() || vkt_init() || vka_init(NULL) || vkr_init()) nxrt_die("--gfx vulkan: the backend could not start (see the log)");
     if (g_window && vkp_init(mode)) nxrt_die("--gfx vulkan: no swapchain on the window (see the log)");
     vks_shot_init();

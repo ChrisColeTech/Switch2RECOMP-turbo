@@ -121,7 +121,12 @@ def job_for(key, name, rec, w, facts, debug=True, reduced=True):
         c1 = dmsh_ampere.c1_segment(ctl, code)
         code = code[:dmsh_ampere.inst_len(ctl)]
         extra['arch'] = 'sm86'
-        if stage == 'cs': extra['nvn2_cs'] = [rec[ci + 0xb1], rec[ci + 0xb2], rec[ci + 0xb3], struct.unpack_from('<H', rec, ci + 0xba)[0], rec[ci + 0xa9] * 4, rec[ci + 0xb4], rec[ci + 0xb5]]
+        if stage == 'cs':
+            # live dumps have no shader_facts table. the NVN2 header is authoritative for the launch geometry.
+            extra['local'] = list(struct.unpack_from('<3I', ctl, 0x58))
+            extra['shared'] = struct.unpack_from('<I', ctl, 0x64)[0]
+            if not all(extra['local']): raise ValueError(f'{key}: zero compute workgroup dimension')
+            extra['nvn2_cs'] = [rec[ci + 0xb1], rec[ci + 0xb2], rec[ci + 0xb3], struct.unpack_from('<H', rec, ci + 0xba)[0], rec[ci + 0xa9] * 4, rec[ci + 0xb4], rec[ci + 0xb5]]
         if stage in ('ts', 'ms'):
             mesh = dmsh_meshstage.info(ctl, rec[0x38:ci])
             lay, size = dmsh_meshstage.memory(mesh)
@@ -138,7 +143,8 @@ def job_for(key, name, rec, w, facts, debug=True, reduced=True):
         tf = tf_layout(key, ctl) if stage in ('vs', 'gs') else None
         if tf: extra['tf'] = tf
         if stage == 'ps' and early_fragment_tests(ctl, code): extra['early_fragment_tests'] = True
-    cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
+    cp = os.path.join(w, key + '.bin')
+    with open(cp, 'wb') as f: f.write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **extra, 'debug': debug, 'reduced': reduced}
     if extra.get('mesh_stage'): return j, c1
     if key not in facts: j['no_facts'] = True
@@ -148,7 +154,8 @@ def job_for(key, name, rec, w, facts, debug=True, reduced=True):
 
 def job_digest(job):
     """What the translator's output depends on: the job with the code's bytes in place of its path"""
-    j = dict(job); code = open(j.pop('code'), 'rb').read()
+    j = dict(job)
+    with open(j.pop('code'), 'rb') as f: code = f.read()
     return hashlib.sha256(json.dumps(j, sort_keys=True, separators=(',', ':')).encode() + b'\0' + code).hexdigest()
 
 

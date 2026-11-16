@@ -39,8 +39,17 @@ sudo apt install build-essential gcc python3 \
 
 ### Windows
 
-Run `Install.bat`. It downloads Python 3.14 (NuGet) and GCC (conda-forge) into the SwitchRecomp folder and checks
-each download against its SHA-256. `tool/get_deps.py` holds the pinned URLs and hashes.
+Use the checkout's existing `.venv\Scripts\python.exe` (or `venv\Scripts\python.exe`) for development.
+The launcher, build scripts and shader translator prefer `SWR_PYTHON`, then `.venv`, then `venv`, then bundled
+`python\python.exe`. With no local interpreter, launchers/scripts look on PATH; Python helpers retain the current
+interpreter. An explicit `SWR_PYTHON` is a single executable path, without quotes or extra arguments in its value.
+An invalid override fails instead of silently selecting another environment.
+
+`Install.bat` reuses that selection. When Python is missing, explicitly running it downloads Python 3.14 (NuGet)
+and GCC (conda-forge) into the SwitchRecomp folder and checks each download against its SHA-256.
+`tool/get_deps.py` holds the pinned URLs and hashes. Build scripts do not create a venv or install Python.
+A venv may use the bundled Python as its base; keep that base installation in place.
+Linux uses the same order with `.venv/bin/python3`, `venv/bin/python3`, and `python/bin/python3`.
 
 ---
 
@@ -74,6 +83,11 @@ The following describes the upstream lightweight layout. This fork's automated Q
 - AppImage: the Linux package + `AppRun`, built with `mksquashfs -comp zstd` on top of an AppImage runtime.
 
 Regression checks (builds, unit tests, homebrew GPU tests, games) are in REGRESSION.md.
+
+For interpreter/library changes, run `.venv\Scripts\python.exe tests/test_python_selection.py -v` and
+`scripts\build-launcher.bat` (launcher-only build plus Qt core/UI tests). The launcher build requires CMake/Ninja
+already installed in the selected interpreter. It does not create or download a build environment.
+See `docs/LAUNCHER.md` for importing existing builds without recompiling the game.
 
 ---
 

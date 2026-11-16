@@ -174,6 +174,7 @@ struct pk_ent { uint64_t lo, hi, off; uint32_t size, pad; };   // size: the leve
 static inline uint64_t pk_stored(const pk_ent &x) { return (x.pad & 1) ? x.size / 2 : x.size; }
 static std::mutex g_pk_mu; static std::unordered_map<uint64_t, pk_ent> g_pk; static HANDLE g_pk_data = INVALID_HANDLE_VALUE, g_pk_index = INVALID_HANDLE_VALUE; static uint64_t g_pk_end, g_pk_max; static int g_pk_state;
 static std::atomic<uint64_t> s_pk_hits, s_pk_miss, s_pk_read_ns, s_pk_hit_b;
+extern "C" uint64_t vka_perf_ns(void) { return s_pk_read_ns.load(); }
 static void pk_open() {   // g_pk_mu held
     g_pk_state = -1;
     const char *e = getenv("NXRT_VK_ASTC_PACK"); if (e && *e == '0') return;

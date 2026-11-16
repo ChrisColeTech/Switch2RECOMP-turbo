@@ -4,6 +4,7 @@
 #include "vk_mem.h"
 #include "vk_submit.h"
 #include "vk_flight.h"
+#include "vk_perf.h"
 #include "nvn_dirty.h"   // gfx/: the dirty-page tracker the recording layer shares (nxnative's, ported by track A)
 #include <stdio.h>
 #include <stdlib.h>
@@ -548,6 +549,24 @@ static int wr_take(uint64_t n, uint64_t *at) {
     g_wr_head = h + n; *at = o; return 1;
 }
 static uint64_t g_wr_end(void) { return g_wr_head; }
+static void wr_shadow(uint32_t **shadow, uint64_t off, const uint32_t *a, const uint32_t *b, uint64_t n, int skip) {
+    if (!skip) {
+        for (uint64_t i = 0; i < n; i++) { uint64_t at = off + 4*i; uint32_t *s = shadow[at/PAGE];
+            if (s) { if (a[i] != b[i]) s[(at%PAGE)/4] = a[i]; } else i += (PAGE-at%PAGE)/4-1; }
+        return;
+    }
+    // MKW writes back about 16 MB a frame but changes only ~170 KB. The old
+    // shadow pass visited every word again, even pages the comparison just skipped.
+    for (uint64_t i = 0; i < n; ) {
+        uint64_t at = off + 4*i, count = (PAGE-at%PAGE)/4; if (count > n-i) count = n-i;
+        uint32_t *s = shadow[at/PAGE];
+        if (s && memcmp(a+i, b+i, (size_t)count*4)) {
+            s += (at%PAGE)/4;
+            for (uint64_t j = 0; j < count; j++) if (a[i+j] != b[i+j]) s[j] = a[i+j];
+        }
+        i += count;
+    }
+}
 // The words that differ between base and after reach guest memory, page by page; a page the shader left alone is not touched (a touch sends it to the device again)
 static void wr_land(wb_t *w) {
     const uint32_t *b = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->base_at), *a = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->after_at);
@@ -561,8 +580,8 @@ static void wr_land(wb_t *w) {
     atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept);
     AcquireSRWLockShared(&g_lk);
     { pool_t_ *p = pool_find((uintptr_t)w->addr, w->len);
-      if (p && p->shadow) for (uint64_t i = 0; i < n; i++) { uint64_t off = w->addr + 4 * i - p->base; uint32_t *s = p->shadow[off / PAGE];
-          if (s) { if (a[i] != b[i]) s[(off % PAGE) / 4] = a[i]; } else i += (PAGE - off % PAGE) / 4 - 1; } }
+      if (p && p->shadow) { static int skip = -1; if (skip < 0) skip = vkc_int("wb_shadow_skip", 1);
+          wr_shadow(p->shadow, w->addr-p->base, a, b, n, skip); } }
     ReleaseSRWLockShared(&g_lk);
     atomic_store(&g_wr_tail, w->ring_end);
     if (w->len & 3) { uint8_t *d = (uint8_t *)(uintptr_t)w->addr; const uint8_t *ab = (const uint8_t *)a, *bb = (const uint8_t *)b; dm_guest_write_prepare(d + (w->len & ~3ull), 3); for (uint64_t i = w->len & ~3ull; i < w->len; i++) if (ab[i] != bb[i]) d[i] = ab[i]; }
@@ -573,7 +592,9 @@ static int wblog_min(void) { static int v = -1; if (v < 0) v = vkc_int("wblog", 
 static void wblog(const char *what, uint64_t addr, uint64_t len, int kind, uint64_t changed) {
     static volatile LONG n; if (!wblog_min() || len < (uint64_t)wblog_min() || (what[0] == 'r' && !vkc_int("wblog_rec", 0)) || (what[0] == 'l' && !changed) || InterlockedIncrement(&n) > 100000) return;
     VKLOG("wblog: %s frame %llu addr %#llx len %#llx kind %d changed %llu", what, (unsigned long long)g_frame, (unsigned long long)addr, (unsigned long long)len, kind, (unsigned long long)changed); }
-static void wb_land(void *arg) {
+static _Atomic uint64_t s_wb_ns;
+void vkm_perf(uint64_t *ns, uint64_t *bytes) { *ns = atomic_load(&s_wb_ns); *bytes = atomic_load(&s_wb_bytes); }
+static void wb_land_(void *arg) {
     wb_t *w = arg;
     if (wblog_min() && w->kind != 3) { uint64_t ch = 0; const uint8_t *src = w->kind == 4 ? (const uint8_t *)g_wr_mem.map + w->after_at : w->kind == 0 ? (const uint8_t *)w->mem.map : w->kind == 1 ? (const uint8_t *)w->cpu : NULL;
         if (src) { const uint8_t *g = (const uint8_t *)(uintptr_t)w->addr; for (uint64_t i = 0; i < w->len; i++) ch += src[i] != g[i]; } wblog("land", w->addr, w->len, w->kind, ch); }
@@ -593,6 +614,11 @@ static void wb_land(void *arg) {
     atomic_fetch_add(&s_wb_bytes, w->len);
     if (w->buf) { vkDestroyBuffer(g_vk.dev, w->buf, NULL); vk_free_mem(&w->mem); }
     free((void *)w->cpu); free(w);
+}
+static void wb_land(void *arg) {
+    uint64_t t = vkperf_enabled ? now_ns() : 0;
+    wb_land_(arg);
+    if (t) atomic_fetch_add(&s_wb_ns, now_ns() - t);
 }
 // NXRT_VK_WB_OFF=1 (TEST ONLY, wrong results possible): no GPU write goes back to guest memory. Measures the most that fewer write-backs could gain
 static int wb_off(void) { static int v = -1; if (v < 0) v = vkc_int("wb_off", 0); return v; }

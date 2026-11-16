@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -39,15 +40,77 @@ SPIRV = {
     'windows': ('win-64/spirv-tools-2026.4-h49e36cd_2.conda', '933e40fe9ca887a63ef742260f0ed801cda317354806504d864764a4ed9749e1'),
     'linux': ('linux-64/spirv-tools-2026.4-h7148c6a_2.conda', 'e8791349946b2c98ffa5cc67cf1525931e066aef8a01800d6f7c151444a3f052'),
 }
+VPX_SOURCES = {
+    'libvpx_1.14.0-1ubuntu2.3.dsc': '284e824d29a73ce6a19b3533ecbde9576bf9325add0b21f2764cb1b29f5aa167',
+    'libvpx_1.14.0.orig.tar.xz': '11150687870e4c94479abafe5d1ed38790e68dc7bbe08880fd5fb55138e4c6f3',
+    'libvpx_1.14.0-1ubuntu2.3.debian.tar.xz': '9605b124232fe21980e2f1a4e7d86b2cedd0f72ac7961a02171eb90a7d762c34',
+}
+VPX_WINDOWS_SHA = '441569ee34a9731973b0ea670faa4a2133daedb3905ce81bd42d10c9820a5066'
+PYTHON_FULL = ('https://github.com/astral-sh/python-build-standalone/releases/download/20261110/'
+               'cpython-3.14.10%2B20261110-x86_64-unknown-linux-gnu-pgo%2Blto-full.tar.zst',
+               '4730c0dc79e7eecbe54a323d587fdeaab621094fe09b5827167d69045115fcbc')
+VPX_FLAGS = ['--target=x86_64-linux-gcc', '--enable-static', '--disable-shared', '--enable-pic',
+             '--disable-vp8', '--disable-vp9-encoder', '--enable-vp9-decoder', '--disable-examples',
+             '--disable-tools', '--disable-docs', '--disable-unit-tests', '--enable-multithread', '--as=nasm']
+
+
+def prepare_vp9(dest, platform, jobs):
+    records = {}
+    for name, sha in VPX_SOURCES.items():
+        url = 'https://archive.ubuntu.com/ubuntu/pool/main/libv/libvpx/' + name
+        deps.fetch(url, sha, str(dest / 'sources' / name))
+        records[name] = {'url': url, 'sha256': sha}
+    if platform == 'windows':
+        lib = ROOT / 'runtime/vp9/win/libvpx.a'
+        if hashlib.sha256(lib.read_bytes()).hexdigest() != VPX_WINDOWS_SHA:
+            raise RuntimeError('Vendored Windows libvpx differs from its documented source build')
+        return {'sources': records, 'sha256': VPX_WINDOWS_SHA, 'build': 'runtime/vp9/win/README.md'}
+    work = dest / 'native'; work.mkdir(exist_ok=True)
+    source = work / 'libvpx-source'
+    # dpkg-source applies the complete Ubuntu quilt series, including security patches.
+    if not source.exists():
+        subprocess.run(['dpkg-source', '--no-check', '-x', str(dest / 'sources/libvpx_1.14.0-1ubuntu2.3.dsc'), str(source)], check=True)
+    build = work / 'libvpx-build'; build.mkdir(exist_ok=True)
+    subprocess.run([str(source / 'configure'), *VPX_FLAGS], cwd=build, check=True)
+    subprocess.run(['make', '-j' + str(jobs)], cwd=build, check=True)
+    lib = ROOT / 'runtime/vp9/lin/libvpx.a'
+    data = (build / 'libvpx.a').read_bytes()
+    if lib.exists() and lib.read_bytes() != data:
+        raise RuntimeError('Preserving existing Linux libvpx; move it aside explicitly before a release build: ' + str(lib))
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(build / 'libvpx.a', lib)
+    return {'sources': records, 'sha256': hashlib.sha256(data).hexdigest(), 'configure': VPX_FLAGS,
+            'compiler': subprocess.check_output(['gcc', '--version'], text=True).splitlines()[0]}
+
+
+def python_notices(dest):
+    # install_only omits licenses and build metadata; recover them from the matching full distribution.
+    url, sha = PYTHON_FULL
+    data = deps.fetch(url, sha, str(dest / '_downloads/python-full.tar.zst'))
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(data), mode='r|zst') as archive:
+        for member in archive:
+            p = Path(member.name)
+            if member.isfile() and (member.name.startswith('python/licenses/') or member.name == 'python/PYTHON.json'):
+                if '..' in p.parts: raise RuntimeError('Unsafe Python notice path')
+                out = dest / 'licenses/python' / Path(*p.parts[1:])
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(archive.extractfile(member).read()); count += 1
+    if count < 2 or not (dest / 'licenses/python/PYTHON.json').is_file() or not (dest / 'licenses/python/licenses/LICENSE.cpython.txt').is_file():
+        raise RuntimeError('Python full distribution is missing notices/build metadata')
+    return {'url': url, 'sha256': sha}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--dest', type=Path, required=True)
+    ap.add_argument('--jobs', type=int, default=4)
     args = ap.parse_args()
     dest = args.dest.resolve(); dest.mkdir(parents=True, exist_ok=True)
     platform = 'windows' if os.name == 'nt' else 'linux'
     manifest = {'platform': platform, 'downloads': {}}
+    manifest['downloads']['libvpx'] = prepare_vp9(dest, platform, args.jobs)
+    if platform == 'linux': manifest['downloads']['python-notices'] = python_notices(dest)
     for module, sha in QT_SOURCES.items():
         name = module + '-everywhere-src-6.8.3.tar.xz'
         url = 'https://download.qt.io/archive/qt/6.8/6.8.3/submodules/' + name

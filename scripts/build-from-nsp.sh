@@ -7,5 +7,6 @@ if [ "$#" -lt 1 ]; then
   exit 2
 fi
 test -f "$1" || { echo "[NSP BUILD] FAILED - file not found: $1" >&2; exit 1; }
-python3 "$root/switchrecomp.py" "$@" --target linux --backend x11
+. "$root/scripts/_env.sh"
+"$python" "$root/switchrecomp.py" "$@" --target linux --backend x11
 echo "[NSP BUILD] SUCCESS - RomFS remains in $1"

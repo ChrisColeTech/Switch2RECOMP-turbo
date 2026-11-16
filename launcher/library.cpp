@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QStandardPaths>
@@ -22,6 +23,21 @@ QString tool(const QString& root, const QStringList& choices, const QString& fal
     return fallback.isEmpty() ? QString{} : QStandardPaths::findExecutable(fallback);
 }
 bool fail(QString* error, const QString& message) { if (error) *error = message; return false; }
+QString pythonTool(const QString& root, const QStringList& choices, const QString& fallback) {
+    const auto runnable=[](const QString& path) {
+        if(path.isEmpty())return false;
+        QProcess process;process.start(path,{"-c","import sys; sys.exit(sys.version_info < (3, 8))"});
+        if(!process.waitForFinished(5000)){process.kill();process.waitForFinished();return false;}
+        return process.exitStatus()==QProcess::NormalExit&&process.exitCode()==0;
+    };
+    const QString override=qEnvironmentVariable("SWR_PYTHON");
+    if(!override.isEmpty()) {
+        const QString path=QStandardPaths::findExecutable(override);
+        return runnable(path)?path:QString{};
+    }
+    for(const auto& choice:choices){const auto path=tool(root,{choice});if(runnable(path))return path;}
+    const auto path=QStandardPaths::findExecutable(fallback);return runnable(path)?path:QString{};
+}
 }
 
 QString Game::executable() const { return QDir(buildDir).filePath(outputName + executableSuffix); }
@@ -66,7 +82,7 @@ Game Game::fromJson(const QJsonObject& o) {
 bool Toolchain::canBuild() const { return problem().isEmpty(); }
 QString Toolchain::problem() const {
     if (root.isEmpty() || !QFileInfo(QDir(root).filePath("switchrecomp.py")).isFile()) return "Choose your Switch2Recomp folder in Settings.";
-    if (python.isEmpty()) return "Python is missing. Extract the complete toolkit bundle or run the setup script.";
+    if (python.isEmpty()) return "Python is missing or SWR_PYTHON is invalid. Check SWR_PYTHON, .venv/venv, or the portable Python bundle.";
     if (compiler.isEmpty()) return "GCC is missing. Extract the complete toolkit bundle or run the setup script.";
     if (runtime.isEmpty()) return "The native runtime is missing. Extract the complete toolkit bundle or build the runtime first.";
     return {};
@@ -75,12 +91,12 @@ Toolchain Toolchain::find(const QString& root) {
     Toolchain t;
     t.root = absolute(root);
 #ifdef Q_OS_WIN
-    t.python = tool(root, {"python/python.exe"}, "python.exe");
+    t.python = pythonTool(root, {".venv/Scripts/python.exe", "venv/Scripts/python.exe", "python/python.exe"}, "python.exe");
     t.compiler = tool(root, {"gcc/Library/bin/x86_64-w64-mingw32-gcc.exe", "gcc/bin/gcc.exe", "w64devkit/bin/gcc.exe"}, "gcc.exe");
     t.runtime = tool(root, {"bin/runtime_win64_win32.exe"});
     t.dotnet = tool(root, {"dotnet/dotnet.exe"}, "dotnet.exe");
 #else
-    t.python = tool(root, {"python/bin/python3"}, "python3");
+    t.python = pythonTool(root, {".venv/bin/python3", "venv/bin/python3", "python/bin/python3"}, "python3");
     t.compiler = tool(root, {"gcc/bin/x86_64-conda-linux-gnu-gcc", "gcc/bin/gcc"}, "gcc");
     t.runtime = tool(root, {"bin/runtime_linux_x11"});
     t.dotnet = tool(root, {"dotnet/dotnet"}, "dotnet");
@@ -169,6 +185,32 @@ bool Library::add(Game g) {
         if ((!g.source.isEmpty() && samePath(existing.source, g.source)) || samePath(existing.executable(), g.executable())) return false;
     }
     games.append(std::move(g)); return true;
+}
+QString Library::importBuild(const Game& game) {
+    for(const auto& existing:games)if(samePath(existing.executable(),game.executable()))return existing.id;
+    for(auto& existing:games) {
+        if(!game.source.isEmpty()&&samePath(existing.source,game.source)&&!existing.hasBuild()) {
+            existing.buildDir=game.buildDir;existing.outputName=game.outputName;
+            existing.builtSource=game.builtSource;existing.buildIncomplete=false;existing.renderer=game.renderer;
+            if(existing.cover.isEmpty())existing.cover=game.cover;
+            return existing.id;
+        }
+    }
+    games.append(game);return game.id;
+}
+int Library::discoverBuilds(const QString& folder) {
+    if(folder.isEmpty()||!QDir(folder).exists())return 0;
+    QStringList folders{folder};
+    for(const auto& dir:QDir(folder).entryInfoList(QDir::Dirs|QDir::NoDotAndDotDot|QDir::NoSymLinks))folders<<dir.absoluteFilePath();
+    int count=0;
+    for(const auto& dir:folders)for(const auto& module:QDir(dir).entryInfoList({QString("*")+moduleSuffix},QDir::Files)) {
+        const auto name=module.fileName().chopped(QString(moduleSuffix).size());
+        Game game;QString error;
+        if(!gameFromExecutable(QDir(dir).filePath(name+executableSuffix),&game,&error))continue;
+        bool known=false;for(const auto& g:games)if(samePath(g.executable(),game.executable())){known=true;break;}
+        if(!known){importBuild(game);++count;}
+    }
+    return count;
 }
 
 QString outputNameFor(const QString& title) {

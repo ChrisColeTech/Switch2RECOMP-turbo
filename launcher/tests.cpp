@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QFile>
 #include <QJsonDocument>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QtTest>
 #include <cmath>
@@ -14,6 +15,51 @@
 class LauncherTests : public QObject {
     Q_OBJECT
 private slots:
+    void pythonPrecedenceAndEnvironment() {
+        const auto oldPython=qgetenv("SWR_PYTHON"),oldPath=qgetenv("PATH");
+        const bool hadPython=qEnvironmentVariableIsSet("SWR_PYTHON");
+        const auto restore=qScopeGuard([&]{if(hadPython)qputenv("SWR_PYTHON",oldPython);else qunsetenv("SWR_PYTHON");qputenv("PATH",oldPath);});
+        qunsetenv("SWR_PYTHON");
+        QTemporaryDir tmp(QDir::tempPath()+"/swr python spaces-XXXXXX");QVERIFY(tmp.isValid());
+#ifdef Q_OS_WIN
+        const QString suffix="Scripts/python.exe",bundle="python/python.exe",fallback="path/python.exe";
+#else
+        const QString suffix="bin/python3",bundle="python/bin/python3",fallback="path/python3";
+#endif
+        const auto stage=[&](const QString& relative){const auto path=tmp.filePath(relative);QDir().mkpath(QFileInfo(path).absolutePath());return QFile::copy(QCoreApplication::applicationFilePath(),path);};
+        QVERIFY(stage(fallback));QVERIFY(stage(bundle));QVERIFY(stage("venv/"+suffix));QVERIFY(stage(".venv/"+suffix));
+        qputenv("PATH",(QDir::toNativeSeparators(tmp.filePath("path"))+QDir::listSeparator()).toUtf8()+oldPath);
+        auto tools=Toolchain::find(tmp.path());QCOMPARE(tools.python,tmp.filePath(".venv/"+suffix));
+        QCOMPARE(tools.environment().value("SWR_PYTHON"),tools.python);
+        qputenv("SWR_PYTHON",tmp.filePath(bundle).toUtf8());QCOMPARE(Toolchain::find(tmp.path()).python,tmp.filePath(bundle));
+        qputenv("SWR_PYTHON",tmp.filePath("missing.exe").toUtf8());QVERIFY(Toolchain::find(tmp.path()).python.isEmpty());
+        qunsetenv("SWR_PYTHON");QVERIFY(QFile::remove(tmp.filePath(".venv/"+suffix)));
+        QCOMPARE(Toolchain::find(tmp.path()).python,tmp.filePath("venv/"+suffix));
+        QVERIFY(QFile::remove(tmp.filePath("venv/"+suffix)));QCOMPARE(Toolchain::find(tmp.path()).python,tmp.filePath(bundle));
+        QVERIFY(QFile::remove(tmp.filePath(bundle)));QCOMPARE(Toolchain::find(tmp.path()).python,tmp.filePath(fallback));
+    }
+    void discoverNspBuildAndPreserveLibrary() {
+        QTemporaryDir tmp;const auto build=tmp.filePath("MKW NSP build");QVERIFY(QDir().mkpath(build+"/Mario Kart World 180_data"));
+        const auto source=tmp.filePath("Mario Kart World 1.8.0.nsp");
+        for(const auto& path:{source,build+"/Mario Kart World 180"+executableSuffix,build+"/Mario Kart World 180"+moduleSuffix}){
+            QFile file(path);QVERIFY(file.open(QIODevice::WriteOnly));file.write("fixture");
+        }
+        {QFile marker(build+"/Mario Kart World 180_data/romfs.nsp");QVERIFY(marker.open(QIODevice::WriteOnly));marker.write("SWRNSP1\n"+QDir::toNativeSeparators(source).toUtf8()+"\n100\n200\n");}
+        {QFile ini(build+"/Mario Kart World 180.ini");QVERIFY(ini.open(QIODevice::WriteOnly));ini.write("[Graphics]\nrenderer=vulkan\n");}
+        Library library(tmp.filePath("library.json"));library.jobs=3;library.colorMode="light";
+        auto old=gameFromSource(tmp.filePath("Older game.nup"));old.cover="my cover.png";QVERIFY(library.add(old));
+        QCOMPARE(library.discoverBuilds(tmp.path()),1);QCOMPARE(library.games.size(),2);
+        const auto game=library.games.back();QVERIFY(game.hasBuild());QCOMPARE(game.format(),QString("DIRECT NSP"));
+        QCOMPARE(game.renderer,QString("vulkan"));QVERIFY(samePath(game.source,source));QVERIFY(game.sourceAvailable());
+        QVERIFY(cardState(game,false,false,false,false).actionEnabled);
+        QCOMPARE(library.discoverBuilds(tmp.path()),0);QCOMPARE(library.importBuild(game),game.id);
+        QCOMPARE(library.games.front().json(),old.json());QCOMPARE(library.jobs,3);QCOMPARE(library.colorMode,QString("light"));
+        Library pending(tmp.filePath("pending.json"));auto unbuilt=gameFromSource(source);unbuilt.cover="chosen.png";unbuilt.title="My MKW";unbuilt.workers=5;pending.add(unbuilt);
+        QCOMPARE(pending.importBuild(game),unbuilt.id);QCOMPARE(pending.games.size(),1);QVERIFY(pending.games.front().hasBuild());
+        QCOMPARE(pending.games.front().cover,unbuilt.cover);QCOMPARE(pending.games.front().title,unbuilt.title);QCOMPARE(pending.games.front().workers,5);
+        QVERIFY(QFile::remove(source));QCOMPARE(cardState(library.games.back(),false,false,false,true).status,QString("Source offline"));
+        QVERIFY(QFile::remove(game.codeModule()));QVERIFY(!library.games.back().hasBuild());
+    }
     void themeTextContrast() {
         const auto luminance=[](const QColor& color){
             const auto linear=[](double v){return v<=.04045?v/12.92:std::pow((v+.055)/1.055,2.4);};
@@ -120,5 +166,9 @@ private slots:
         QCOMPARE(tools.environment().value("SWR_PROD_KEYS"),tools.keys);
     }
 };
-QTEST_GUILESS_MAIN(LauncherTests)
+int main(int argc,char** argv) {
+    // copied into fixture tool directories to exercise executable probes without another Python installation
+    if(argc>1&&QByteArray(argv[1])=="-c")return 0;
+    QCoreApplication app(argc,argv);LauncherTests tests;return QTest::qExec(&tests,argc,argv);
+}
 #include "tests.moc"

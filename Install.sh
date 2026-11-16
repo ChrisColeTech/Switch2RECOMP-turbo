@@ -23,12 +23,17 @@ if [ ! -t 1 ] && [ -z "$SWR_IN_TERMINAL" ]; then
 fi
 
 find_python() {
-  for p in ./python/bin/python3 python3; do
+  if [ -n "${SWR_PYTHON:-}" ]; then
+    "$SWR_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 8))' || return 1
+    printf '%s\n' "$SWR_PYTHON"; return 0
+  fi
+  for p in ./.venv/bin/python3 ./venv/bin/python3 ./python/bin/python3 python3; do
     if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then echo "$p"; return 0; fi
   done
   return 1
 }
 PY=$(find_python)
+if [ -z "$PY" ] && [ -n "${SWR_PYTHON:-}" ]; then echo 'Invalid SWR_PYTHON' >&2; exit 1; fi
 if [ -z "$PY" ]; then
   echo "Python 3 is not installed. Asking the package manager for it (it may ask for your password)..."
   su=""; [ "$(id -u)" != 0 ] && { command -v pkexec >/dev/null 2>&1 && su=pkexec || su=sudo; }

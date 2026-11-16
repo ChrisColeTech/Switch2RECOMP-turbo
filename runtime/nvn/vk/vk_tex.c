@@ -248,6 +248,7 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
     }
     VkImageCreateFlags cf = (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) | (!depth ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
     if (type == VK_IMAGE_TYPE_3D) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    if (type == VK_IMAGE_TYPE_3D && (g_vk.has.image_2d_of_3d || g_vk.has.sampler_2d_of_3d)) cf |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
     // drop what this format cannot have in this combination (storage on an sRGB format, a sample count)
     for (int pass = 0; pass < 3; pass++) {
         VkImageFormatProperties ip;
@@ -659,7 +660,6 @@ VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz) 
     uint32_t b0 = v && v->set_layers ? v->min_layer : 0, nly = v && v->set_layers ? v->nlayers : im->layers;
     if (im->trim && v && v->set_levels) { uint32_t cut = bl < im->trim ? im->trim - bl : 0; nl = nl > cut ? nl - cut : 1; bl = bl > im->trim ? bl - im->trim : 0; }
     if (bl >= im->levels) bl = im->levels - 1; if (!nl || bl + nl > im->levels) nl = im->levels - bl;
-    if (b0 >= im->layers) b0 = im->layers - 1; if (!nly || b0 + nly > im->layers) nly = im->layers - b0;
     VkFormat f = vkf_view_format(im->d.format, fmt);   // the image's own fallback, whatever the view asks for
     if (im->bc1) { f = bc1_of(f);
         if (f != VK_FORMAT_BC1_RGB_UNORM_BLOCK && f != VK_FORMAT_BC1_RGB_SRGB_BLOCK) { static int n; if (n++ < 20) VKRED("BC1 image ser=%llu %ux%u (format %#x) viewed as VkFormat %d (view format %#x): not a BC1 format", (unsigned long long)im->serial, im->w, im->h, im->d.format, (int)f, fmt); } }
@@ -692,6 +692,10 @@ VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz) 
 VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_t bl, uint32_t nl, uint32_t b0, uint32_t nly, VkImageAspectFlags asp, const VkComponentMapping *mp) {
     VkComponentMapping m = mp ? *mp : (VkComponentMapping){0};
     if (bl >= im->levels) bl = im->levels - 1; if (!nl || bl + nl > im->levels) nl = im->levels - bl;
+    if (im->vtype == VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_3D) {
+        if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) { VKRED("invalid 3D slice view type %d, ser%llu", (int)vt, (unsigned long long)im->serial); return VK_NULL_HANDLE; }
+        nl = 1;   // a slice view exposes one mip; its layers are that mip's depth, not the image's arrayLayers=1
+    }
     uint32_t all = im->vtype == VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_3D ? mip(im->depth, bl) : im->layers;   // a 3D level viewed as a 2D array: its depth slices
     if (b0 >= all) b0 = all - 1; if (!nly || b0 + nly > all) nly = all - b0;
     uint64_t key = (uint64_t)f ^ (uint64_t)vt << 20 ^ (uint64_t)bl << 24 ^ (uint64_t)nl << 28 ^ (uint64_t)b0 << 34 ^ (uint64_t)nly << 46 ^ (uint64_t)asp << 58 ^
@@ -704,7 +708,7 @@ VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_
         im->views[im->nviews].key = key; im->views[im->nviews].v = nv; im->nviews++;
     }
     ReleaseSRWLockExclusive(&g_lk);
-    return nv ? nv : im->view;
+    return nv;   // the original view can have another dimension/format and is not a valid fallback
 }
 
 // ---------- Samplers ----------

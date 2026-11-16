@@ -26,7 +26,7 @@ WORK = P.ext('pokopia-native')
 DEFAULT_CACHE = os.path.join(REPO, 'games', 'MKW', 'MKW_nvn', 'cache')
 # the installer: this tree's parent inside pokopia-native (windows/ beside nxs2.py), else the sibling folder of the private layout
 DEFAULT_INSTALLER = WORK if os.path.exists(os.path.join(WORK, 'nxs2.py')) else os.path.join(WORK, 'installer')
-FRONT_VERSION = 2   # nxs_front.py's job building and the integer-input rule (2: uses inside functions only)
+FRONT_VERSION = 3   # 3: NVN2 compute workgroup dimensions and shared memory from the control header, including live dumps
 BELOW_NORMAL = 0x00004000
 
 

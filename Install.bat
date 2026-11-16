@@ -6,8 +6,13 @@ title SwitchRecomp - Install
 cd /d "%~dp0"
 echo SwitchRecomp: installing what is missing (into this folder, nothing goes on the system)
 echo.
+call "scripts\_python.bat" 2>nul
+if not errorlevel 1 (
+  set "PY=%SWR_PYTHON%"
+  goto havepy
+)
+if defined SWR_PYTHON goto failed
 set "PY=python\python.exe"
-if exist "%PY%" goto havepy
 echo Python 3.14 (about 16 MB, once)
 where curl >nul 2>nul || goto oldwindows
 where tar >nul 2>nul || goto oldwindows

@@ -26,19 +26,16 @@ try {
     $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $vs) { throw 'The MSVC x64 toolset is not installed.' }
     $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-    $venv = Join-Path $root '.venv'
-    $python = Join-Path $root 'python\python.exe'
-    if (-not (Test-Path -LiteralPath $python)) { $python = (Get-Command python -ErrorAction Stop).Source }
-    if (-not (Test-Path -LiteralPath (Join-Path $venv 'Scripts\python.exe'))) {
-        & $python -m venv $venv
-        if ($LASTEXITCODE) { throw 'Could not create launcher build environment.' }
-    }
-    $python = Join-Path $venv 'Scripts\python.exe'
-    $cmake = Join-Path $venv 'Scripts\cmake.exe'
-    $ninja = Join-Path $venv 'Scripts\ninja.exe'
-    if (-not (Test-Path -LiteralPath $cmake) -or -not (Test-Path -LiteralPath $ninja)) {
-        & $python -m pip install cmake==3.31.10 ninja==1.13.2
-        if ($LASTEXITCODE) { throw 'Could not install CMake/Ninja.' }
+    $python = & cmd.exe /d /c "call `"$PSScriptRoot\_python.bat`" && call echo %SWR_PYTHON%"
+    if ($LASTEXITCODE) { throw 'Python selection failed.' }
+    $python = $python.Trim()
+    $scripts = & $python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+    if ($LASTEXITCODE) { throw 'Cannot locate Python build tools.' }
+    $cmake = Join-Path $scripts 'cmake.exe'
+    $ninja = Join-Path $scripts 'ninja.exe'
+    $ctest = Join-Path $scripts 'ctest.exe'
+    foreach ($tool in @($cmake, $ninja, $ctest)) {
+        if (-not (Test-Path -LiteralPath $tool)) { throw "Missing $tool. Install cmake==3.31.10 ninja==1.13.2 in $python explicitly." }
     }
     $build = Join-Path $root "build\launcher-$($Config.ToLower())"
     $logs = Join-Path $root 'logs'
@@ -53,7 +50,7 @@ try {
         "call `"$vcvars`" >nul",
         "`"$cmake`" -S `"$root\launcher`" -B `"$build`" -G Ninja -DCMAKE_BUILD_TYPE=$Config -DCMAKE_PREFIX_PATH=`"$QtPrefix`" -DCMAKE_MAKE_PROGRAM=`"$ninja`" -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=`"$build\bin`"",
         "`"$cmake`" --build `"$build`" --parallel $Jobs",
-        "`"$venv\Scripts\ctest.exe`" --test-dir `"$build`" --output-on-failure"
+        "`"$ctest`" --test-dir `"$build`" --output-on-failure"
     )
     & cmd.exe /d /c ("(" + ($commands -join ' && ') + ") > `"$log`" 2>&1")
     if ($LASTEXITCODE) { throw "Build/tests failed. See $log" }

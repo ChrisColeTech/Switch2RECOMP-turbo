@@ -55,6 +55,8 @@ public:
     Game* find(const QString& id);
     const Game* find(const QString& id) const;
     bool add(Game game);
+    QString importBuild(const Game& game);
+    int discoverBuilds(const QString& folder);
     QString path;
     QString toolRoot, outputRoot, keysPath;
     int jobs = 8;

@@ -550,10 +550,8 @@ uint32_t *vkspv_dual_source(const uint32_t *w, size_t n, size_t *out_n) {
     }
     *out_n = o.n; return o.w;
 }
-// Float outputs retyped into integer ones (nxshader's IntOutputs pass, nvn_mtl.m fs_uint): a float output whose target is uint or sint stores undefined values, because
-// Vulkan converts nothing and Maxwell's ROP truncated towards zero. kinds[i]: 1 = target i unsigned, 2 = signed, 0 = float or unwritten. Each matching output becomes an
-// int32 of the same shape (its Location stays), and every float store to it goes through a truncating OpConvertFToU / OpConvertFToS. Needs no Flat: Vulkan asks it of
-// integer inputs, not of outputs. New words or NULL
+// integer attachments consume register bits, not float-to-integer conversions. the translator's float output is
+// only a register container (also see Eglantine's EmitSetFragColor). kinds: 1 unsigned, 2 signed, 0 unchanged.
 uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], size_t *out_n) {
     if (!spv_ok(w, n)) return NULL;
     uint32_t bound = w[3], *def = calloc(bound, sizeof *def), f32 = 0;
@@ -562,7 +560,7 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
         if (!wc || i + wc > n) { free(def); return NULL; }
         if (op >= OP_TYPE_VOID && op <= OP_TYPE_POINTER && wc >= 2 && w[i + 1] < bound) def[w[i + 1]] = (uint32_t)i;
-        if (op == OP_VARIABLE && wc >= 4 && w[i + 2] < bound) def[w[i + 2]] = (uint32_t)i;
+        if ((op == OP_VARIABLE || op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && wc >= 4 && w[i + 2] < bound) def[w[i + 2]] = (uint32_t)i;
         if (op == OP_TYPE_INT && wc == 4 && w[i + 2] == 32 && w[i + 3] < 2) iscal[w[i + 3]] = w[i + 1];
         if (op == OP_TYPE_FLOAT && wc == 3 && w[i + 2] == 32) f32 = w[i + 1];
         i += wc;
@@ -605,15 +603,14 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
         if (!var_of[l]) continue;
         int k = k_of[l], nc = nc_of[l];
         if (!iscal[k]) { iscal[k] = bound++; NEWT(4u << 16 | OP_TYPE_INT, iscal[k], 32, k); }
-        if (nc == 1) { if (!isp[k]) { isp[k] = bound++; NEWT(4u << 16 | OP_TYPE_POINTER, isp[k], SC_OUTPUT, iscal[k]); } }
-        else {
+        if (!isp[k]) { isp[k] = bound++; NEWT(4u << 16 | OP_TYPE_POINTER, isp[k], SC_OUTPUT, iscal[k]); }
+        if (nc > 1) {
             if (!ivec[k][nc]) { ivec[k][nc] = bound++; NEWT(4u << 16 | OP_TYPE_VECTOR, ivec[k][nc], iscal[k], (uint32_t)nc); }
             if (!ivp[k][nc]) { ivp[k][nc] = bound++; NEWT(4u << 16 | OP_TYPE_POINTER, ivp[k][nc], SC_OUTPUT, ivec[k][nc]); }
         }
     }
     #undef NEWT
-    // the rewrite: variables take the new pointer type; access chains into them the scalar pointer; stores through either convert the value (a whole variable: the vector,
-    // one index into it: the scalar)
+    // stores preserve the bits; loads cast back so reads of the original output (including alpha tests) keep their type
     uint32_t *repl = calloc(bound + 1, sizeof *repl);   // pointer id -> class + 1 of what it now points to
     wbuf o = {0};
     wput(&o, w, 5);
@@ -626,13 +623,23 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
         uint32_t x[64] = {0}; memcpy(x, w + i, wc * 4);
         if (op == OP_VARIABLE && wc >= 4) {
             for (int l = 0; l < 8; l++) if (var_of[l] && x[2] == var_of[l]) {
+                if (wc != 4) { bad = 1; break; }   // an initializer would need retyping too
                 x[1] = nc_of[l] > 1 ? ivp[k_of[l]][nc_of[l]] : isp[k_of[l]];
                 repl[x[2]] = (uint32_t)k_of[l] + 1;
             }
             wput(&o, x, wc);
         } else if ((op == OP_ACCESS_CHAIN || op == OP_IN_BOUNDS_ACCESS_CHAIN) && wc >= 5 && x[3] < bound && repl[x[3]]) {
+            if (wc != 5) { bad = 1; break; }
             int k = (int)repl[x[3]] - 1; x[1] = isp[k]; repl[x[2]] = (uint32_t)k + 1;   // one index into a vector: the scalar
             wput(&o, x, wc);
+        } else if (op == OP_LOAD && wc >= 4 && x[3] < w[3] && repl[x[3]]) {
+            int k = (int)repl[x[3]] - 1;
+            uint32_t ti = def[x[1]], nc = (w[ti] & 0xffff) == OP_TYPE_VECTOR ? w[ti + 3] : 1;
+            uint32_t old_type = x[1], old_id = x[2];
+            x[1] = nc > 1 ? ivec[k][nc] : iscal[k]; x[2] = bound++;
+            wput(&o, x, wc);
+            uint32_t cv[4] = {4u << 16 | 124 /* OpBitcast */, old_type, old_id, x[2]};
+            wput(&o, cv, 4);
         } else if ((op == OP_STORE || op == OP_COPY_MEMORY) && x[1] < bound && repl[x[1]]) {
             if (op == OP_COPY_MEMORY || wc != 3) bad = 1;   // a copy keeps the source's float type: no variant
             else {
@@ -643,7 +650,7 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
                     if (vt < bound && def[vt] && (w[def[vt]] & 0xffff) == OP_TYPE_VECTOR) nc = w[def[vt] + 3];
                 }
                 uint32_t want = nc > 1 ? ivec[k][nc] : iscal[k], nid = bound++;
-                uint32_t cv[4] = {4u << 16 | (k ? OP_CONVERT_F_TO_S : OP_CONVERT_F_TO_U), want, nid, x[2]};
+                uint32_t cv[4] = {4u << 16 | 124 /* OpBitcast */, want, nid, x[2]};
                 wput(&o, cv, 4);
                 uint32_t st[3] = {3u << 16 | OP_STORE, x[1], nid};
                 wput(&o, st, 3);
@@ -739,7 +746,7 @@ uint32_t *vkspv_alpha_test(const uint32_t *w, size_t n, size_t *out_n) {
 static const vks_shader *fs_variant_l(const vks_shader *fs_, int flags) {
     vks_shader *fs = (vks_shader *)fs_;
     if (!flags || !fs->words || fs->stage != VKS_FS) return fs;
-    uint64_t key = 0x100u | (unsigned)flags;
+    uint64_t key = (1ull << 32) | (unsigned)flags;
     for (int i = 0; i < fs->nvar; i++) if (fs->var[i].key == key) return fs->var[i].s;
     if (fs->nvar == 8) return fs;
     size_t n = fs->nwords, nn = 0; uint32_t *w = NULL; int dual = 0, alpha = 0, ik = 0;

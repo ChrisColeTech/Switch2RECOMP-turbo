@@ -8,13 +8,20 @@ or another working directory. Game files, keys, and firmware are not included or
 
 | Tool | Supported version | Source |
 |---|---:|---|
-| Python | 3.14.9 bundled on Windows; Python 3 on Linux | `scripts\setup.bat` / `scripts/setup.sh` |
+| Python | Existing project venv for development; 3.14.9 bundled in releases | `.venv` or `venv`; explicit setup for missing portable tools |
 | GCC/G++ | 16.2 portable package | conda-forge packages verified by SHA-256 in `tool/get_deps.py` |
 | zstd decoder | 1.6.0 source | `runtime/edenvk/deps/zstd`, linked into every runtime |
 | SDL2 | 2.32.10 on Linux | portable wheel installed by `Install.sh` |
 
 Windows setup is portable. It writes `python\` and `gcc\` under the repository and requires no administrator
 access. Linux can use system Python and GCC or the portable compiler downloaded by `Install.sh`.
+
+Development scripts and launchers select a valid explicit `SWR_PYTHON` first, then `.venv`, then `venv`, then
+the portable `python` directory, then PATH. Windows venvs use `Scripts/python.exe`; Linux uses `bin/python3`.
+Python subprocess helpers use the current interpreter as their final fallback. Invalid explicit overrides fail.
+No activation or system PATH change is needed. Build scripts do not create/download interpreters or venvs.
+The launcher build also requires CMake/Ninja already installed in the selected environment.
+Portable releases contain no development venv and continue to use their bundled Python.
 
 The Vulkan renderers have additional dependencies described in `README.md`. They are optional; the standard
 OpenGL runtime and direct-NUP filesystem do not require Vulkan or .NET.
@@ -78,7 +85,7 @@ python3 switchrecomp.py --build-runtime --target linux --backend headless --cc g
 ```
 
 ```bat
-python\python.exe switchrecomp.py --build-runtime --target win64 --backend win32 --cc gcc\Library\bin\x86_64-w64-mingw32-gcc.exe
+scripts\build-runtime.bat
 ```
 
 ## 5. Build From A NUP
@@ -190,7 +197,7 @@ Build the optional NVN layer before rebuilding the Windows runtime:
 
 ```powershell
 Set-Location -LiteralPath "D:\Projects\Switch2RECOMP-main"
-& ".\python\python.exe" tools/build_nvn.py --jobs 8
+& ".\.venv\Scripts\python.exe" tools/build_nvn.py --jobs 8
 & ".\scripts\build-runtime.bat"
 ```
 
@@ -210,7 +217,7 @@ The Windows helper now monitors its parent with a read-only synchronization hand
 Windows liveness probe; on Windows it can terminate the target process. Regression check:
 
 ```powershell
-& ".\python\python.exe" tests/test_nxs_parent.py
+& ".\.venv\Scripts\python.exe" tests/test_nxs_parent.py
 ```
 
 Verified on this machine after fixing deployment: 102 captured Bananza shaders translated with zero failures; a
