@@ -238,6 +238,23 @@ class Module:
         return enc
 
 
+NSO_ZBIC = 1 << 7           # NSO flag: compressed segments use ZBIC (Switch 2 zstd variant) instead of LZ4
+
+
+def unpack_segment(raw, size, flags, path, seg):
+    import zbic
+    if not (flags & NSO_ZBIC or zbic.is_zbic(raw)):
+        return lz4_block(raw, size)
+    try:
+        return zbic.decompress(raw, size)
+    except zbic.Unsupported as e:
+        raise ValueError('%s: segment %d uses ZBIC compression (Switch 2 zstd variant), which is not supported by this '
+                         'Python: %s' % (path, seg, e))
+    except zbic.Error as e:
+        raise ValueError('%s: segment %d uses ZBIC compression (Switch 2 zstd variant) and could not be decoded (%s); '
+                         'the data is damaged or uses a ZBIC variant this engine does not support' % (path, seg, e))
+
+
 def load_nso_data(d, path='<memory>', name=None):
     if d[:4] != b'NSO0':
         raise ValueError('%s is not NSO0' % path)
@@ -250,7 +267,7 @@ def load_nso_data(d, path='<memory>', name=None):
     for i, (foff, moff, sz) in enumerate(segs):
         raw = d[foff:foff + fsz[i]]
         if flags & (1 << i):
-            raw = lz4_block(raw, sz)
+            raw = unpack_segment(raw, sz, flags, path, i)
         # a short slice assignment would shrink the image and shift every later segment
         if len(raw) < sz or moff + sz > size:
             raise ValueError('%s: segment %d is truncated (damaged file?)' % (path, i))

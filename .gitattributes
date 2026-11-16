@@ -11,3 +11,4 @@ tests/** linguist-documentation
 *.sh linguist-detectable=false
 *.bat linguist-detectable=false
 *.cpp linguist-detectable=false
+tests/*.zbic binary

@@ -1,5 +1,8 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Switch 2 NSOs with ZBIC-compressed segments (NSO flag bit 7, e.g. Ocarina of Time) load: zbic.py rewrites ZBIC's
+  interpolative-coded FSE table headers into standard zstd and decodes with the stock zstd in Python 3.14 (or the
+  zstandard package). Without a zstd decoder the error says ZBIC is not supported instead of calling the dump corrupt.
 - Qt launcher and native Vulkan startup now show the original SwitchRECOMP logo and copyright artwork on black
   for one second. Win32 startup painting stops before renderer handoff so later repaints cannot cover the scene.
 - Native Vulkan frame telemetry can write bounded, background-buffered CSV with present intervals and replay,
