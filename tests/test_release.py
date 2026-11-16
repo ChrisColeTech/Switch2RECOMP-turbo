@@ -132,6 +132,23 @@ class ReleaseChecks(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Non-relocatable'): package.validate_contents(root, 'linux')
             link.unlink()
 
+    @unittest.skipIf(os.name == 'nt', 'Unix symlink archive contract')
+    def test_dereference_replaces_nonrelocatable_links_with_target_copies(self):
+        root = self.bundle('linux')
+        (root / 'gcc/lib').mkdir(parents=True, exist_ok=True)
+        real = root / 'gcc/lib/libgomp.so.1.0.0'; real.write_bytes(b'gomp')
+        (root / 'gcc/lib/libgomp.so').symlink_to(real)             # relative, inside the stage
+        (root / 'gcc/lib/absolute.so').symlink_to(self.root / 'outside-target')
+        (self.root / 'outside-target').write_bytes(b'absolute')
+        package.dereference_symlinks(root)
+        self.assertFalse((root / 'gcc/lib/libgomp.so').is_symlink())
+        self.assertEqual((root / 'gcc/lib/libgomp.so').read_bytes(), b'gomp')
+        self.assertFalse((root / 'gcc/lib/absolute.so').is_symlink())
+        self.assertEqual((root / 'gcc/lib/absolute.so').read_bytes(), b'absolute')
+        package.validate_contents(root, 'linux')                   # the fixed tree now validates
+        (root / 'gcc/lib/broken.so').symlink_to(self.root / 'gone')
+        with self.assertRaisesRegex(RuntimeError, 'unreadable target'): package.dereference_symlinks(root)
+
     def test_source_allowlist_includes_new_headers_but_not_personal_data(self):
         names = ['runtime/controller_sony.h', 'runtime/nvn/vk/vk_perf.c', 'tools/nxshader/s2r_paths.py',
                  'tools/library.json', 'runtime/prod.keys', '.venv/Scripts/python.exe', 'games/Game.exe', 'performance.txt']

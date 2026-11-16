@@ -160,6 +160,19 @@ def digest(path):
     with path.open('rb') as stream: return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def dereference_symlinks(stage):
+    """Toolchain archives carry absolute symlinks (e.g. GCC's libgomp.so -> libgomp.so.1.0.0); a relocated
+    bundle cannot follow them, so replace every non-relocatable link with a copy of its target."""
+    root = stage.resolve()
+    for path in [p for p in stage.rglob('*') if p.is_symlink()]:
+        target = Path(os.readlink(path))
+        resolved = target if target.is_absolute() else (path.parent / target)
+        if not resolved.is_file() or not resolved.resolve().is_relative_to(root):
+            raise RuntimeError('Non-relocatable symlink with unreadable target: ' + str(path.relative_to(stage)))
+        path.unlink()
+        shutil.copy2(resolved, path)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--deps', type=Path, required=True)
@@ -198,6 +211,7 @@ def main():
         wrapper = stage / 'Switch2RECOMP-turbo.sh'
         wrapper.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport LD_LIBRARY_PATH="$root/lib:$root/gcc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"\nexec "$root/bin/launcher/SwitchRecompLauncher" --root "$root" "$@"\n')
         wrapper.chmod(0o755)
+    dereference_symlinks(stage)
     validate_contents(stage, platform)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     dirty = bool(subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=normal'], cwd=ROOT))
