@@ -161,19 +161,40 @@ def digest(path):
 
 
 GCC_FIXUP = '''#!/bin/sh
-# The bundled conda GCC resolves its sysroot through absolute paths recorded when this release was packaged;
-# after the bundle is extracted somewhere else those paths are dead. Re-point them at this copy.
+# The bundled conda GCC bakes absolute paths in while the release is packaged (its sysroot, an rpath inside
+# specs and the linker scripts) and, being GCC, it cannot run from a directory containing spaces. Repoint the
+# baked paths at a space-free alias of this copy and wrap the drivers so every run resolves the alias as
+# --sysroot. Safe to run repeatedly; recreates the alias if /tmp was cleared.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cfg="$root/gcc/bin/x86_64-conda-linux-gnu.cfg"
-if [ ! -f "$cfg" ]; then exit 0; fi
-want="$root/gcc"
-have=$(sed -n 's|^--sysroot=\\(.*\\)/x86_64-conda-linux-gnu/sysroot$|\\1|p' "$cfg")
-if [ -z "$have" ] || [ "$have" = "$want" ]; then exit 0; fi
-esc=$(printf '%s\\n' "$have" | sed 's/[][\\*^$|]/\\\\&/g')
-rep=$(printf '%s\\n' "$want" | sed 's/[&\\\\|]/\\\\&/g')
-for f in "$cfg" "$root"/gcc/lib/gcc/x86_64-conda-linux-gnu/*/specs "$root"/gcc/x86_64-conda-linux-gnu/lib/ldscripts/*; do
-    if [ -f "$f" ]; then sed -i "s|$esc|$rep|g" "$f"; fi
+gcc="$root/gcc"
+if [ ! -d "$gcc" ]; then exit 0; fi
+home=/tmp/switchrecomp-toolchains
+mkdir -p "$home" 2>/dev/null || true
+hash=$(printf '%s\\n' "$gcc" | cksum | cut -d' ' -f1)
+alias_name="$home/$hash"
+if [ ! -e "$alias_name" ]; then ln -s "$gcc" "$alias_name" 2>/dev/null || true; fi
+cfg="$gcc/bin/x86_64-conda-linux-gnu.cfg"
+have=''
+if [ -f "$cfg" ]; then
+    have=$(sed -n 's|^--sysroot=\\(.*\\)/x86_64-conda-linux-gnu/sysroot$|\\1|p' "$cfg")
+    : > "$cfg"
+fi
+if [ -n "$have" ] && [ "$have" != "$alias_name" ]; then
+    esc=$(printf '%s\\n' "$have" | sed 's/[][\\\\*^$|]/\\\\&/g')
+    rep=$(printf '%s\\n' "$alias_name" | sed 's/[&\\\\|]/\\\\&/g')
+    for f in "$gcc"/lib/gcc/x86_64-conda-linux-gnu/*/specs "$gcc"/x86_64-conda-linux-gnu/lib/ldscripts/*; do
+        if [ -f "$f" ]; then sed -i "s|$esc|$rep|g" "$f"; fi
+    done
+fi
+for name in gcc g++ c++ cpp; do
+    driver="$gcc/bin/x86_64-conda-linux-gnu-$name"
+    if [ -f "$driver" ] && [ ! -f "$driver.bin" ]; then
+        mv "$driver" "$driver.bin"
+        printf '#!/bin/sh\\nset -eu\\ngcc=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)\\nhome=/tmp/switchrecomp-toolchains\\nmkdir -p "$home" 2>/dev/null || true\\na="$home/%s"\\nif [ ! -e "$a" ]; then ln -s "$gcc" "$a" 2>/dev/null || true; fi\\nif [ -e "$a" ]; then exec "$a/bin/x86_64-conda-linux-gnu-%s.bin" --sysroot="$a/x86_64-conda-linux-gnu/sysroot" "$@"; fi\\nexec "$gcc/bin/x86_64-conda-linux-gnu-%s.bin" --sysroot="$gcc/x86_64-conda-linux-gnu/sysroot" "$@"\\n' \\
+            "$hash" "$name" "$name" > "$driver"
+        chmod +x "$driver" "$driver.bin"
+    fi
 done
 '''
 

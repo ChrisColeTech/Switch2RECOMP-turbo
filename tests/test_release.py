@@ -140,15 +140,18 @@ class ReleaseChecks(unittest.TestCase):
         cfg = root / 'gcc/bin/x86_64-conda-linux-gnu.cfg'; cfg.parent.mkdir(parents=True, exist_ok=True)
         cfg.write_text('--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % old)
         specs = root / 'gcc/lib/gcc/x86_64-conda-linux-gnu/16.2.0/specs'; specs.parent.mkdir(parents=True, exist_ok=True)
-        specs.write_text('*link: -L%s/lib\n' % old)
+        specs.write_text('*link: -rpath %s/lib\n' % old)
+        driver = root / 'gcc/bin/x86_64-conda-linux-gnu-gcc'
+        driver.write_text('#!/bin/sh\nexit 42\n'); driver.chmod(0o755)
         script = root / 'fix-gcc.sh'; script.write_text(package.GCC_FIXUP); script.chmod(0o755)
         subprocess.run(['sh', script], check=True)
-        self.assertEqual(cfg.read_text(), '--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % (root / 'gcc'))
-        self.assertEqual(specs.read_text(), '*link: -L%s/lib\n' % (root / 'gcc'))
-        subprocess.run(['sh', script], check=True)  # idempotent
-        cfg.write_text('--sysroot=%s/x86_64-conda-linux-gnu/sysroot\n' % (root / 'gcc'))
-        (root / 'gcc/bin/other.cfg').write_text('unrelated\n')
-        subprocess.run(['sh', script], check=True)  # already correct: no sed, no crash
+        self.assertEqual(cfg.read_text(), '')                                # never space-split again
+        self.assertIn('/tmp/switchrecomp-toolchains/', specs.read_text())    # baked paths now use the alias
+        wrapper = driver.read_text()
+        self.assertIn('--sysroot="$a/x86_64-conda-linux-gnu/sysroot"', wrapper)
+        self.assertTrue((root / 'gcc/bin/x86_64-conda-linux-gnu-gcc.bin').exists())
+        subprocess.run(['sh', script], check=True)                           # idempotent
+        self.assertEqual(driver.read_text(), wrapper)
 
     @unittest.skipIf(os.name == 'nt', 'Unix symlink archive contract')
     def test_dereference_replaces_nonrelocatable_links_with_target_copies(self):
