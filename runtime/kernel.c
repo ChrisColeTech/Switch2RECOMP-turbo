@@ -368,10 +368,14 @@ static u32 svc_arbitrate_unlock(u64 addr){
 
 static u32 svc_wait_cv(KThread* t, u64 maddr, u64 key, u32 tag, i64 timeout){
   pm_lock(&g_klock);
-  unlock_nl(maddr);
-  if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
-  t->wait_kind=3; t->wait_key=key; t->wait_addr=maddr; t->wait_tag=tag; t->woken=0; wl_add(t);
+  if(timeout==0){ unlock_nl(maddr); pm_unlock(&g_klock); return R_TIMEOUT; }
+  /* the key says "a thread waits" before the mutex is released, as in Horizon. the SDK's Signal/Broadcast skip the
+     SVC while the key reads 0: with the mutex released first, a thread on another core could take the lock, change
+     the state (the last reader leaving a ReaderWriterLock), read key 0 and not signal, and this thread then slept for
+     good (Pokemon Legends Z-A froze after a few seconds of the language screen with main waiting for the write lock) */
   __atomic_store_n(U32(key),1,__ATOMIC_SEQ_CST);
+  t->wait_kind=3; t->wait_key=key; t->wait_addr=maddr; t->wait_tag=tag; t->woken=0; wl_add(t);
+  unlock_nl(maddr);
   int ok=sleep_nl(t,timeout);
   u32 r;
   if(!ok){ if(wl_has(t)){ wl_del(t); } t->wait_kind=0; r=R_TIMEOUT;
@@ -1128,6 +1132,10 @@ void kernel_dump_threads(void){
     /* Switch 2: a thread busy in a driver loop (NVN fence waits poll memory) shows its registers, the address it
        polls is usually among them */
     if(k==0 && (g_title_id>>56)==0x04){ LOG("    regs:"); for(int r=0;r<29;r++) LOG(" x%d=%llx",r,(unsigned long long)t->cpu.x[r]); LOG("\n"); }
+    /* a waiting thread: the condvar key, and x19..x24 (the SDK's wait wrapper keeps its cv and mutex objects there,
+       the game's own pointers are a frame further up) */
+    if(k>=1){ if(k==3) LOG("    cv key %llx (%x)", (unsigned long long)t->wait_key, gr32(t->wait_key)); else LOG("   ");
+      for(int r=19;r<=24;r++) LOG(" x%d=%llx",r,(unsigned long long)t->cpu.x[r]); LOG("\n"); }
   }
   /* running threads (main first): sample where they are */
   if(g_dump_sample){ int ns=0;

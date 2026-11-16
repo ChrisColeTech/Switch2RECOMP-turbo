@@ -1,5 +1,10 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Pokemon Legends Z-A (Switch 2 Edition) no longer stays on a black screen with sound: LDXR/STXR now have an
+  exclusive monitor (a STXR fails when another thread's store-exclusive hit the same address since the LDXR, not
+  only when the value differs), so the game's lock-free resource and job lists stop losing updates. LDAR/STLR are
+  translated as atomic accesses. Both are in the generated code: rebuild the game. Experimental guest core
+  scheduler (SWR_CORE_SCHED=1, off by default) and more thread diagnostics; see docs/PLZA_BLACK_SCREEN_INVESTIGATION.md.
 - Switch 2 NSOs with ZBIC-compressed segments (NSO flag bit 7, e.g. Ocarina of Time) load: zbic.py rewrites ZBIC's
   interpolative-coded FSE table headers into standard zstd and decodes with the stock zstd in Python 3.14 (or the
   zstandard package). Without a zstd decoder the error says ZBIC is not supported instead of calling the dump corrupt.

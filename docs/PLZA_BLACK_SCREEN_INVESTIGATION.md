@@ -3,12 +3,14 @@
      Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
 # Pokemon Legends Z-A (Switch 2 Edition): black screen at boot
 
-Status 2026-11-16: **not fixed.** Pokemon Legends Z-A Switch 2 Edition (`0100F43008C44000`, built by RecompLauncher
-with turbo a9a4add) opens a black window with working audio and never renders. The cause is a concurrency failure
-in the game's own job/resource system under this runtime: loading jobs stall partway and every thread goes to sleep.
-The evidence points at threads that share a guest core running at the same time on the PC (on the Switch they
-never do). Two engine changes were made and committed on branch `plza-blackscreen` (not merged, not pushed); neither
-makes the game render yet. See [Open items](#open-items) for what is left.
+Status 2026-11-16: **fixed (renders).** Pokemon Legends Z-A Switch 2 Edition (`0100F43008C44000`, built by
+RecompLauncher with turbo a9a4add) opened a black window with working audio and never rendered. The cause was a
+concurrency failure in the game's job/resource system under this runtime: loading jobs stalled partway and every
+thread went to sleep. The root cause is the LL/SC emulation: LDXR/STXR were a compare-and-swap on the value with no
+exclusive monitor, so the game's lock-free structures lost updates (ABA) when its threads really ran at once. With the
+global exclusive monitor (`runtime/cpu.h`) and the game recompiled, it reaches the Language Selection screen at a
+steady 30 FPS. The scheduler work below was needed to find this but is not part of the fix (it stays opt-in). Branch
+`plza-blackscreen`. Remaining issues are in [Open items](#open-items) (text in some UI fonts is garbled).
 
 ## Symptom
 
@@ -113,12 +115,64 @@ reintroduce the parallelism and it stalls as before. Either thread 95 yields (sv
 does not go to equal priorities yet (no FIFO hand-off), or it polls for work that a same-core thread produces.
 Which one is not established.
 
+## Round 2: floating threads, the scheduler and the exclusive monitor
+
+**Most "core 0" threads float.** With `log=2` the runtime now prints CreateThread's requested core and every
+SetThreadCoreMask. Most of PLZA's threads are created with core `-2` and then given ideal core `-1`, mask `f` (any
+of cores 0-3): the job workers 89-92, the loader 95, 82-87, 99-101, 105-108 (121 has mask `7`). Only main (80), 96,
+109 and 114 are pinned to core 0. Before, the runtime put every floating thread on core 0, so GetCurrentProcessorNumber
+told main and a dozen floating threads that they were all on core 0 at the same time. On the console a floating thread
+runs on whichever core of its mask is free, and that core runs nothing else meanwhile. Thread 95 is a loader that
+polls (`while (state != 4) F_816F5C4(obj);`) without blocking; on the console it simply runs on another core.
+
+**Scheduler v2** (`SWR_CORE_SCHED=1`, `runtime/kernel.c`). One global lock with explicit grants: waiting threads are
+served in (priority, ticket) order, so a yield (svcSleepThread 0/-1/-2) goes behind threads of the same priority. A
+free core goes to the best waiter whose mask allows it (its ideal core, else the last one, first). If a waiter's cores
+are all busy, a holder that may also run on a free core is moved there (it keeps running, as a migration on the
+console) and the waiter gets the core. GetCurrentProcessorNumber reports the core the thread holds. Two deadlocks were
+found with cdb and fixed:
+- The stall dump logs under the log lock and took the scheduler lock, while the scheduler logged under its own lock.
+  Nothing is logged under the scheduler lock now, and the dump reads its fields without it.
+- Preemption by `SuspendThread` blocked in `NtSuspendThread` while holding the scheduler lock, and every other thread
+  queued behind it. Before that, the first preemption looked up the code range with `GetModuleHandleEx` (loader lock)
+  after suspending a thread that could hold it. The range is now looked up at startup, and suspend-preemption is off
+  unless `SWR_CORE_PREEMPT=1`.
+
+With scheduler v2 (old DLL) the game got past the font stage (`bcat:u` at 2.66 s, no overtakes), then stalled just
+before its first `QueuePresentTexture`. Every core was free and nobody waited for one: all threads were in guest waits.
+A job on worker 93 was waiting in `F_8F1C390` (a synchronous resource request) for a second signal of a LightEvent. With
+the recompiled DLL (`efa9b2a`) it stalled back in the font loop. So the scheduler removes one cause, but loads still
+get lost.
+
+**Lost dependency continuations.** A stuck font resource (state 1 at `+0x158`) points at `+0x150` to its dependency,
+`data:/arc/uifontbinbmp_din_24_28.bfcpx.trpak`. That dependency is fully loaded (state 5). The loader `F_9B1C1F0`
+moves a resource 0 → 1 (waiting for dependencies) → 2 → 3, then `F_9A850B0` 4 → 5 and notifies the dependents
+registered at `+280`. A dependent that stays at 1 after its dependency reached 5 never got its continuation. That is
+a lost update in game data structures that are correct on the console. Under true parallelism this is the expected
+failure of an LL/SC emulation without an exclusive monitor:
+
+**Exclusive monitor** (`runtime/cpu.h`, `runtime/main.c`). `ldx`/`stx` emulated LDXR/STXR as a compare-and-swap on
+the value only. A STXR succeeded whenever memory held the value its LDXR read, even if other threads had changed it
+and changed it back in between (ABA). On the console another core's store-exclusive to that address clears the
+reservation. Now every 16-byte address bucket (hashed into a 65,536-entry table owned by the runtime and passed
+through `RtAPI.excl_mon`, appended so old DLLs are unaffected) has a sequence number. LDXR records it, and STXR holds
+the bucket (odd sequence) for its compare-and-swap and succeeds only if no other exclusive store hit the bucket since
+the LDXR. Plain stores and LSE atomics are not tracked, as in dynarmic. The helpers are inlined into the game code,
+so a game needs a recompile to get it.
+
+**Result.** Recompiled with the monitor (and `efa9b2a`), the scheduler off: `first frame request: QueuePresentTexture`
+at 3.9 s, `[vk] textures: 93 images, 214 MB`, `[vk] pacing: 30.00 FPS`, 1723 frames at 60 s, the Language Selection
+screen on screen. A second run: the same, 30 FPS from the start. The value-only LL/SC was the cause. The guest core
+scheduler is not needed for this game and stays opt-in.
+
 ## Switches and diagnostics
 
 | Switch | Effect |
 | --- | --- |
-| `SWR_CORE_SCHED=1` | turn on the experimental one-thread-per-core scheduler |
+| `SWR_CORE_SCHED=1` | turn on the experimental guest core scheduler (one thread per core, floating threads migrate) |
 | `SWR_CORE_SPIN_MS=n` | overtake a core holder after n ms without a blocking SVC (default 500) |
+| `SWR_CORE_PREEMPT=1` | also preempt worse priority holders in game code with SuspendThread (known to deadlock) |
+| cdb (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe -pv -p <pid> -c "~*kn 14; qd"`) | native stacks of a hung game without stopping it; resolve runtime offsets with `x86_64-w64-mingw32-nm -n bin/runtime_win64_win32.exe` (the runtime has a symbol table, no debug info; addr2line prints `??`) |
 | `start "" /affinity 1 "<Game>.exe"` | the whole game on one host CPU, the strongest serialization available |
 | `log=2` in the `.ini` | IPC commands, thread start/exit (`[thread N] starts at`, `exits`) |
 
@@ -138,21 +192,23 @@ Done on copies (`D:\Projects\plza-work` = the owner's build with swapped runtime
 game recompiled from the NUP with `efa9b2a`). The owner's build folder and the NUP were not modified.
 
 - `python -m unittest discover -s tests -p "test_n*.py"`: 17 tests OK.
-- Runtime builds (`switchrecomp.py --build-runtime --target win64 --backend win32`) with both commits.
-- Game results: see the experiment table above. None reaches rendering.
+- Runtime builds (`switchrecomp.py --build-runtime --target win64 --backend win32`).
+- Game: the experiments above. With the exclusive monitor (game recompiled in `D:\Projects\plza-build`), two runs
+  each rendered at 30 FPS (Language Selection screen, screenshot taken with PrintWindow).
+- The fixed build was then built with the engine CLI into the owner's library folder
+  (`...\SwitchRecomp Builds\Pokemon Legends Z-A Switch 2 Edition\`, same output name), seeded with the verified
+  build's generated C and objects so only changed chunks recompiled.
 
 ## Open items
 
-- Give `svcSleepThread(0/-1/-2)` real yield semantics in the scheduler: a FIFO ticket per priority, so the token
-  goes to the next thread of equal priority instead of back to the caller.
-- Find what thread 95's loop (`F_816F5C4`, `F_816F820`) waits for. If it is work from another core-0 thread, the
-  Switch would need that thread on another core or at a better priority. Check the core and priority the game asks
-  for at CreateThread / SetThreadCoreMask (the log shows the core after `-2` is resolved to the default core).
-- The later stall that also happens on one host CPU: main idles in the job scheduler (`9cfb804 -> F_9CFD6F0 ->
-  F_9CFE0F0`) on the pool condvar `344801858`. Inspect the per-core queues (`F_9CFD4F0`, `F_9CFC400`, scheduler
-  `+3104`) in a live run to see whether a job is queued while everyone sleeps.
-- Preemption on Linux (signal-based suspend) is not implemented.
-- `efa9b2a` changes the code of every game on its next recompile. Run Mario Kart World and Donkey Kong Bananza on
-  a recompile before merging.
-- Workaround for the owner until then: one host CPU (`/affinity 1`) gets past the black screen to a few frames but
-  stalls later. It's slow and not a fix.
+- **Garbled UI text.** On the Language Selection screen the language names are drawn as broken glyphs, while
+  the question line is clean (the title's look may be the game's own glitch style). Likely one of the bitmap (`.bffnt`) or Fontworks (`.bfotf`)
+  font paths, i.e. a texture format or glyph-cache upload; not investigated yet.
+- **Other games.** The monitor and `efa9b2a` change every game's generated code on its next recompile. Mario Kart
+  World and Donkey Kong Bananza should be recompiled and run before this is merged (not done here). The monitor adds
+  one atomic per STXR.
+- Plain stores and LSE atomics do not clear reservations (as in dynarmic). If another game loses updates with a
+  plain-store or LSE writer racing an LDXR/STXR pair, those would need to bump the bucket too.
+- Guest core scheduler (`SWR_CORE_SCHED`): not needed for PLZA; kept opt-in. Suspend-preemption deadlocked in
+  `NtSuspendThread` and is opt-in (`SWR_CORE_PREEMPT`); preemption on Linux is not implemented.
+- The old "one host CPU" workaround is no longer needed.
