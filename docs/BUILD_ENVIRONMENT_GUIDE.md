@@ -52,7 +52,6 @@ provides portable packages. Re-running setup is safe: already installed componen
 | `scripts\build-runtime.bat` | Builds `bin\runtime_win64_win32.exe` |
 | `scripts\build-from-nup.bat` | Recompiles a NUP for Windows and leaves its RomFS in the package |
 | `scripts\build-from-nsp.bat` | Recompiles a supported application NSP for Windows and leaves its RomFS in the package |
-| `scripts\build-launcher.bat [-QtPrefix path]` | Builds/tests the Qt desktop launcher and deploys Qt to `bin\launcher` |
 | `scripts/setup.sh` | Installs Linux dependencies |
 | `scripts/build-runtime.sh` | Builds `bin/runtime_linux_x11` |
 | `scripts/build-from-nup.sh` | Recompiles a NUP for Linux and leaves its RomFS in the package |
@@ -61,7 +60,7 @@ provides portable packages. Re-running setup is safe: already installed componen
 Every runnable script exits 0 on success and nonzero on failure. All arguments after the NUP path are passed to
 `switchrecomp.py`, including `-o`, `--outdir`, `-O`, `--jobs`, `--runtime`, and `--native`.
 
-For a desktop library that builds and launches games without per-game shortcuts, see [the Qt launcher guide](LAUNCHER.md).
+The Qt desktop library that builds and launches games lives in the separate RecompLauncher repository.
 
 ## 4. Build The Runtime
 

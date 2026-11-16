@@ -13,7 +13,8 @@ Rules of the project:
   distributable under AGPL v3.
 - New files written for this project keep the header `SwitchRecomp - Copyright 2026 MZ Labs` (AGPL v3 with NOTICE.txt).
 - Upstream lightweight packages stay under 20 MB and download tools through `Install.bat` / `Install.sh`.
-  This fork's all-in-one Windows/Linux releases bundle those tools and exceed that limit; see `docs/RELEASES.md`.
+  This fork's all-in-one Windows/Linux releases bundle those tools and exceed that limit; they are built from the
+  separate RecompLauncher repository.
 - A fix is not done until it is explained by a mechanism (log, trace or replay), not by trial and error.
 
 ---
@@ -76,18 +77,14 @@ change on a game, copy the new runtime over the game's executable** and keep the
 "Update all games" does that for every game. Windows Explorer sometimes renames the copy; check the name.
 
 Packaging (what the release has):
-The following describes the upstream lightweight layout. This fork's automated Qt bundles use
-`scripts/package-release.py` and the layout documented in `docs/RELEASES.md`.
+The following describes the upstream lightweight layout. This fork's Qt bundles are packaged by RecompLauncher.
 - Windows zip: the whole `SwitchRecomp` folder, without `gcc/`, `python/`, `games/*/*` and `__pycache__`.
 - Linux tar.gz: the Linux package folder (`SwitchRecomp` launcher script + `SwitchRecomp.bin`, `lib/`, `bin/`).
 - AppImage: the Linux package + `AppRun`, built with `mksquashfs -comp zstd` on top of an AppImage runtime.
 
 Regression checks (builds, unit tests, homebrew GPU tests, games) are in REGRESSION.md.
 
-For interpreter/library changes, run `.venv\Scripts\python.exe tests/test_python_selection.py -v` and
-`scripts\build-launcher.bat` (launcher-only build plus Qt core/UI tests). The launcher build requires CMake/Ninja
-already installed in the selected interpreter. It does not create or download a build environment.
-See `docs/LAUNCHER.md` for importing existing builds without recompiling the game.
+For interpreter/library changes, run `.venv\Scripts\python.exe tests/test_python_selection.py -v`.
 
 ---
 
