@@ -161,19 +161,24 @@ def digest(path):
 
 
 def dereference_symlinks(stage):
-    """Toolchain archives carry absolute symlinks (e.g. GCC's libgomp.so -> libgomp.so.1.0.0 recorded against
-    the toolchain's original build directory, which never exists on the packaging machine); a relocated bundle
-    cannot follow them, so replace every link with a copy of its target. When the recorded target is unreadable,
-    fall back to the versioned sibling carrying the same basename (standard SONAME layout)."""
+    """Toolchain archives carry absolute symlinks (e.g. GCC's libgomp.so recorded against the toolchain's
+    original build directory, which never exists on the packaging machine); a relocated bundle cannot follow
+    them, so replace every link with a copy of its target — falling back to the versioned sibling carrying the
+    same basename (standard SONAME layout). Links whose library is not shipped anywhere in the stage (e.g. the
+    dangling OpenMP dev link, unused by this build) are removed; anything else unresolvable is an error."""
+    names = {p.name for p in stage.rglob('*') if p.is_file()}
     for path in [p for p in stage.rglob('*') if p.is_symlink()]:
         target = Path(os.readlink(path))
         candidates = [target] if target.is_absolute() else [Path(os.path.normpath(path.parent / target))]
         candidates.append(path.parent / target.name)
         resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
-        if resolved is None:
+        if resolved is not None:
+            path.unlink(); shutil.copy2(resolved, path)
+        elif target.name not in names:
+            print('Removing dangling development symlink (library not shipped): ' + str(path.relative_to(stage)))
+            path.unlink()
+        else:
             raise RuntimeError('Non-relocatable symlink with unreadable target: ' + str(path.relative_to(stage)))
-        path.unlink()
-        shutil.copy2(resolved, path)
 
 
 def main():

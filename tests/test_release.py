@@ -150,7 +150,11 @@ class ReleaseChecks(unittest.TestCase):
         self.assertFalse((root / 'gcc/lib/gcc-ghost.so').is_symlink())
         self.assertEqual((root / 'gcc/lib/gcc-ghost.so').read_bytes(), b'ghost')
         package.validate_contents(root, 'linux')                   # the fixed tree now validates
-        (root / 'gcc/lib/broken.so').symlink_to(self.root / 'gone')
+        (root / 'gcc/lib/libopenmp.so').symlink_to(Path('/never/libopenmp.so'))  # dev link, library not shipped
+        package.dereference_symlinks(root)
+        self.assertFalse((root / 'gcc/lib/libopenmp.so').exists())  # dangling dev link removed
+        package.validate_contents(root, 'linux')
+        (root / 'gcc/lib/suspicious.so').symlink_to(self.root / 'missing-dir/NOTICE.txt')  # basename IS shipped
         with self.assertRaisesRegex(RuntimeError, 'unreadable target'): package.dereference_symlinks(root)
 
     def test_source_allowlist_includes_new_headers_but_not_personal_data(self):
