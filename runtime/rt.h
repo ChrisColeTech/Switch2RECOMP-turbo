@@ -37,6 +37,7 @@ typedef void (*PThreadFn)(void* arg);
 int  plat_thread(PThreadFn fn, void* arg, size_t stack);
 void plat_thread_low_priority(void);
 void plat_thread_exit(void);
+int  plat_thread_suspend(void* h, u64* pc); void plat_thread_resume(void* h); int plat_code_range(u64* lo, u64* hi);
 void* plat_thread_self(void); void plat_thread_forget(void* h); int plat_thread_pc(void* h, u64* pc); int plat_addr_module(u64 a, char* name, int n, u64* off); int plat_addr_base(u64 a, char* name, int n, u64* off);
 void plat_sleep_ns(i64 ns);
 void plat_yield(void);

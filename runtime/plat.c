@@ -339,6 +339,21 @@ int plat_thread_pc(void* h, u64* pc){ if(!h || SuspendThread((HANDLE)h)==(DWORD)
   CONTEXT cx; memset(&cx,0,sizeof cx); cx.ContextFlags=CONTEXT_CONTROL; int ok=GetThreadContext((HANDLE)h,&cx)!=0; ResumeThread((HANDLE)h);
   if(ok) *pc=cx.Rip; return ok; }
 
+/* preemption (kernel.c, one thread per core): stop a thread and give its pc, start it again. 0: it wasn't stopped */
+int plat_thread_suspend(void* h, u64* pc){ if(!h || SuspendThread((HANDLE)h)==(DWORD)-1) return 0;
+  CONTEXT cx; memset(&cx,0,sizeof cx); cx.ContextFlags=CONTEXT_CONTROL;
+  if(!GetThreadContext((HANDLE)h,&cx)){ ResumeThread((HANDLE)h); return 0; }
+  *pc=cx.Rip; return 1; }
+void plat_thread_resume(void* h){ if(h) ResumeThread((HANDLE)h); }
+
+/* the host addresses of the recompiled game code (the _code module): a thread stopped there holds no runtime lock */
+int plat_code_range(u64* lo, u64* hi){
+  if(!g_mod || !g_mod->nentries || !g_mod->entry_fn[0]) return 0;
+  HMODULE hm=NULL;
+  if(!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)(uintptr_t)g_mod->entry_fn[0],&hm) || !hm) return 0;
+  const IMAGE_DOS_HEADER* d=(const IMAGE_DOS_HEADER*)hm; const IMAGE_NT_HEADERS* nt=(const IMAGE_NT_HEADERS*)((const u8*)hm+d->e_lfanew);
+  *lo=(u64)(uintptr_t)hm; *hi=*lo+nt->OptionalHeader.SizeOfImage; return 1; }
+
 /* module name + offset from the module's base (gpu_profile.txt): same thing on Windows */
 int plat_addr_base(u64 a, char* name, int n, u64* off){ return plat_addr_module(a,name,n,off); }
 /* module name + offset of a host address */
@@ -625,6 +640,11 @@ static void samp_handler(int s, siginfo_t* si, void* uc){ (void)s; (void)si;
 void* plat_thread_self(void){ HostThread* h=malloc(sizeof *h); if(h) h->t=pthread_self(); return h; }
 
 void plat_thread_forget(void* h){ free(h); }
+
+/* no preemption here yet: one thread per core still holds, a better priority thread waits for the next SVC */
+int plat_thread_suspend(void* h, u64* pc){ (void)h; (void)pc; return 0; }
+void plat_thread_resume(void* h){ (void)h; }
+int plat_code_range(u64* lo, u64* hi){ (void)lo; (void)hi; return 0; }
 
 int plat_thread_pc(void* hv, u64* pc){ HostThread* h=hv; if(!h) return 0;
   pthread_mutex_lock(&g_samp_lk);
