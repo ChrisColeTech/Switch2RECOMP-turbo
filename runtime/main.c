@@ -124,7 +124,10 @@ static void rt_sev(void){}
 
 static void rt_wfe(CPU* c){ (void)c; plat_yield(); }
 
-const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe};
+/* the global exclusive monitor (cpu.h, ldx/stx): one sequence number per 16-byte address bucket */
+static u32 g_excl_mon[1u<<SWR_XM_BITS];
+
+const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe,g_excl_mon};
 
 /* ============================================================ system errors */
 void crash_report(void* host_pc, void* fault, int sig){

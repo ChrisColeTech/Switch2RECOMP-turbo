@@ -57,6 +57,8 @@ typedef struct RtAPI {
   void (*fpcr_changed)(struct CPU* c);
   void (*sev)(void);
   void (*wfe)(struct CPU* c);
+  /* appended (old games never read it): the global exclusive monitor, one sequence per address bucket, see ldx */
+  u32* excl_mon;
 } RtAPI;
 
 typedef struct CPU {
@@ -73,7 +75,7 @@ typedef struct CPU {
   const RtAPI* rt;
   void* thread;              /* owning HLE thread */
   int  depth;
-  u32  pad_;
+  u32  excl_seq;             /* the monitor bucket's sequence at the last LDXR (was padding) */
   u64  user[8];
 } CPU;
 
@@ -304,17 +306,42 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
 #define STLR_(T,a,v) __atomic_store_n((T*)MP(a),(T)(v),__ATOMIC_SEQ_CST)
 #define DMB_LD()     __atomic_thread_fence(__ATOMIC_ACQUIRE)
 #endif
+/* the exclusive monitor. LDXR/STXR used to be a compare-and-swap on the value alone: a STXR worked whenever memory
+   held the value its LDXR read, even if other threads had changed it and changed it back in between (ABA). on the
+   console another core's store-exclusive or atomic to that place clears the reservation and the STXR fails. lock-free
+   lists, job queues and reference counts built on LDXR/STXR lost updates that way when the game's threads really
+   ran at once (Pokemon Legends Z-A: resources whose dependency finished stayed unloaded, a black screen). now every
+   address bucket (16 bytes, hashed into the runtime's table) has a sequence number: LDXR remembers it, and STXR
+   succeeds only if no other exclusive store went to that bucket since, and the value still matches. a STXR holds the
+   bucket (odd sequence) for the length of its compare-and-swap. plain stores don't count, as with dynarmic.
+   an old runtime without the table leaves the value-only behavior */
+#define SWR_XM_BITS 16
+SWR_INLINE u32* swr_xm(CPU* c, u64 a){ u32* t=c->rt->excl_mon; return t? t+(((u32)(a>>4)*2654435761u)>>(32-SWR_XM_BITS)) : (u32*)0; }
+#if defined(__TINYC__)
+#define SWR_XM_LOAD(p)    (*(volatile u32*)(p))
+#define SWR_XM_STORE(p,v) do{ SWR_FENCE(); *(volatile u32*)(p)=(v); }while(0)
+#else
+#define SWR_XM_LOAD(p)    __atomic_load_n((p),__ATOMIC_ACQUIRE)
+#define SWR_XM_STORE(p,v) __atomic_store_n((p),(v),__ATOMIC_RELEASE)
+#endif
+SWR_INLINE void swr_xm_mark(CPU* c, u64 a){ u32* m=swr_xm(c,a); if(m){ u32 q; while((q=SWR_XM_LOAD(m))&1){} c->excl_seq=q; } }
+/* 1: the bucket is ours (unchanged since the LDXR), release it with swr_xm_end */
+SWR_INLINE u32 swr_xm_begin(CPU* c, u64 a){ u32* m=swr_xm(c,a); return !m || swr_cas32(m,c->excl_seq,c->excl_seq+1); }
+SWR_INLINE void swr_xm_end(CPU* c, u64 a, u32 stored){ u32* m=swr_xm(c,a); if(m) SWR_XM_STORE(m,stored? c->excl_seq+2 : c->excl_seq); }
+
 /* LDXR/LDAXR read with LDAR_: an LDAXR that only checks (a lock already taken, no STXR after it) must not let the
    compiler reuse older loads either */
 SWR_INLINE u64 ldx(CPU* c, u8* M, u64 a, u32 sz){
+  swr_xm_mark(c,a);
   u64 v; switch(sz){ case 0: v=LDAR_(u8,a); break; case 1: v=LDAR_(u16,a); break; case 2: v=LDAR_(u32,a); break; default: v=LDAR_(u64,a); }
   c->excl_addr=a; c->excl_val=v; c->excl_size=sz; c->excl_on=1; return v; }
 
 SWR_INLINE u32 stx(CPU* c, u8* M, u64 a, u32 sz, u64 v){
   u32 ok=0;
-  if(c->excl_on && c->excl_addr==a && c->excl_size==sz){
+  if(c->excl_on && c->excl_addr==a && c->excl_size==sz && swr_xm_begin(c,a)){
     switch(sz){ case 0: ok=swr_cas8((u8*)MP(a),(u8)c->excl_val,(u8)v); break; case 1: ok=swr_cas16((u16*)MP(a),(u16)c->excl_val,(u16)v); break;
       case 2: ok=swr_cas32((u32*)MP(a),(u32)c->excl_val,(u32)v); break; default: ok=swr_cas64((u64*)MP(a),c->excl_val,v); }
+    swr_xm_end(c,a,ok);
   }
   c->excl_on=0; return ok?0:1; }
 
@@ -348,15 +375,17 @@ SWR_INLINE void swr_casp(u8* M, u64 a, u32 sz, u64* e0, u64* e1, u64 n0, u64 n1)
     if(swr_cas128((u64*)MP(a),o0,o1,n0,n1)) return; } }
 
 SWR_INLINE void ldxp(CPU* c, u8* M, u64 a, u32 sz, u64* v1, u64* v2){
+  swr_xm_mark(c,a);
   if(sz==2){ u64 t=RD64(a); *v1=(u32)t; *v2=t>>32; c->excl_val=t; c->excl_val2=0; }
   else { *v1=RD64(a); *v2=RD64(a+8); c->excl_val=*v1; c->excl_val2=*v2; }
   c->excl_addr=a; c->excl_size=sz|0x10; c->excl_on=1; }
 
 SWR_INLINE u32 stxp(CPU* c, u8* M, u64 a, u32 sz, u64 v1, u64 v2){
   u32 ok=0;
-  if(c->excl_on && c->excl_addr==a && c->excl_size==(sz|0x10)){
+  if(c->excl_on && c->excl_addr==a && c->excl_size==(sz|0x10) && swr_xm_begin(c,a)){
     if(sz==2) ok=swr_cas64((u64*)MP(a),c->excl_val,(u32)v1|((u64)v2<<32));
     else ok=swr_cas128((u64*)MP(a),c->excl_val,c->excl_val2,v1,v2);
+    swr_xm_end(c,a,ok);
   }
   c->excl_on=0; return ok?0:1; }
 

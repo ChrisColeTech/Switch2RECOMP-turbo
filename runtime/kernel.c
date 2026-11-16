@@ -106,7 +106,7 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
   KThread* t=calloc(1,sizeof *t);
   t->o.type=KO_THREAD; t->o.is_signaled=th_sig; t->o.destroy=th_destroy; t->o.name="thread";
   t->entry=entry; t->arg=arg; t->stack_top=stack_top; t->prio=prio; t->core=core<0? 0 : core; t->ideal=t->core; t->affinity=1ull<<t->core;
-  t->tls=alloc_tls(); pc_init(&t->cv);
+  t->tls=alloc_tls(); pc_init(&t->cv); t->ct_core=-1; t->ct_grant=-1;
   pm_lock(&g_klock); t->id=g_next_tid++; if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
   CPU* c=&t->cpu; memset(c,0,sizeof *c);
   c->mem=g_mem; c->disp=g_disp; c->code_lo=g_code_lo; c->code_hi=g_code_hi; c->rt=&g_rtapi; c->thread=t;
@@ -116,96 +116,137 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
 
 void swr_fpcr_apply(CPU* c);
 
-/* one thread per core at a time (EXPERIMENT, off unless SWR_CORE_SCHED=1). Horizon runs one thread on a core at a
-   time, and a running thread only gives the core up when it blocks or a thread of better priority becomes ready (that
-   one preempts it). Pokemon Legends Z-A's job system has a work queue per core (picked with GetCurrentProcessorNumber)
-   whose owner side isn't atomic; here its core 0 threads run at once and it stalls at boot with a black screen (it
-   gets much further with the whole process on one host CPU). each guest core has a token, a thread runs game code only
-   while it holds its core's token. it gives it up in a blocking SVC, or to a thread of better priority: at its next
-   SVC, or right away if it is in game code (the host thread is suspended and resumed when the core is free for it
-   again, Windows). a holder that keeps the core for g_ct_spin_ns without a blocking SVC is overtaken (logged).
-   not finished: PLZA's boot loader thread polls for over 10 s on core 0 without blocking, so equal priority threads
-   of that core wait for the overtake; yields don't hand the core to equal priorities yet (no FIFO).
-   SWR_CORE_SPIN_MS sets the overtake time */
-#define CT_N 64
-#define CT_PRE 32
+/* guest cores like Horizon's (SWR_CORE_SCHED=1, experiment). on the switch a core runs one thread at a time: a thread
+   pinned to a core waits for it, a thread with no ideal core (ideal -1, a mask of several cores) runs on whichever
+   core of its mask is free, and GetCurrentProcessorNumber is the core it is on right now. a running thread keeps its
+   core until it blocks, yields, or a thread of better priority wants that core (it preempts it). games build per core
+   data on that: Pokemon Legends Z-A's job system keeps a work queue per core whose owner side isn't atomic. here
+   every floating thread used to say it was on core 0 and ran at the same time as main (pinned to core 0), so the
+   core 0 queue lost jobs and the game slept forever on a black screen.
+   each guest core has an owner. a thread runs game code only while it owns a core; it gives it up in a blocking SVC
+   (a yield puts it behind threads of the same priority), and at its next SVC when a better priority thread waits
+   for its core. on Windows a better priority waiter also takes the core at once from a holder that is in recompiled
+   code (the host thread is suspended, and resumed on the same core when that core is free for it). a holder that
+   keeps a core for g_ct_spin_ns without a blocking SVC is overtaken (logged), so a spin on another thread can't hang
+   the game. SWR_CORE_SPIN_MS sets that time */
+#define CT_NC 4
+#define CT_MAXW 256
 static i64 g_ct_spin_ns=500000000ll;
-typedef struct { PMutex m; PCond c; KThread* owner; int nw[64]; KThread* pre[CT_PRE]; int npre; } CoreTok;
-static CoreTok g_ct[CT_N];
+static PMutex g_ct_m; static PCond g_ct_c;
+static KThread* g_ct_owner[CT_NC];
+static KThread* g_ct_w[CT_MAXW]; static int g_ct_nw;   /* threads waiting for a core (preempted ones too) */
+static volatile int g_ct_nwait;                         /* g_ct_nw, read without the lock */
+static u64 g_ct_tick, g_ct_npre;
+static u64 g_ct_say[3]; static volatile int g_ct_say_pre;
+static void ct_say(void){ if(g_ct_say_pre && __atomic_exchange_n(&g_ct_say_pre,0,__ATOMIC_ACQ_REL))
+  LOG("kernel: thread %llu preempted thread %llu on core %d (better priority, like the switch)\n",(unsigned long long)g_ct_say[0],(unsigned long long)g_ct_say[1],(int)g_ct_say[2]); }
 static int g_ct_on=-1;
-static u64 g_ct_npre;
-static __thread int tls_ct=-1;   /* the core whose token this thread holds; -1 none, -2 running past a holder */
+static u64 g_ct_lo, g_ct_hi; static int g_ct_range=-1;
 
 static int ct_on(void){
-  if(g_ct_on<0){ const char* on=getenv("SWR_CORE_SCHED"); g_ct_on= on && atoi(on)>0; { const char* e=getenv("SWR_CORE_SPIN_MS"); if(e && atoi(e)>0) g_ct_spin_ns=(i64)atoi(e)*1000000; }
-    if(g_ct_on) LOG("kernel: one thread per core at a time, like the switch (SWR_CORE_SCHED, experiment)\n"); }
+  if(g_ct_on<0){ const char* on=getenv("SWR_CORE_SCHED"); g_ct_on= on && atoi(on)>0;
+    { const char* e=getenv("SWR_CORE_SPIN_MS"); if(e && atoi(e)>0) g_ct_spin_ns=(i64)atoi(e)*1000000; }
+    if(g_ct_on){ { const char* pe=getenv("SWR_CORE_PREEMPT"); g_ct_range= pe && atoi(pe)>0? plat_code_range(&g_ct_lo,&g_ct_hi) : 0; }
+      LOG("kernel: guest cores scheduled like the switch, one thread per core (SWR_CORE_SCHED, experiment)%s\n",g_ct_range>0? ", preemption by suspending (SWR_CORE_PREEMPT)" : ""); } }
   return g_ct_on; }
 static int ct_prio(KThread* t){ return t->prio<0? 0 : t->prio>63? 63 : t->prio; }
-static int ct_better_nl(CoreTok* k, int prio){ for(int p=0;p<prio;p++) if(__atomic_load_n(&k->nw[p],__ATOMIC_RELAXED)) return 1; return 0; }
-static int ct_best_wait_nl(CoreTok* k){ for(int p=0;p<64;p++) if(k->nw[p]) return p; return 64; }
-static int ct_best_pre_nl(CoreTok* k){ int b=64; for(int i=0;i<k->npre;i++){ int p=ct_prio(k->pre[i]); if(p<b) b=p; } return b; }
+static u32 ct_mask(KThread* t){ u32 m=(u32)t->affinity&((1u<<CT_NC)-1); return m? m : 1u<<(t->core&(CT_NC-1)); }
+static int ct_pref(KThread* t){ return t->ideal>=0 && t->ideal<CT_NC? t->ideal : (t->core&(CT_NC-1)); }   /* its ideal core, else the last one */
+/* a before b in line: better priority, then a preempted thread (it was running), then first come */
+static int ct_before(KThread* a, KThread* b){ int pa=ct_prio(a), pb=ct_prio(b); if(pa!=pb) return pa<pb; if(a->ct_pre!=b->ct_pre) return a->ct_pre; return a->ct_ticket<b->ct_ticket; }
 
-static u64 g_ct_lo, g_ct_hi; static int g_ct_range=-1;
-static int ct_in_code(u64 pc){ if(g_ct_range<0) g_ct_range=plat_code_range(&g_ct_lo,&g_ct_hi); return g_ct_range>0 && pc>=g_ct_lo && pc<g_ct_hi; }
+/* the range is looked up in ct_on, at the first thread start: never after a suspend, the stopped thread could hold
+   the loader lock that GetModuleHandleEx takes */
+static int ct_in_code(u64 pc){ return g_ct_range>0 && pc>=g_ct_lo && pc<g_ct_hi; }
 
-/* a free core goes back to the thread it was taken from when nobody better waits (it was running: first among equals) */
-static void ct_handoff_nl(CoreTok* k){
-  if(k->owner || !k->npre) return;
-  int bi=0; for(int i=1;i<k->npre;i++) if(ct_prio(k->pre[i])<ct_prio(k->pre[bi])) bi=i;
-  if(ct_prio(k->pre[bi])>ct_best_wait_nl(k)) return;
-  KThread* p=k->pre[bi]; for(int i=bi;i+1<k->npre;i++) k->pre[i]=k->pre[i+1]; k->npre--;
-  k->owner=p; plat_thread_resume(p->host); }
+static void ct_wdel_nl(KThread* t){ for(int i=0;i<g_ct_nw;i++) if(g_ct_w[i]==t){ g_ct_w[i]=g_ct_w[--g_ct_nw]; break; } t->ct_waiting=0; g_ct_nwait=g_ct_nw; }
 
-/* the holder has worse priority: stop it if it is in game code (never in the runtime, it could hold a lock there) */
-static int ct_preempt_nl(CoreTok* k, KThread* t, int pr){
-  KThread* o=k->owner; u64 pc=0;
-  if(!o || ct_prio(o)<=pr || k->npre>=CT_PRE || !o->host || !plat_thread_suspend(o->host,&pc)) return 0;
-  if(!ct_in_code(pc)){ plat_thread_resume(o->host); return 0; }
-  k->pre[k->npre++]=o; k->owner=NULL;
-  if(!g_ct_npre++) LOG("kernel: thread %llu preempted thread %llu on core %d (better priority, like the switch)\n",(unsigned long long)t->id,(unsigned long long)o->id,(int)(k-g_ct));
-  return 1; }
+static void ct_grant_nl(KThread* w, int core){
+  ct_wdel_nl(w); g_ct_owner[core]=w; w->ct_grant=core; w->core=core;
+  if(w->ct_pre){ w->ct_pre=0; w->ct_core=core; plat_thread_resume(w->host); } }
+
+/* hand free cores to the waiting threads, best first; preempt worse priority holders in game code */
+static void ct_schedule_nl(void){
+  for(int pass=0;pass<CT_MAXW && g_ct_nw;pass++){
+    int done=1;
+    /* waiters in line order */
+    KThread* order[CT_MAXW]; int n=g_ct_nw; memcpy(order,g_ct_w,sizeof(KThread*)*n);
+    for(int i=1;i<n;i++){ KThread* x=order[i]; int j=i; while(j>0 && ct_before(x,order[j-1])){ order[j]=order[j-1]; j--; } order[j]=x; }
+    for(int i=0;i<n;i++){ KThread* w=order[i]; u32 m=ct_mask(w);
+      if(w->ct_pre) m=1u<<w->ct_core;                     /* a preempted thread goes back where it was */
+      int pick=-1;
+      { int pf= w->ct_pre? w->ct_core : ct_pref(w); if((m>>pf&1) && !g_ct_owner[pf]) pick=pf; }
+      for(int k=0;k<CT_NC && pick<0;k++) if((m>>k&1) && !g_ct_owner[k]) pick=k;
+      if(pick>=0){ ct_grant_nl(w,pick); done=0; break; }
+      /* no free core of its own: a holder that may also run on a free core moves there (it keeps running, like a
+         migration on the switch) and w gets its core */
+      for(int k=0;k<CT_NC && pick<0;k++){ KThread* o=g_ct_owner[k]; if(!(m>>k&1) || !o || o->ct_pre || o->ct_core!=k) continue;
+        u32 om=ct_mask(o); for(int f=0;f<CT_NC;f++) if(f!=k && (om>>f&1) && !g_ct_owner[f]){ g_ct_owner[f]=o; o->core=f; o->ct_core=f; g_ct_owner[k]=NULL; pick=k; break; } }
+      if(pick>=0){ ct_grant_nl(w,pick); done=0; break; }
+      /* no free core: the worst priority holder of its cores, if worse than w and in game code, is preempted */
+      int victim=-1;
+      for(int k=0;k<CT_NC;k++) if((m>>k&1) && g_ct_owner[k] && ct_prio(g_ct_owner[k])>ct_prio(w) && !g_ct_owner[k]->ct_pre && g_ct_owner[k]->host)
+        if(victim<0 || ct_prio(g_ct_owner[k])>ct_prio(g_ct_owner[victim])) victim=k;
+      if(victim>=0 && g_ct_range>0 && g_ct_nw<CT_MAXW){ KThread* o=g_ct_owner[victim]; u64 pc=0;
+        if(plat_thread_suspend(o->host,&pc)){
+          if(ct_in_code(pc)){
+            o->ct_pre=1; o->ct_core=victim; o->ct_ticket=0; o->ct_waiting=1; g_ct_w[g_ct_nw++]=o; g_ct_nwait=g_ct_nw; g_ct_owner[victim]=NULL;
+            if(!g_ct_npre++){ g_ct_say[0]=w->id; g_ct_say[1]=o->id; g_ct_say[2]=(u64)victim; g_ct_say_pre=1; }   /* logged after the lock */
+            ct_grant_nl(w,victim); done=0; break; }
+          plat_thread_resume(o->host); } }
+    }
+    if(done) break;
+  }
+  pc_broadcast(&g_ct_c); }
 
 static void ct_acquire(KThread* t){
-  int core=t->core&(CT_N-1), pr=ct_prio(t); CoreTok* k=&g_ct[core];
-  pm_lock(&k->m);
-  k->nw[pr]++;
+  pm_lock(&g_ct_m);
+  t->ct_grant=-1; t->ct_pre=0; t->ct_ticket=++g_ct_tick; t->ct_waiting=1;
+  if(g_ct_nw<CT_MAXW){ g_ct_w[g_ct_nw++]=t; g_ct_nwait=g_ct_nw; }
   u64 t0=plat_ns(); int over=0;
   for(;;){
-    ct_handoff_nl(k);
-    if(!k->owner && !ct_better_nl(k,pr) && ct_best_pre_nl(k)>pr) break;
-    if(ct_preempt_nl(k,t,pr)) continue;
+    ct_schedule_nl();
+    if(t->ct_grant>=0) break;
     i64 left=g_ct_spin_ns-(i64)(plat_ns()-t0);
     if(left<=0){ over=1; break; }
-    /* a worse priority holder that was in the runtime is tried again in 1 ms */
-    i64 w= k->owner && ct_prio(k->owner)>pr? 1000000 : left;
-    pc_wait(&k->c,&k->m,w<left? w : left);
+    pc_wait(&g_ct_c,&g_ct_m,left<1000000? left : 1000000);   /* 1 ms: a holder that was in the runtime can be preempted now */
   }
-  k->nw[pr]--;
-  if(over){ tls_ct=-2; static int n; if(n++<10 || !(n&1023)) WARN("kernel: thread %llu ran past thread %llu, which kept core %d for %.1f s without an SVC [%d times]\n",
-      (unsigned long long)t->id,(unsigned long long)(k->owner? k->owner->id : 0),core,(double)g_ct_spin_ns/1e9,n); }
-  else { k->owner=t; tls_ct=core; }
-  pm_unlock(&k->m); }
+  u64 past=0; static int n_over;
+  if(over){ ct_wdel_nl(t); t->ct_core=-2; u32 m=ct_mask(t); for(int k=0;k<CT_NC;k++) if((m>>k&1) && g_ct_owner[k]){ past=g_ct_owner[k]->id; break; } n_over++; }
+  else t->ct_core=t->ct_grant;
+  pm_unlock(&g_ct_m);
+  ct_say();
+  /* never log under g_ct_m: the stall dump logs under the log lock and takes g_ct_m */
+  if(over && (n_over<=10 || !(n_over&1023))) WARN("kernel: thread %llu ran past thread %llu, which kept the core for %.1f s without blocking [%d times]\n",(unsigned long long)t->id,(unsigned long long)past,(double)g_ct_spin_ns/1e9,n_over); }
 
-static void ct_release(void){
-  if(tls_ct==-2){ tls_ct=-1; return; }
-  if(tls_ct<0) return;
-  CoreTok* k=&g_ct[tls_ct]; tls_ct=-1;
-  pm_lock(&k->m); k->owner=NULL; ct_handoff_nl(k); pc_broadcast(&k->c); pm_unlock(&k->m); }
+static void ct_release_t(KThread* t){
+  if(!t) return;
+  if(t->ct_core==-2){ t->ct_core=-1; return; }
+  if(t->ct_core<0) return;
+  pm_lock(&g_ct_m);
+  if(g_ct_owner[t->ct_core]==t) g_ct_owner[t->ct_core]=NULL;
+  t->ct_core=-1; ct_schedule_nl();
+  pm_unlock(&g_ct_m); ct_say(); }
+static void ct_release(void){ ct_release_t(kthread_cur()); }
 
-/* after an SVC and at thread start: take the core, give it to a better priority thread that waits for it, or follow
-   the thread to the core it was moved to */
+/* after an SVC and at thread start: take a core, give it to a better priority thread waiting for it, or move when the
+   thread's mask no longer has its core */
 static void ct_check(KThread* t){
   if(!t || !ct_on()) return;
-  int core=t->core&(CT_N-1);
-  if(tls_ct>=0 && tls_ct==core && !ct_better_nl(&g_ct[core],ct_prio(t))) return;
-  ct_release(); ct_acquire(t); }
+  if(t->ct_core>=0 && (ct_mask(t)>>t->ct_core&1)){
+    if(!g_ct_nwait) return;
+    int yield=0; pm_lock(&g_ct_m);
+    for(int i=0;i<g_ct_nw;i++){ KThread* w=g_ct_w[i]; u32 m= w->ct_pre? 1u<<w->ct_core : ct_mask(w); if((m>>t->ct_core&1) && ct_prio(w)<ct_prio(t)){ yield=1; break; } }
+    pm_unlock(&g_ct_m);
+    if(!yield) return; }
+  ct_release_t(t); ct_acquire(t); }
 
-/* the SVCs that can block: the core goes to another thread meanwhile */
+/* the SVCs that can block: the core goes to another thread meanwhile (0x0B with 0/-1/-2 is a yield) */
 static int ct_blocking(u32 imm){
   switch(imm){ case 0x0A: case 0x0B: case 0x18: case 0x1A: case 0x1C: case 0x21: case 0x22: case 0x23: case 0x34: case 0x43: case 0x44: return 1; }
   return 0; }
 
-static void kernel_core_init(void){ for(int i=0;i<CT_N;i++){ pm_init(&g_ct[i].m); pc_init(&g_ct[i].c); } }
+static void kernel_core_init(void){ pm_init(&g_ct_m); pc_init(&g_ct_c); }
 
 static void thread_body(void* p){
   KThread* t=p; kthread_set(t); CPU* c=&t->cpu;
@@ -913,7 +954,7 @@ static void swr_svc_(CPU* c, u32 imm){
     KThread* n=kthread_create(x[1],x[2],x[3],prio,core);
     u32 h=h_new(&n->o); x[0]=0; x[1]=h;
     if((g_title_id>>56)==0x04){ static int nl; if(nl<sw2_cap(8)){ nl++; LOG("thread %llu created: entry %llx prio %d core %d (lr %llx)\n",(unsigned long long)n->id,(unsigned long long)n->cpu.pc,prio,core,(unsigned long long)c->x[30]); } }
-    else LOGV("CreateThread entry=%llx stack=%llx prio=%d core=%d -> %x\n",(unsigned long long)x[1],(unsigned long long)n->stack_top,prio,core,h);
+    else LOGV("CreateThread entry=%llx stack=%llx prio=%d core=%d (asked %d) -> %x thread %llu\n",(unsigned long long)x[1],(unsigned long long)n->stack_top,prio,core,(int)(i32)(u32)x[5],h,(unsigned long long)n->id);
     return; }
   case 0x09: { KThread* n=(KThread*)h_get_type((u32)x[0],KO_THREAD); if(!n){ x[0]=R_BADHANDLE; return; }
     if((g_title_id>>56)==0x04){ static int nl; if(nl<sw2_cap(8)){ nl++; LOG("thread %llu started (lr %llx)\n",(unsigned long long)n->id,(unsigned long long)c->x[30]); } }
@@ -933,6 +974,7 @@ static void swr_svc_(CPU* c, u32 imm){
     if(mask) n->affinity=mask;
     n->ideal=core;
     if(core>=0) n->core=core; else if(!(n->affinity>>n->core&1)) n->core=63-__builtin_clzll(n->affinity);
+    LOGV("SetThreadCoreMask thread %llu ideal %d mask %llx -> core %d\n",(unsigned long long)n->id,(int)(i32)(u32)x[1],(unsigned long long)x[2],n->core);
     x[0]=0; return; }
   case 0x10: x[0]=(u32)(t? t->core : 0); return;
   case 0x11: { KEvent* e=(KEvent*)h_get_type((u32)x[0],KO_EVENT); if(!e){ x[0]=R_BADHANDLE; return; } kevent_signal(e); x[0]=0; return; }
@@ -1066,9 +1108,15 @@ void kernel_dump_threads_stall(void){ extern void gpu_gl_stall_report(void); gpu
 void kernel_dump_threads(void){
   static const char* kinds[]={"running/in svc","objects","mutex","condvar","address"};
   LOG("---- game thread state ----\n");
+  if(g_ct_on>0){ u64 own[CT_NC], wid[64]; int wpr[64], wpre[64], nw=0;   /* read without the lock: a stuck scheduler still shows */
+    for(int k=0;k<CT_NC;k++){ KThread* o=g_ct_owner[k]; own[k]= o? o->id : 0; }
+    for(int i=0;i<g_ct_nw && nw<64;i++){ KThread* w=g_ct_w[i]; if(!w) continue; wid[nw]=w->id; wpr[nw]=w->prio; wpre[nw]=w->ct_pre; nw++; }
+    LOG("cores (SWR_CORE_SCHED):"); for(int k=0;k<CT_NC;k++) LOG(" %d=%llu",k,(unsigned long long)own[k]);
+    LOG(" | waiting:"); for(int i=0;i<nw;i++) LOG(" %llu(p%d%s)",(unsigned long long)wid[i],wpr[i],wpre[i]? " preempted" : "");
+    LOG("\n"); }
   for(int i=0;i<g_nthreads;i++){ KThread* t=g_threads[i]; if(!t || t->state==2) continue;
     int k=t->wait_kind; if(k<0||k>4) k=0;
-    LOG("thread %llu '%s' prio %d core %d: %s", (unsigned long long)t->id, t->name, t->prio, t->core, kinds[k]);
+    LOG("thread %llu '%s' prio %d core %d (ideal %d mask %llx): %s", (unsigned long long)t->id, t->name, t->prio, t->core, t->ideal, (unsigned long long)t->affinity, kinds[k]);
     if(k==1) LOG(" [%s%s]", t->wait_name? t->wait_name : "?", t->wait_timeout<0? "" : " with timeout");
     if(k>=2){ u32 wv=gr32(t->wait_addr); LOG(" [addr %llx value %x]", (unsigned long long)t->wait_addr, wv);
       if(k==2){ KObj* ow=h_get(wv&~0x40000000u); if(ow && ow->type==KO_THREAD) LOG(" owner thread %llu", (unsigned long long)((KThread*)ow)->id); } }

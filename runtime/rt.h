@@ -184,6 +184,8 @@ struct KThread {
   u64 sleep_lr, sleep_n, sleep_x[31];   /* for threads.txt: catches SleepThread polling loops */
   struct { u32 imm, res, n, h0; u64 lr, a[4]; } svc_hist[24]; u32 svc_hist_n;   /* threads.txt: this thread's last SVCs */
   void* host;                  /* host thread handle: the stall dump samples where it runs */
+  /* SWR_CORE_SCHED (kernel.c): the guest core this thread holds (-1 none), the one it was handed, its place in line */
+  int ct_core, ct_grant, ct_waiting, ct_pre; u64 ct_ticket;
 };
 
 typedef struct KShmem { KObj o; u64 size; u8* host; u64 gaddr; u32 perm; } KShmem;
