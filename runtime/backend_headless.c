@@ -21,6 +21,7 @@ int video_has_gl(void){ return 0; }
 void backend_vibration_set(float low,float high){ (void)low; (void)high; }
 void backend_vibration_stop(void){}
 void hid_vibration_flush(void){}
+void backend_controller_shutdown(void){}
 
 void video_init(const char* t){ (void)t; pm_init(&g_hl); g_start=plat_ns(); }
 

@@ -95,14 +95,20 @@ static BOOL CALLBACK vibration_init(PINIT_ONCE once,PVOID arg,PVOID* ctx){
   (void)once; (void)arg; (void)ctx; InitializeCriticalSection(&g_vib_lock); return TRUE;
 }
 static void vibration_lock(void){ InitOnceExecuteOnce(&g_vib_once,vibration_init,NULL,NULL); EnterCriticalSection(&g_vib_lock); }
-static void controllers_shutdown(void){
-  vibration_lock(); g_controller_shutdown=1; g_vib_accept=0;
+static void controllers_shutdown_locked(void){
+  g_controller_shutdown=1; g_vib_accept=0;
   sony_close(&g_sony);
   if(xset && g_xuser!=(DWORD)~0){ XVIB v={0}; xset(g_xuser,&v); }
-  g_xuser=(DWORD)~0; g_vib_left=g_vib_right=0; LeaveCriticalSection(&g_vib_lock);
+  g_xuser=(DWORD)~0; g_vib_left=g_vib_right=0;
 }
-/* renderer-owned immediate exits can call this before ExitProcess/TerminateProcess. */
-void backend_controller_shutdown(void){ controllers_shutdown(); }
+static void controllers_shutdown(void){ vibration_lock(); controllers_shutdown_locked(); LeaveCriticalSection(&g_vib_lock); }
+/* immediate exits outside the window thread (fatal(), the NVN renderer's die/exit paths, the crash handler) call this
+   before _exit/ExitProcess/TerminateProcess, which skip atexit. bounded: if another thread holds the controller lock
+   (possibly the crashing one) it gives up after ~200 ms instead of hanging the exit. */
+void backend_controller_shutdown(void){
+  InitOnceExecuteOnce(&g_vib_once,vibration_init,NULL,NULL);
+  for(int i=0;i<200;i++){ if(TryEnterCriticalSection(&g_vib_lock)){ controllers_shutdown_locked(); LeaveCriticalSection(&g_vib_lock); return; } Sleep(1); }
+}
 
 static void xinput_load(void){
   vibration_lock(); LeaveCriticalSection(&g_vib_lock); atexit(controllers_shutdown);
@@ -135,7 +141,10 @@ void hid_vibration_flush(void){
   XVIB v; v.wLeftMotorSpeed=g_vib_left; v.wRightMotorSpeed=g_vib_right;
   u64 now=plat_ns();
   if((v.wLeftMotorSpeed || v.wRightMotorSpeed) && now-g_vib_last<15000000ull) { InterlockedExchange(&g_vib_dirty,1); LeaveCriticalSection(&g_vib_lock); return; }
-  if(g_sony.h && !g_sony.output_failed) sony_write(&g_sony,v.wLeftMotorSpeed>>8,v.wRightMotorSpeed>>8,1,0);
+  static int unrouted;
+  if(g_sony.h && g_sony.writable && !g_sony.output_failed) sony_write(&g_sony,v.wLeftMotorSpeed>>8,v.wRightMotorSpeed>>8,1,0);
+  else if(g_sony.h){ if((v.wLeftMotorSpeed || v.wRightMotorSpeed) && unrouted++<4)
+      LOG("controllers: rumble low=%u high=%u dropped: the Sony controller is %s\n",v.wLeftMotorSpeed,v.wRightMotorSpeed,g_sony.writable?"in output-error state":"open read-only"); }
   else if(xset && g_xuser!=(DWORD)~0){
     DWORD r=xset(g_xuser,&v); static int errors;
     if(r && errors++<8) LOG("controllers: XInput output failed user=%lu error=%lu\n",(unsigned long)g_xuser,(unsigned long)r);
@@ -601,6 +610,16 @@ void video_poll(void){
     if(xset && g_xuser!=(DWORD)~0){ XVIB zero={0}; xset(g_xuser,&zero); }
     g_xuser=user; g_vib_left=g_vib_right=0; InterlockedExchange(&g_vib_dirty,1);
   }
+  { /* SWR_CONTROLLER_SELFTEST=1: once a rumble-capable pad is active, low motor then high motor for 0.5 s each.
+       goes through the same flush/throttle/device-write path as the game's HID vibration requests. */
+    static int selftest=-1; static u64 start;
+    if(selftest<0) selftest=getenv("SWR_CONTROLLER_SELFTEST") && atoi(getenv("SWR_CONTROLLER_SELFTEST"));
+    if(selftest && pad_active && (source==1 || (source==3 && g_sony.writable))){
+      u64 now=plat_ns(); if(!start){ start=now; LOG("controllers: self-test: lights on, low motor 0.5 s, high motor 0.5 s, stop\n"); }
+      WORD l=0,r=0; u64 t=now-start;
+      if(t<500000000ull) l=0x8000; else if(t<1000000000ull) r=0x8000; else { selftest=0; LOG("controllers: self-test finished\n"); }
+      if(l!=g_vib_left || r!=g_vib_right){ g_vib_left=l; g_vib_right=r; InterlockedExchange(&g_vib_dirty,1); }
+    } }
   if(!pad_active) backend_vibration_stop();
   if(pad_active) pad_source(source);
   hid_vibration_flush();

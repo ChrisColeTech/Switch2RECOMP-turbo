@@ -3,8 +3,9 @@
 # Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
 """Isolated production controller tests and optional HID probe. Never builds/launches the runtime.
 
-.venv/Scripts/python tests/test_controllers.py [--device | --pulse]
+.venv/Scripts/python tests/test_controllers.py [--device | --pulse | --rumble]
 Evidence stays in a unique build/controllers-* directory. --device is shared read-only.
+--rumble drives the connected pad's lights and both motors for about 5 s (the owner's physical check).
 """
 import argparse
 import ctypes as C
@@ -25,9 +26,10 @@ def main():
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument('--device', action='store_true')
     mode.add_argument('--pulse', action='store_true')
+    mode.add_argument('--rumble', action='store_true')
     args = ap.parse_args()
     out = ROOT / 'build' / ('controllers-' + time.strftime('%Y%m%d-%H%M%S-') + str(time.time_ns() % 1000000000))
-    out.mkdir()
+    out.mkdir(parents=True)
     env = P.env_with_gcc()
     cc = P.gcc_tool('gcc')
     log = []
@@ -45,12 +47,19 @@ def main():
         run([cc, '-std=gnu11', '-fsyntax-only', '-Werror=implicit-function-declaration', ROOT / 'runtime' / file])
     exe = out / 'controller_device.exe'
     run([cc, '-std=gnu11', '-O2', ROOT / 'tests/controller_device.c', '-o', exe])
-    if args.device or args.pulse:
-        run([exe] + (['--pulse'] if args.pulse else []))
+    if args.device or args.pulse or args.rumble:
+        run([exe] + (['--pulse'] if args.pulse else ['--rumble'] if args.rumble else []))
         return
+    # regression (2026-11-16): the output open must share write access. Denying FILE_SHARE_WRITE fails with
+    # ERROR_SHARING_VIOLATION whenever any other handle on the pad can write, which left the owner's DualSense
+    # read-only (no lights, no rumble) in every session. --device/--rumble prove the real open.
+    win32 = (ROOT / 'runtime/controller_sony_win32.h').read_text()
+    assert 'GENERIC_READ|(output?GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE' in win32
     wrapper = out / 'protocol.c'
     wrapper.write_text('''#include "controller_sony.h"
 __declspec(dllexport) size_t packet(int m,int t,unsigned seq,unsigned l,unsigned h,int lit,int reset,uint8_t* p,size_t n){return sony_output(m,t,seq,l,h,lit,reset,p,n);}
+__declspec(dllexport) size_t packet_v(int m,int t,unsigned seq,unsigned l,unsigned h,int lit,int reset,int v2,uint8_t* p,size_t n){return sony_output_v(m,t,seq,l,h,lit,reset,v2,p,n);}
+__declspec(dllexport) int vib_v2(unsigned pid,const uint8_t* f,size_t n){return sony_vibration_v2(pid,f,n);}
 __declspec(dllexport) int input(int m,int t,const uint8_t* p,size_t n,SonyState* s){return sony_input(m,t,p,n,s);}
 __declspec(dllexport) int model(unsigned v,unsigned p){return sony_model(v,p);}
 __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_transport(m,i,o);}
@@ -63,6 +72,17 @@ __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_tra
         _fields_ = [('buttons', C.c_uint64)] + [(v, C.c_int32) for v in ('lx', 'ly', 'rx', 'ry')]
     lib.packet.argtypes = [C.c_int, C.c_int] + [C.c_uint]*3 + [C.c_int]*2 + [C.POINTER(byte), C.c_size_t]
     lib.packet.restype = C.c_size_t
+    lib.packet_v.argtypes = [C.c_int, C.c_int] + [C.c_uint]*3 + [C.c_int]*3 + [C.POINTER(byte), C.c_size_t]
+    lib.packet_v.restype = C.c_size_t
+    lib.vib_v2.argtypes = [C.c_uint, C.POINTER(byte), C.c_size_t]
+    def fw(version, rid=0x20, n=64):
+        f = bytearray(n); f[0] = rid
+        if n >= 46: f[44:46] = version.to_bytes(2, 'little')
+        return (byte*n).from_buffer_copy(f), n
+    # DualSense firmware feature 0x20: update version at 44 (Linux hid-playstation: v2 from 2.21, Edge always)
+    assert lib.vib_v2(0xce6, *fw(0x0214)) == 0 and lib.vib_v2(0xce6, *fw(0x0215)) == 1 and lib.vib_v2(0xce6, *fw(0x0630)) == 1
+    assert lib.vib_v2(0xdf2, *fw(0x0100)) == 1
+    assert lib.vib_v2(0xce6, None, 0) == 1 and lib.vib_v2(0xce6, *fw(0x0100, rid=0x21)) == 1 and lib.vib_v2(0xce6, *fw(0x0100, n=40)) == 1
     lib.input.argtypes = [C.c_int, C.c_int, C.POINTER(byte), C.c_size_t, C.POINTER(State)]
     for vid, pid, expected in ((0x54c, 0xce6, 5), (0x54c, 0xdf2, 5), (0x54c, 0x5c4, 4), (0x54c, 0x9cc, 4), (1, 0xce6, 0), (0x54c, 1, 0)):
         assert lib.model(vid, pid) == expected
@@ -89,6 +109,13 @@ __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_tra
                     if bus == 2: assert p[1] == 0xc4
                 if bus == 2:
                     assert int.from_bytes(bytes(p)[74:78], 'little') == zlib.crc32(b'\xa2' + bytes(p)[:74])
+            # v2 rumble: same packet plus valid_flag2 COMPATIBLE_VIBRATION2 (0x04) at common offset 38 on DualSense only
+            q = (byte*80)()
+            assert lib.packet_v(model, bus, 3, 999, 16, 1, 0, 1, q, 80) == n and lib.packet_v(model, bus, 3, 999, 16, 1, 0, 0, p, 80) == n
+            diff = [i for i in range(n) if p[i] != q[i]]
+            assert diff == ([off+38] + ([74, 75, 76, 77] if bus == 2 else []) if model == 5 else []), diff
+            if model == 5: assert q[off+38] == 4 and q[off] == 3
+            if bus == 2: assert int.from_bytes(bytes(q)[74:78], 'little') == zlib.crc32(bytes([0xa2]) + bytes(q)[:74])
             assert lib.packet(model, bus, 0, 0, 0, 0, 0, p, 80) == n
             assert p[off+(2 if model == 5 else 3)] == p[off+(3 if model == 5 else 4)] == 0
             if model == 5:
@@ -131,7 +158,7 @@ __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_tra
                 if bus == 2 and not simple:
                     corrupt = (byte*78).from_buffer_copy(raw); corrupt[74] ^= 1
                     assert not lib.input(model, bus, corrupt, 78, C.byref(State()))
-    print('PASS production Sony model/transport, button/hat/axis fixtures, packet bounds, motor stop, lights, Bluetooth sequence and independent zlib CRC')
+    print('PASS production Sony model/transport, button/hat/axis fixtures, packet bounds, motor stop, lights, DualSense rumble v1/v2 + firmware gate, Bluetooth sequence and independent zlib CRC')
     log.append('PASS Sony protocol fixtures (synthetic, not physical button validation)\n')
     svc_exe = out / 'controller_service.exe'
     run([cc, '-std=gnu11', '-O1', '-ffunction-sections', '-fdata-sections', ROOT / 'tests/controller_service.c', '-Wl,--gc-sections', '-o', svc_exe])

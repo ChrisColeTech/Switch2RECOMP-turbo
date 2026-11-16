@@ -25,6 +25,7 @@ extern int g_opt_fps;
 void backend_vibration_set(float low,float high){ (void)low; (void)high; }
 void backend_vibration_stop(void){}
 void hid_vibration_flush(void){}
+void backend_controller_shutdown(void){}
 
 void backend_ini(const char* k, const char* v){
   if(!strcmp(k,"fullscreen")) g_want_fs=atoi(v);

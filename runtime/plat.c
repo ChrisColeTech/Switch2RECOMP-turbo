@@ -31,6 +31,7 @@ void logf_(int lvl, const char* fmt, ...){
 void fatal(const char* fmt, ...){
   char buf[4096]; va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
   logf_(0,"FATAL: %s\n",buf);
+  { extern void backend_controller_shutdown(void); backend_controller_shutdown(); }   /* stop rumble and lights before the message box */
 #if defined(_WIN32)
   { extern void win_fatal_box(const char*); win_fatal_box(buf); }
 #else
