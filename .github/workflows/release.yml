@@ -26,16 +26,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        platform: ${{ github.event_name != 'workflow_dispatch' && fromJSON('["windows", "linux"]') || (inputs.platform != 'all' && fromJSON(format('["{0}"]', inputs.platform)) || fromJSON('["windows", "linux"]')) }}
         include:
-          - os: windows-2022
-            platform: windows
+          - platform: windows
+            os: windows-2022
             qt_arch: win64_msvc2022_64
-          - os: ubuntu-24.04
-            platform: linux
+          - platform: linux
+            os: ubuntu-24.04
             qt_arch: linux_gcc_64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == matrix.platform
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
