@@ -1,0 +1,108 @@
+# SwitchRecomp - Copyright 2026 MZ Labs
+# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Engine-only CI: tests and native runtime builds. Release bundles are packaged by the RecompLauncher repository.
+name: Engine CI
+on:
+  push:
+    branches: [turbo]
+  pull_request:
+    branches: [turbo]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: GCC 16.2, hactool and SPIRV-Tools (checksum-pinned)
+        shell: pwsh
+        run: |
+          python tool/get_deps.py gcc hactool
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # same pinned conda package RecompLauncher's release-deps.py bundles
+          python -c "import sys; sys.path.insert(0, 'tool'); import get_deps as d; d.DEST = sys.argv[1]; d.os.makedirs(d.DEST, exist_ok=True); d.relocate(d.unpack(d.get(sys.argv[2], sys.argv[3]), sys.argv[2].split('/')[-1]), d.DEST)" build/shader-tools win-64/spirv-tools-2026.4-h49e36cd_2.conda 933e40fe9ca887a63ef742260f0ed801cda317354806504d864764a4ed9749e1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Shader compiler (glslang 15.1.0)
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch 15.1.0 https://github.com/KhronosGroup/glslang.git build/glslang-src
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S build/glslang-src -B build/glslang -G "Visual Studio 17 2022" -A x64 -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DBUILD_TESTING=OFF -DENABLE_GLSLANG_BINARIES=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build/glslang --config Release --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Resolve-Path build/glslang/StandAlone/Release).Path >> $env:GITHUB_PATH
+      - name: Python tests
+        run: |
+          python -m unittest discover -s tests -p "test_n*.py"
+          python tests/test_python_selection.py -v
+      - name: Controller and shader regression tests
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd\gcc\Library\bin;$env:PATH"
+          $env:NXSHADER_TOOLS = "$pwd\build\shader-tools\Library\bin"
+          New-Item -ItemType Directory -Force build/mkw-investigation | Out-Null
+          python tests/test_controllers.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/test_mkw_runtime.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: NVN archive and Windows runtime
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd\gcc\Library\bin;$env:PATH"
+          python tools/build_nvn.py --jobs 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (-not (Test-Path build/nvn/libnvn.a)) { throw 'NVN archive missing' }
+          python switchrecomp.py --build-runtime --target win64 --backend win32 --cc "$pwd\gcc\Library\bin\x86_64-w64-mingw32-gcc.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Runtime links VP9, NVN telemetry and Sony HID
+        run: |
+          python -c "import sys; d = open('bin/runtime_win64_win32.exe', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:', b'hid.dll', b'setupapi.dll') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: engine-logs-windows
+          path: |
+            build/controllers-*/checks.log
+            build/mkw-investigation/
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential glslang-tools libx11-dev libgl-dev libegl1
+      - name: SDL2 (checksum-pinned, for the audio harness)
+        run: python tool/get_deps.py sdl
+      - name: Python tests
+        run: |
+          python -m unittest discover -s tests -p "test_n*.py"
+          python tests/test_python_selection.py -v
+      - name: Audio regression tests
+        run: LD_LIBRARY_PATH="$PWD/lib" sh tests/run_audio.sh
+      - name: NVN archive and Linux runtime
+        run: |
+          python tools/build_nvn.py --linux --jobs 4
+          test -s build/nvn_lin/libnvn.a
+          test -s runtime/vp9/lin/libvpx.a
+          python switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
+      - name: Runtime links VP9 and NVN telemetry
+        run: |
+          python -c "import sys; d = open('bin/runtime_linux_x11', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
