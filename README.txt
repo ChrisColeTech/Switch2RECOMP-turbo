@@ -108,7 +108,7 @@ notice) that the recompiler and every recompiled game show when they start.
                            never included or copied)
     log=2                  log everything (for bug reports)
     renderer=opengl        opengl (default), vulkan, or eden (Eden's Vulkan GPU)
-    button_layout=nintendo controller face buttons: nintendo = by position like
+    button_layout=switch   controller face buttons: switch = by position like
                            the Switch, xbox = by Xbox label (Cross = A)
     button_map=            optional per-button overrides, physical:guest pairs,
                            e.g. south:a east:b (see the comments in the .ini)

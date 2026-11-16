@@ -19,10 +19,10 @@ static u64 press_sdl(int pos){ static const int b[]={1,0,3,2}; u64 m=0;         
   for(unsigned i=0;i<sizeof PAD_SDL/sizeof PAD_SDL[0];i++) if(PAD_SDL[i].sdl==b[pos]) m|=1ull<<PAD_SDL[i].bit; return m; }
 static void layout_matrix(void){
   /* guest bit (A 0, B 1, X 2, Y 3) for each physical position */
-  static const int nintendo[]={0,1,2,3},xbox[]={1,0,3,2};
+  static const int sw[]={0,1,2,3},xbox[]={1,0,3,2};
   for(int layout=0;layout<2;layout++){ PadMap m; char err[160];
-    assert(pad_map_build(&m,layout?"xbox":"nintendo","",err,sizeof err)==0 && !err[0]);
-    for(int pos=0;pos<4;pos++){ u64 want=1ull<<(layout?xbox:nintendo)[pos];
+    assert(pad_map_build(&m,layout?"xbox":"switch","",err,sizeof err)==0 && !err[0]);
+    for(int pos=0;pos<4;pos++){ u64 want=1ull<<(layout?xbox:sw)[pos];
       assert(pad_map_apply(&m,press_xinput(pos))==want);
       assert(pad_map_apply(&m,press_winmm(pos,0))==want && pad_map_apply(&m,press_winmm(pos,1))==want);
       assert(pad_map_apply(&m,press_sony(pos,SONY_DS5,SONY_USB))==want && pad_map_apply(&m,press_sony(pos,SONY_DS4,SONY_USB))==want);
@@ -32,19 +32,19 @@ static void layout_matrix(void){
   }
   PadMap m; char err[160], d[400];
   /* aliases and the empty default */
-  assert(pad_layout_id("position")==PAD_NINTENDO && pad_layout_id("")==PAD_NINTENDO && pad_layout_id("label")==PAD_XBOX && pad_layout_id("labels")==PAD_XBOX && pad_layout_id("wii")<0);
+  assert(pad_layout_id("nintendo")==PAD_SWITCH && pad_layout_id("position")==PAD_SWITCH && pad_layout_id("")==PAD_SWITCH && pad_layout_id("label")==PAD_XBOX && pad_layout_id("labels")==PAD_XBOX && pad_layout_id("wii")<0);
   /* button_map: case-insensitive physical:guest pairs on top of the layout; Sony names alias the compass ones */
-  assert(pad_map_build(&m,"nintendo","South:A, circle:b  triangle:none",err,sizeof err)==0);
+  assert(pad_map_build(&m,"switch","South:A, circle:b  triangle:none",err,sizeof err)==0);
   assert(pad_map_apply(&m,press_sony(BOTTOM,SONY_DS5,SONY_USB))==1 && pad_map_apply(&m,press_sony(RIGHT,SONY_DS5,SONY_USB))==2);
   assert(pad_map_apply(&m,press_sony(TOP,SONY_DS5,SONY_USB))==0 && pad_map_apply(&m,press_xinput(LEFT))==8);
   assert(pad_map_build(&m,"xbox","zl:zr zr:zl minus:plus",err,sizeof err)==0);
   assert(pad_map_apply(&m,1ull<<8)==1ull<<9 && pad_map_apply(&m,1ull<<9)==1ull<<8 && pad_map_apply(&m,1ull<<11)==1ull<<10 && pad_map_apply(&m,1ull<<10)==1ull<<10);
   pad_map_describe(&m,d,sizeof d); assert(!strcmp(d,"xbox (A=bottom B=right X=left Y=top) button_map: zl:zr zr:zl minus:plus"));
-  /* bad entries are reported and skipped, the rest still applies; an unknown layout falls back to nintendo */
+  /* bad entries are reported and skipped, the rest still applies; an unknown layout falls back to switch */
   assert(pad_map_build(&m,"sega","east:q bogus west:b",err,sizeof err)==3 && strstr(err,"sega"));
-  assert(m.layout==PAD_NINTENDO && pad_map_apply(&m,press_xinput(LEFT))==2 && pad_map_apply(&m,press_xinput(RIGHT))==1);
-  assert(pad_map_build(&m,"nintendo","east:q",err,sizeof err)==1 && strstr(err,"east:q"));
-  pad_map_build(&m,"nintendo","",err,sizeof err); pad_map_describe(&m,d,sizeof d); assert(!strcmp(d,"nintendo (A=right B=bottom X=top Y=left)"));
+  assert(m.layout==PAD_SWITCH && pad_map_apply(&m,press_xinput(LEFT))==2 && pad_map_apply(&m,press_xinput(RIGHT))==1);
+  assert(pad_map_build(&m,"switch","east:q",err,sizeof err)==1 && strstr(err,"east:q"));
+  pad_map_build(&m,"switch","",err,sizeof err); pad_map_describe(&m,d,sizeof d); assert(!strcmp(d,"switch (A=right B=bottom X=top Y=left)"));
 }
 int main(void){
   for(int sony=0;sony<2;sony++){
@@ -68,6 +68,6 @@ int main(void){
   backend_vibration_set(.5f,.5f); hid_vibration_flush(); assert(writes==4);
   controllers_shutdown(); assert(writes==5 && owner==2 && !output.wLeftMotorSpeed && !output.wRightMotorSpeed);
   backend_vibration_set(1,1); hid_vibration_flush(); assert(writes==5 && !g_vib_left && !g_vib_right);
-  puts("PASS button layouts nintendo/xbox x XInput, WinMM generic + Sony, Sony HID DS5 + DS4, SDL table; button_map overrides, aliases, errors, startup description");
+  puts("PASS button layouts switch/xbox x XInput, WinMM generic + Sony, Sony HID DS5 + DS4, SDL table; button_map overrides, aliases, errors, startup description");
   puts("PASS production WinMM mapping, startup synchronization, amplitude bounds, output owner, rate limit, immediate stop and shutdown (mock device)"); return 0;
 }

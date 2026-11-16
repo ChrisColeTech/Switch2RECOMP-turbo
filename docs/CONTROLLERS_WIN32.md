@@ -99,16 +99,16 @@ Every pad path reports buttons **by position** in the Switch bit order: XInput (
 `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0`). `runtime/pad_layout.h` then maps that positional mask to the guest once,
 in `video_poll`/`pad_poll`, from two INI keys (section `[Controls]`, both apply live when the INI is saved):
 
-- `button_layout=nintendo` (default; aliases `position`, `positions`): the button where a Switch pad has A is A.
+- `button_layout=switch` (default; accepted aliases `nintendo`, `position`, `positions`): the button where a Switch pad has A is A.
 - `button_layout=xbox` (aliases `label`, `labels`): Xbox labels, i.e. the bottom button is A.
 - `button_map=physical:guest ...` (optional, empty by default): per-button overrides on top of the layout,
   separated by spaces, commas or semicolons, case-insensitive. Physical: `south east west north` (or `cross circle
   square triangle`), `l r zl zr lstick rstick plus minus up down left right` (the Switch names of those positions).
   Guest: `a b x y l r zl zr lstick rstick plus minus up down left right none`. Example: `button_map=south:a east:b`
-  on the nintendo layout swaps only A/B. Bad entries are logged and skipped; an unknown layout falls back to
-  `nintendo`.
+  on the switch layout swaps only A/B. Bad entries are logged and skipped; an unknown layout falls back to
+  `switch`.
 
-| Position | Xbox | Sony | `nintendo` | `xbox` |
+| Position | Xbox | Sony | `switch` | `xbox` |
 | --- | --- | --- | --- | --- |
 | right (east) | B | Circle | A / bit 0 | B / bit 1 |
 | bottom (south) | A | Cross | B / bit 1 | A / bit 0 |
@@ -123,7 +123,7 @@ in `video_poll`/`pad_poll`, from two INI keys (section `[Controls]`, both apply 
 | Options / Create (Share), Start / Back | Plus / Minus / 10, 11 |
 | D-pad left/up/right/down | 12, 13, 14, 15 |
 
-Why `nintendo` is the default: the games' button prompts and muscle memory refer to the Switch positions, XInput and
+Why `switch` is the default: the games' button prompts and muscle memory refer to the Switch positions, XInput and
 Linux were already positional, and emulators (Ryujinx, yuzu) map by position by default. Before this change the two
 Sony paths were the odd ones out with a hybrid (Cross = A and Circle = B by "confirm" label, but Triangle = X and
 Square = Y by position), so on a DualSense A/B felt swapped against the positional pads and X/Y felt swapped against
@@ -131,7 +131,7 @@ Xbox labels. Now every pad follows the same layout, and `xbox` gives the full la
 Square = X, Triangle = Y) for players who want PC-style confirm/back. The keyboard is not remapped. RecompLauncher
 writes `button_layout` (Settings > Controller default, per-game override in Properties > Runtime) into the game's INI.
 
-The log shows the active layout at startup and after a live change, e.g. `controllers: button layout nintendo
+The log shows the active layout at startup and after a live change, e.g. `controllers: button layout switch
 (A=right B=bottom X=top Y=left)` or `controllers: button layout xbox (A=bottom B=right X=left Y=top) button_map:
 zl:zr zr:zl`; the Sony connect line names the face buttons for the layout.
 
@@ -164,7 +164,7 @@ Hold the pad: blue lightbar and the centre player LED come on, then the left (lo
 (high-frequency) motor, both, and everything turns off. Each write prints its report bytes and `write=OK bytes=48`.
 `--device` is the read-only variant (decodes input, sends nothing); `--pulse` is a short weak check.
 `--buttons [SECONDS]` (default 20, read-only) prints for every button you press the Switch button it becomes under
-both layouts, e.g. `Circle (right)   -> nintendo: a      xbox: b`.
+both layouts, e.g. `Circle (right)   -> switch: a      xbox: b`.
 
 In a game: set `SWR_CONTROLLER_SELFTEST=1` (and `SWR_CONTROLLER_TRACE=1`) before starting it; the pad lights and
 pulses about 1.5 s after the window opens, then follows the game's rumble.

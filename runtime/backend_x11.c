@@ -29,8 +29,8 @@ void hid_vibration_flush(void){}
 void backend_controller_shutdown(void){}
 
 /* button_layout / button_map (pad_layout.h), same as backend_win32.c: SDL reports by position, this maps to the guest */
-static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_NINTENDO,0};
-static char g_pad_layout[32]="nintendo", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
+static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_SWITCH,0};
+static char g_pad_layout[32]="switch", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
 /* the INI only stores the strings; the table is rebuilt on the input thread (video_init, then video_poll), so a live
    reload that changes both keys logs once, after both, and the poll never reads a half-written table */
 static void pad_layout_update(void){

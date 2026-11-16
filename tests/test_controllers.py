@@ -6,7 +6,7 @@
 .venv/Scripts/python tests/test_controllers.py [--device | --pulse | --rumble | --buttons [SECONDS]]
 Evidence stays in a unique build/controllers-* directory. --device is shared read-only.
 --rumble drives the connected pad's lights and both motors for about 5 s (the owner's physical check).
---buttons prints, for every physical button pressed, the Switch button it becomes with button_layout=nintendo / xbox.
+--buttons prints, for every physical button pressed, the Switch button it becomes with button_layout=switch / xbox.
 """
 import argparse
 import ctypes as C

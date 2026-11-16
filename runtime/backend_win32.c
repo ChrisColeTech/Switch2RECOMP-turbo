@@ -39,8 +39,8 @@ extern int g_opt_fps;
 static int g_ls_mode=0; static char g_ls_path[1024];
 
 /* button_layout / button_map (pad_layout.h): every pad path below reports by position, this maps to the guest */
-static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_NINTENDO,0};
-static char g_pad_layout[32]="nintendo", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
+static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_SWITCH,0};
+static char g_pad_layout[32]="switch", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
 /* the INI only stores the strings; the table is rebuilt on the input thread (video_init, then video_poll), so a live
    reload that changes both keys logs once, after both, and the poll never reads a half-written table */
 static void pad_layout_update(void){
@@ -232,7 +232,7 @@ static void pad_source(int source){
   if(source==1) LOG("controllers: XInput controller connected\n");
   else if(source==2) LOG("controllers: native Windows controller connected (vendor %04x product %04x, %u axes, %u buttons)\n",
     g_joy_caps.wMid,g_joy_caps.wPid,g_joy_caps.wNumAxes,g_joy_caps.wNumButtons);
-  else if(source==3) LOG("controllers: player 1 using Sony native-HID (%s, L1/R1=L/R, L3/R3=stick clicks)\n",g_padmap.layout==PAD_XBOX?"xbox layout: Cross=A Circle=B Square=X Triangle=Y":"nintendo layout: Circle=A Cross=B Triangle=X Square=Y");
+  else if(source==3) LOG("controllers: player 1 using Sony native-HID (%s, L1/R1=L/R, L3/R3=stick clicks)\n",g_padmap.layout==PAD_XBOX?"xbox layout: Cross=A Circle=B Square=X Triangle=Y":"switch layout: Circle=A Cross=B Triangle=X Square=Y");
   else if(g_pad_source) LOG("controllers: disconnected\n");
   g_pad_source=source;
 }

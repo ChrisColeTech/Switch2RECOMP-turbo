@@ -6,7 +6,7 @@
      --pulse      bounded output check: lights on, a short weak rumble, stop
      --rumble     owner's physical check: lights on, low motor, high motor, both, stop, lights off (about 5 s)
      --buttons N  shared read-only, N seconds (default 20): every physical press prints the Switch button it becomes
-                  under button_layout=nintendo and =xbox (pad_layout.h, the runtime's own mapping)
+                  under button_layout=switch and =xbox (pad_layout.h, the runtime's own mapping)
    every output write prints its report bytes and the WriteFile result. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,14 +17,14 @@
 static const char* const SONY_NAMES[16]={"Circle (right)","Cross (bottom)","Triangle (top)","Square (left)","L3","R3","L1","R1",
   "L2","R2","Options","Create","D-pad left","D-pad up","D-pad right","D-pad down"};
 static int buttons(unsigned seconds){
-  PadMap n,x; pad_map_build(&n,"nintendo","",NULL,0); pad_map_build(&x,"xbox","",NULL,0);
-  printf("Press each button (%u s). Physical button -> Switch button with button_layout=nintendo | xbox\n",seconds); fflush(stdout);
+  PadMap n,x; pad_map_build(&n,"switch","",NULL,0); pad_map_build(&x,"xbox","",NULL,0);
+  printf("Press each button (%u s). Physical button -> Switch button with button_layout=switch | xbox\n",seconds); fflush(stdout);
   ULONGLONG start=GetTickCount64(); uint64_t last=0; int seen=0;
   while(GetTickCount64()-start<seconds*1000ull && g_sony.h){
     if(sony_poll(&g_sony)){ seen=1; uint64_t b=g_sony.state.buttons&0xffff,down=b&~last; last=b;
       for(int i=0;i<16;i++) if(down>>i&1){ uint64_t gn=pad_map_apply(&n,1ull<<i),gx=pad_map_apply(&x,1ull<<i); int a=0,c=0;
         while(gn>>a>1) a++; while(gx>>c>1) c++;
-        printf("  %-15s -> nintendo: %-6s xbox: %s\n",SONY_NAMES[i],PAD_GUEST[a],PAD_GUEST[c]); fflush(stdout); } }
+        printf("  %-15s -> switch: %-6s xbox: %s\n",SONY_NAMES[i],PAD_GUEST[a],PAD_GUEST[c]); fflush(stdout); } }
     Sleep(4);
   }
   printf("buttons check: valid_input=%d\n",seen); sony_close(&g_sony); return seen?0:1;
