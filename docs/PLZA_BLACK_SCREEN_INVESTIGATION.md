@@ -219,14 +219,13 @@ game recompiled from the NUP with `efa9b2a`). The owner's build folder and the N
 
 ## Open items
 
-- **Garbled UI labels and portraits.** On the Language Selection screen the language names are broken, while the
-  question line is clean. On the Appearance screen the character portraits break up the same way, so it is not a
-  font-only problem. At native resolution (runtime screenshots) each glyph is cut into horizontal strips, groups of
-  rows missing or displaced in a regular rhythm. That points at a texture whose tiled (block-linear) layout is read
-  with the wrong parameters (block height, pitch vs block-linear) rather than at the text. Ruled out: alpha to
-  coverage (`gamectl set a2c 0`, a new live switch, changes nothing). Next: find the label/portrait textures (flight
-  recorder draw list, `texat`) and compare their NVN descriptions (`DM_NVN_TEXINFO=WxH`) with how the backend
-  deswizzles them.
+- **Garbled UI labels and portraits: fixed.** The language names, the screen titles and the Appearance portraits
+  were torn into horizontal row bands (glyph shapes right, row pairs displaced). Cause: the in-GOB byte order. PLZA
+  is a Switch 1 program (`0100…`, a Switch 2 Edition upgrade) and ships its textures in the Tegra X1 order; the
+  runtime read every texture in the Switch 2 order (address bits 5 and 6 exchanged, `s2tex`). Most visible on its
+  BC4 (`RGTC1`, format `0x49`) UI textures. `NXRT_TEX_ORDER=tx1` made everything crisp; the runtime now picks the X1
+  order for every non-`04…` title (log: `textures: Tegra X1 GOB order`), `NXRT_TEX_ORDER=switch2` reverts. Ruled out
+  on the way: alpha to coverage (`gamectl set a2c 0`) and the automatic block height (`DM_S2_TILEH_TEX`).
 - **Other games.** The monitor and `efa9b2a` change every game's generated code on its next recompile. Mario Kart
   World and Donkey Kong Bananza should be recompiled and run before this is merged (not done here). The monitor adds
   one atomic per STXR.

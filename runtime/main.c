@@ -442,6 +442,10 @@ int swr_main(int argc, char** argv){
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }
   if((g_title_id>>56)==0x04 && !getenv("SWR_HEAP8")){ mem_layout_nx2(); LOG("memory: Switch 2 layout, 12 GB heap region\n"); }
+  /* texture byte order inside a GOB (nvn/gfx/nvn_texio.c, s2tex): a Switch 1 program (title 01..., a "Switch 2 Edition"
+     upgrade too) ships its textures in the Tegra X1 order; read in the Switch 2 order (bits 5 and 6 exchanged) Pokemon
+     Legends Z-A's BC4 UI textures came out torn into row bands. NXRT_TEX_ORDER=tx1 or switch2 still decides */
+  if((g_title_id>>56)!=0x04 && !getenv("NXRT_TEX_ORDER")){ static char e[]="NXRT_TEX_ORDER=tx1"; putenv(e); LOG("textures: Tegra X1 GOB order (a Switch 1 program; NXRT_TEX_ORDER=switch2 to change)\n"); }
   mem_init(); if(g_opt_null_trap){ plat_vm_readonly(g_mem,0x10000); LOG("null_trap: writes to page 0 crash with a log\n"); }
   kernel_init(); build_dispatch();
   if(g_mod->init) g_mod->init(&g_rtapi);

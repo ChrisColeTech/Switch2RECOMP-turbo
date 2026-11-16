@@ -5,6 +5,12 @@ Switch2Recomp 0.4.1 - MZ Labs
   only when the value differs), so the game's lock-free resource and job lists stop losing updates. LDAR/STLR are
   translated as atomic accesses. Both are in the generated code: rebuild the game. Experimental guest core
   scheduler (SWR_CORE_SCHED=1, off by default) and more thread diagnostics; see docs/PLZA_BLACK_SCREEN_INVESTIGATION.md.
+- A condvar wait no longer loses a signal: the key is marked "waited on" before the mutex is released, as in Horizon
+  (Pokemon Legends Z-A froze after a few seconds on the language screen).
+- Switch 1 programs (title 01..., "Switch 2 Edition" upgrades included) read textures in the Tegra X1 GOB byte order:
+  Pokemon Legends Z-A's UI text and portraits were torn into row bands. NXRT_TEX_ORDER=switch2 restores the old order.
+- tools/plza_probe.py: a bounded PLZA run with runtime screenshots, scripted buttons, control-pipe commands, progress
+  and stall capture (the mkw_probe.py pattern).
 - Switch 2 NSOs with ZBIC-compressed segments (NSO flag bit 7, e.g. Ocarina of Time) load: zbic.py rewrites ZBIC's
   interpolative-coded FSE table headers into standard zstd and decodes with the stock zstd in Python 3.14 (or the
   zstandard package). Without a zstd decoder the error says ZBIC is not supported instead of calling the dump corrupt.

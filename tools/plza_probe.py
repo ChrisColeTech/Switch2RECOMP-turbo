@@ -275,7 +275,8 @@ def worker(run):
                     if inp.exists(): raise RuntimeError('pending input request; refusing overwrite')
                     atomic(inp, f'{ident} {BUTTONS[action]:x} {request["hold_ms"]}')
                     wait(lambda: (run / 'input.txt.ack').exists() and (run / 'input.txt.ack').read_text().strip() == ident)
-                    time.sleep(request['hold_ms'] / 1000 + request['settle'])
+                    time.sleep(request['hold_ms'] / 1000)
+                time.sleep(request['settle'])   # a plain "shot" waits too, so "--settle N" can time a screenshot
                 image = shot(f'{action}-settled')
                 atomic(run / f'{ident}.done.json', json.dumps(dict(screenshot=image)))
                 next_shot = time.monotonic() + config['shot_every']

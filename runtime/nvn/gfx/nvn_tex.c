@@ -155,7 +155,9 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
                && blk(h * sy, t.bh) >= 8u << sparse_tile_h(t.bpb)) tileH = (unsigned)sparse_tile_h(t.bpb);
     else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile(ah * 3 / 16);
         // SWITCH2 (private bring-up): DM_S2_TILEH=<log2> overrides the automatic block height of 2D textures without a packaged layout, to find the Switch 2 driver rule
-        static int s2_th = -2; if (s2_th == -2) { const char *e = getenv("DM_S2_TILEH"); s2_th = e ? atoi(e) : -1; } if (s2_th >= 0) tileH = (unsigned)s2_th; }
+        static int s2_th = -2; if (s2_th == -2) { const char *e = getenv("DM_S2_TILEH"); s2_th = e ? atoi(e) : -1; } if (s2_th >= 0) tileH = (unsigned)s2_th;
+        // DM_S2_TILEH_TEX=<log2>: the same for textures with no flags at all (not a render target, not compressible), the ones a game fills itself
+        static int s2_tt = -2; if (s2_tt == -2) { const char *e = getenv("DM_S2_TILEH_TEX"); s2_tt = e ? atoi(e) : -1; } if (s2_tt >= 0 && !d->flags) tileH = (unsigned)s2_tt; }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
     // MINIMAL_LAYOUT (0x200): the driver keeps the automatic block height and depth only when the whole layer (every level, the layer alignment) is no larger than with 1-GOB blocks,
