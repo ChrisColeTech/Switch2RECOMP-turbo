@@ -170,8 +170,10 @@ if [ ! -f "$cfg" ]; then exit 0; fi
 want="$root/gcc"
 have=$(sed -n 's|^--sysroot=\\(.*\\)/x86_64-conda-linux-gnu/sysroot$|\\1|p' "$cfg")
 if [ -z "$have" ] || [ "$have" = "$want" ]; then exit 0; fi
+esc=$(printf '%s\\n' "$have" | sed 's/[][\\*^$|]/\\\\&/g')
+rep=$(printf '%s\\n' "$want" | sed 's/[&\\\\|]/\\\\&/g')
 for f in "$cfg" "$root"/gcc/lib/gcc/x86_64-conda-linux-gnu/*/specs "$root"/gcc/x86_64-conda-linux-gnu/lib/ldscripts/*; do
-    if [ -f "$f" ]; then sed -i "s|$have|$want|g" "$f"; fi
+    if [ -f "$f" ]; then sed -i "s|$esc|$rep|g" "$f"; fi
 done
 '''
 
