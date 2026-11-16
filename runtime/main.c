@@ -127,7 +127,7 @@ static void rt_wfe(CPU* c){ (void)c; plat_yield(); }
 /* the global exclusive monitor (cpu.h, ldx/stx): one sequence number per 16-byte address bucket */
 static u32 g_excl_mon[1u<<SWR_XM_BITS];
 
-const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe,g_excl_mon};
+RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe,g_excl_mon};   /* SWR_NO_XMON=1 clears excl_mon at startup */
 
 /* ============================================================ system errors */
 void crash_report(void* host_pc, void* fault, int sig){
@@ -454,6 +454,13 @@ int swr_main(int argc, char** argv){
   if((g_title_id>>56)!=0x04 && !getenv("NXRT_TEX_ORDER")){ static char e[]="NXRT_TEX_ORDER=tx1"; putenv(e); LOG("textures: Tegra X1 GOB order (a Switch 1 program; NXRT_TEX_ORDER=switch2 to change)\n"); }
   mem_init(); if(g_opt_null_trap){ plat_vm_readonly(g_mem,0x10000); LOG("null_trap: writes to page 0 crash with a log\n"); }
   kernel_init(); build_dispatch();
+  /* the exclusive monitor (cpu.h ldx/stx) costs an extra atomic per STXR on a shared table: Mario Kart World, which
+     runs many atomics on many threads, lost about a third of its frames with it. Pokemon Legends Z-A (a Switch 1
+     program) needs it, the native Switch 2 games tested (Mario Kart World, Donkey Kong Bananza) ran correctly without
+     it. On for Switch 1 programs, off for Switch 2 titles (04...); SWR_XMON=1 / SWR_NO_XMON=1 decide */
+  { int on= getenv("SWR_XMON")? atoi(getenv("SWR_XMON"))>0 : getenv("SWR_NO_XMON")? 0 : (g_title_id>>56)!=0x04;
+    if(!on) g_rtapi.excl_mon=NULL;
+    LOG("cpu: exclusive monitor %s (SWR_XMON=1 / SWR_NO_XMON=1)\n",on? "on: a STXR fails after another thread's store-exclusive to the same place" : "off: LDXR/STXR compare values only"); }
   if(g_mod->init) g_mod->init(&g_rtapi);
   load_hints();
   if(loader_load()) fatal("Could not load the game executables from %sexefs/",g_datadir);

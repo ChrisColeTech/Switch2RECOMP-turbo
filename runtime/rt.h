@@ -318,7 +318,7 @@ typedef struct SwrModule {
 extern const SwrModule* g_mod;
 extern GuestFn* g_disp;
 extern char g_datadir[1024], g_exename[256], g_exedir[1024];
-extern const RtAPI g_rtapi;
+extern RtAPI g_rtapi;
 int  loader_load(void);
 extern u64 g_code_lo, g_code_hi;
 

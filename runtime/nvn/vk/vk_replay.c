@@ -835,6 +835,8 @@ static void vsnote(const char *fmt, ...) {
 enum { PH_EXEC, PH_DRAW, PH_WSET, PH_DISP, PH_SPLIT, PH_WS_ALLOC, PH_WS_UBO, PH_WS_SBUF, PH_WS_TEX, PH_WS_UPD, PH_N };
 static uint64_t g_ph_ns[PH_N]; static int g_ph_on = -1;
 static inline int ph_on(void) { if (g_ph_on < 0) g_ph_on = vkc_int("phases", 0); return g_ph_on; }
+// "gamectl set a2c 0" / NXRT_VK_A2C=0: alpha to coverage off (diagnostics). Read through a cached pointer: it is asked on every draw
+static inline int a2c_on(void) { static const volatile int *p; if (!p) p = vkc_ptr("a2c", 1); return *p; }
 // in TSC cycles (a few ns a read; QueryPerformanceCounter's ~30 ns over ~100k reads a frame made the phases 3-4 ms slower than the replay they measured), ms at the report
 #define PH_T() __builtin_ia32_rdtsc()
 #define PH0() uint64_t ph0_ = ph_on() ? PH_T() : 0
@@ -1181,7 +1183,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if ((fsv & VKSH_FS_ALPHA) && atest) { static int n; if (!n++) VKLOG("alpha test: function %u, reference %g (shader %s's alpha test variant)", S->color.alpha_func, S->alpha_ref, fs->key); }
     if (!g_vkp_dyn.logic_op_enable) k.logic_en = (uint8_t)logic;
     if (!g_vkp_dyn.logic_op) k.logic_op = (uint8_t)(logic ? vkp_logic_op(S->color.logic_op) : VK_LOGIC_OP_COPY);
-    if (!g_vkp_dyn.a2c) k.a2c = S->ms.a2c != 0 && vkc_int("a2c", 1);   // "gamectl set a2c 0" / NXRT_VK_A2C=0: alpha to coverage off (diagnostics)
+    if (!g_vkp_dyn.a2c) k.a2c = S->ms.a2c != 0 && a2c_on();   // "gamectl set a2c 0" / NXRT_VK_A2C=0: alpha to coverage off (diagnostics)
     if (!g_vkp_dyn.polygon_mode) k.poly = (uint8_t)S->poly.mode;
     if (!g_vkp_dyn.depth_clamp) k.depth_clamp = S->depth_clamp != 0 && g_vk.f10.depthClamp;
     uint32_t used; int use_zero;
@@ -1239,7 +1241,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     if (g_vkp_dyn.logic_op_enable) DS_U(cb, DS_LOGIC_EN, logic_en, logic, vkCmdSetLogicOpEnableEXT(cb, (VkBool32)v_));
     if (g_vkp_dyn.logic_op) DS_U(cb, DS_LOGIC, logic, logic ? vkp_logic_op(S->color.logic_op) : VK_LOGIC_OP_COPY, vkCmdSetLogicOpEXT(cb, (VkLogicOp)v_));
-    if (g_vkp_dyn.a2c) DS_U(cb, DS_A2C, a2c, S->ms.a2c != 0 && vkc_int("a2c", 1), vkCmdSetAlphaToCoverageEnableEXT(cb, (VkBool32)v_));
+    if (g_vkp_dyn.a2c) DS_U(cb, DS_A2C, a2c, S->ms.a2c != 0 && a2c_on(), vkCmdSetAlphaToCoverageEnableEXT(cb, (VkBool32)v_));
     if (g_vkp_dyn.polygon_mode) DS_U(cb, DS_POLY, poly, vkp_polygon_mode(S->poly.mode), vkCmdSetPolygonModeEXT(cb, (VkPolygonMode)v_));
     if (g_vkp_dyn.depth_clamp) DS_U(cb, DS_DCLAMP, dclamp, S->depth_clamp != 0 && g_vk.f10.depthClamp, vkCmdSetDepthClampEnableEXT(cb, (VkBool32)v_));
     bind_vertex_buffers(cb, used, use_zero);

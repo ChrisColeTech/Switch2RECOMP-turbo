@@ -56,6 +56,7 @@ int vkq_resetting(void);
 
 void vkc_start(void);                                              // the pipe's thread
 int vkc_int(const char *name, int def);                            // a switch: its value from "gamectl set", else NXRT_VK_<NAME>, else def
+const volatile int *vkc_ptr(const char *name, int def);            // the same switch's live value, for hot paths (no lookup per call)
 int vkc_any_hidden(void);
 int vkc_hidden(uint64_t key);                                      // "gamectl hide": a shader whose draws are not made
 void vkc_gate(uint64_t frame);                                     // the game's present passes here: "gamectl pause" holds it

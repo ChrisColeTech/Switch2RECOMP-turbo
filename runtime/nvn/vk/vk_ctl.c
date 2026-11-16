@@ -31,6 +31,9 @@ int vkc_int(const char *name, int def) {
     ReleaseSRWLockExclusive(&g_swl);
     return s ? s->v : def;
 }
+const volatile int *vkc_ptr(const char *name, int def) { static int fallback[64]; static LONG nf;   // the table full: a fixed value
+    vkc_int(name, def); sw_t *s = sw_find(name); if (s) return (const volatile int *)&s->v;
+    LONG i = InterlockedIncrement(&nf) - 1; if (i >= 64) i = 63; fallback[i] = def; return &fallback[i]; }
 static void sw_set(const char *name, int v) { vkc_int(name, v); sw_t *s = sw_find(name); if (s) s->v = v; }
 
 // ---------- Hidden shaders ----------
