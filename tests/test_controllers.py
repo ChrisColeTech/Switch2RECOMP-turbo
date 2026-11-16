@@ -3,9 +3,10 @@
 # Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
 """Isolated production controller tests and optional HID probe. Never builds/launches the runtime.
 
-.venv/Scripts/python tests/test_controllers.py [--device | --pulse | --rumble]
+.venv/Scripts/python tests/test_controllers.py [--device | --pulse | --rumble | --buttons [SECONDS]]
 Evidence stays in a unique build/controllers-* directory. --device is shared read-only.
 --rumble drives the connected pad's lights and both motors for about 5 s (the owner's physical check).
+--buttons prints, for every physical button pressed, the Switch button it becomes with button_layout=nintendo / xbox.
 """
 import argparse
 import ctypes as C
@@ -27,6 +28,7 @@ def main():
     mode.add_argument('--device', action='store_true')
     mode.add_argument('--pulse', action='store_true')
     mode.add_argument('--rumble', action='store_true')
+    mode.add_argument('--buttons', nargs='?', const=20, type=int, metavar='SECONDS')
     args = ap.parse_args()
     out = ROOT / 'build' / ('controllers-' + time.strftime('%Y%m%d-%H%M%S-') + str(time.time_ns() % 1000000000))
     out.mkdir(parents=True)
@@ -47,6 +49,8 @@ def main():
         run([cc, '-std=gnu11', '-fsyntax-only', '-Werror=implicit-function-declaration', ROOT / 'runtime' / file])
     exe = out / 'controller_device.exe'
     run([cc, '-std=gnu11', '-O2', ROOT / 'tests/controller_device.c', '-o', exe])
+    if args.buttons is not None:
+        sys.exit(subprocess.run([str(exe), '--buttons', str(args.buttons)], env=env).returncode)  # live output
     if args.device or args.pulse or args.rumble:
         run([exe] + (['--pulse'] if args.pulse else ['--rumble'] if args.rumble else []))
         return
@@ -140,7 +144,8 @@ __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_tra
 
                 r, s = parse(raw)
                 assert r and (s.buttons, s.lx, s.ly, s.rx, s.ry) == (0, 0, 0, 0, 0)
-                for bit, target in ((5, 0), (6, 1), (7, 2), (4, 3)):
+                # by position (pad_layout.h maps to the guest): circle = A position, cross = B, triangle = X, square = Y
+                for bit, target in ((6, 0), (5, 1), (7, 2), (4, 3)):
                     data = raw.copy(); data[bo] |= 1 << bit
                     assert parse(data)[1].buttons == 1 << target
                 for bit, target in ((0, 6), (1, 7), (2, 8), (3, 9), (4, 11), (5, 10), (6, 4), (7, 5)):
@@ -167,7 +172,7 @@ __declspec(dllexport) int transport(int m,unsigned i,unsigned o){return sony_tra
     # Keep the real globals and functions together, excluding window/GPU code from this executable.
     begin = backend.index('/* ---------------------------------------------------------------- XInput,')
     end = backend.index('static int joy_poll(')
-    (out / 'controller_backend_production.h').write_text('#include "rt.h"\n#include <math.h>\n#include <mmsystem.h>\n#include "controller_sony_win32.h"\n' + backend[begin:end])
+    (out / 'controller_backend_production.h').write_text('#include "rt.h"\n#include <math.h>\n#include <mmsystem.h>\n#include "controller_sony_win32.h"\n#include "pad_layout.h"\n' + backend[begin:end])
     backend_exe = out / 'controller_backend.exe'
     run([cc, '-std=gnu11', '-O1', '-I', out, '-I', ROOT / 'runtime', '-ffunction-sections', '-fdata-sections', ROOT / 'tests/controller_backend.c', '-Wl,--gc-sections', '-o', backend_exe])
     run([backend_exe])

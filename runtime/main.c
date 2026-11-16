@@ -226,6 +226,8 @@ static const IniOpt INI_INPUT[]={
   {"mouse_right_stick","0","Right stick: 0 = IJKL, 1 = mouse (change with F1)"},
   {"mouse_sensitivity","1.00","Mouse sensitivity: F1 10%..500% goes from 5x to 1250x speed, on a curve so 100% stays close to before"},
   {"mouse_invert","0","Mouse inversion: 0 = normal, 1 = horizontal, 2 = vertical, 3 = both"},
+  {"button_layout","nintendo","Controller face buttons: nintendo = by position like the Switch (right = A, bottom = B, top = X,\n;   left = Y; Circle = A, Cross = B on PlayStation), xbox = by Xbox label (bottom = A, right = B, left = X, top = Y;\n;   Cross = A, Square = X on PlayStation). Applies live"},
+  {"button_map","","Optional per-button overrides on top of button_layout, physical:guest pairs, e.g. south:a east:b.\n;   Physical: south east west north (or cross circle square triangle), l r zl zr lstick rstick plus minus up down\n;   left right. Guest: a b x y l r zl zr lstick rstick plus minus up down left right none"},
   {NULL,NULL,NULL}};
 
 static const IniOpt INI_GRAPHICS[]={

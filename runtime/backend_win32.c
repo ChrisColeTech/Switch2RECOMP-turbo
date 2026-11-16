@@ -9,6 +9,7 @@
 #include <math.h>
 #include <mmsystem.h>  /* timeBeginPeriod (windows.h leaves it out with WIN32_LEAN_AND_MEAN) */
 #include "controller_sony_win32.h"
+#include "pad_layout.h"
 /* Startup splash: broken and disabled in the turbo fork. Build with -DSWR_STARTUP_SPLASH to re-enable. */
 #ifdef SWR_STARTUP_SPLASH
 #include "splash_img.h"
@@ -37,6 +38,18 @@ extern int g_opt_fps;
 
 static int g_ls_mode=0; static char g_ls_path[1024];
 
+/* button_layout / button_map (pad_layout.h): every pad path below reports by position, this maps to the guest */
+static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_NINTENDO,0};
+static char g_pad_layout[32]="nintendo", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
+/* the INI only stores the strings; the table is rebuilt on the input thread (video_init, then video_poll), so a live
+   reload that changes both keys logs once, after both, and the poll never reads a half-written table */
+static void pad_layout_update(void){
+  if(!__atomic_exchange_n(&g_pad_dirty,0,__ATOMIC_ACQ_REL)) return;
+  char err[160],d[400]; PadMap m; int bad=pad_map_build(&m,g_pad_layout,g_pad_buttons,err,sizeof err);
+  g_padmap=m; if(bad) LOG("controllers: %s; %d setting(s) ignored\n",err,bad);
+  pad_map_describe(&m,d,sizeof d); if(strcmp(d,g_pad_desc)){ strcpy(g_pad_desc,d); LOG("controllers: button layout %s\n",d); }
+}
+
 void backend_ini(const char* k, const char* v){
   if(!strcmp(k,"fullscreen")) g_want_fs=atoi(v);
   else if(!strcmp(k,"lossless_scaling")) g_ls_mode=atoi(v);
@@ -49,6 +62,8 @@ void backend_ini(const char* k, const char* v){
     double n=atof(v); if(!(n>0)) n=1; if(n<.1) n=.1; if(n>5) n=5; g_mouse_sensitivity=(LONG)(n*100+.5);
   }
   else if(!strcmp(k,"mouse_invert")) g_mouse_invert=atoi(v)&3;
+  else if(!strcmp(k,"button_layout")){ snprintf(g_pad_layout,sizeof g_pad_layout,"%s",v); __atomic_store_n(&g_pad_dirty,1,__ATOMIC_RELEASE); }
+  else if(!strcmp(k,"button_map")){ snprintf(g_pad_buttons,sizeof g_pad_buttons,"%s",v); __atomic_store_n(&g_pad_dirty,1,__ATOMIC_RELEASE); }
   else if(!strcmp(k,"script")) strncpy(g_script,v,8191);
   else if(!strcmp(k,"renderer")){   /* opengl (default), vulkan (the NVN layer, runtime/nvn) or eden (edenvk.h) */
     { static int set_nvn; int nv= !strcmp(v,"vulkan");
@@ -167,9 +182,11 @@ static int joy_open(void){
   return 0;
 }
 
+/* positional mask (pad_layout.h). WinMM numbers PlayStation face buttons square, cross, circle, triangle, and generic
+   DirectInput pads also put the bottom button at 1 and the right one at 2. Sony only swaps the Options/Create order. */
 static u64 joy_buttons(DWORD x,int sony){
   u64 b=0;
-  if(x&(1u<<(sony?1:2))) b|=1ull<<0; if(x&(1u<<(sony?2:1))) b|=1ull<<1;
+  if(x&(1u<<2)) b|=1ull<<0; if(x&(1u<<1)) b|=1ull<<1;
   if(x&(1u<<3)) b|=1ull<<2; if(x&(1u<<0)) b|=1ull<<3;
   if(x&(1u<<10)) b|=1ull<<4; if(x&(1u<<11)) b|=1ull<<5;
   if(x&(1u<<4)) b|=1ull<<6; if(x&(1u<<5)) b|=1ull<<7;
@@ -178,13 +195,22 @@ static u64 joy_buttons(DWORD x,int sony){
   return b;
 }
 
+/* XInput by position like a Switch pad: right (xbox B) = A position, bottom (xbox A) = B, top (Y) = X, left (X) = Y */
+static u64 xinput_buttons(WORD x,BYTE lt,BYTE rt){
+  u64 b=0;
+  if(x&0x2000) b|=1<<0; if(x&0x1000) b|=1<<1; if(x&0x8000) b|=1<<2; if(x&0x4000) b|=1<<3;
+  if(x&0x0040) b|=1<<4; if(x&0x0080) b|=1<<5; if(x&0x0100) b|=1<<6; if(x&0x0200) b|=1<<7;
+  if(lt>60) b|=1<<8; if(rt>60) b|=1<<9;
+  if(x&0x0010) b|=1<<10; if(x&0x0020) b|=1<<11;
+  if(x&0x0004) b|=1<<12; if(x&0x0001) b|=1<<13; if(x&0x0008) b|=1<<14; if(x&0x0002) b|=1<<15;
+  return b;
+}
+
 static int joy_poll(u64* buttons,i32* lx,i32* ly,i32* rx,i32* ry){
   JOYINFOEX state; memset(&state,0,sizeof state); state.dwSize=sizeof state; state.dwFlags=JOY_RETURNALL;
   if(g_joy_id==UINT_MAX){ u64 now=plat_ns(); if(now<g_joy_next_scan) return 0; g_joy_next_scan=now+1000000000ull; if(!joy_open()) return 0; }
   if(joyGetPosEx(g_joy_id,&state)!=JOYERR_NOERROR){ g_joy_id=UINT_MAX; return 0; }
   DWORD x=state.dwButtons;
-  /* WinMM numbers PlayStation face buttons square, cross, circle, triangle. PC players expect Cross to confirm;
-     other DirectInput pads retain Switch's physical A/B positions. */
   *buttons|=joy_buttons(x,g_joy_caps.wMid==0x054c);
   if(state.dwPOV!=JOY_POVCENTERED){ DWORD pov=state.dwPOV;
     if(pov>=31500 || pov<=4500) *buttons|=1ull<<13;
@@ -206,7 +232,7 @@ static void pad_source(int source){
   if(source==1) LOG("controllers: XInput controller connected\n");
   else if(source==2) LOG("controllers: native Windows controller connected (vendor %04x product %04x, %u axes, %u buttons)\n",
     g_joy_caps.wMid,g_joy_caps.wPid,g_joy_caps.wNumAxes,g_joy_caps.wNumButtons);
-  else if(source==3) LOG("controllers: player 1 using Sony native-HID (Cross=A, Circle=B, L1/R1=L/R, L3/R3=stick clicks)\n");
+  else if(source==3) LOG("controllers: player 1 using Sony native-HID (%s, L1/R1=L/R, L3/R3=stick clicks)\n",g_padmap.layout==PAD_XBOX?"xbox layout: Cross=A Circle=B Square=X Triangle=Y":"nintendo layout: Circle=A Cross=B Triangle=X Square=Y");
   else if(g_pad_source) LOG("controllers: disconnected\n");
   g_pad_source=source;
 }
@@ -480,7 +506,7 @@ static void win_thread(void* arg){ (void)arg;
 
 void video_init(const char* title){
   snprintf(g_title,sizeof g_title,"%s - SwitchRecomp  (F1 help)",title);
-  xinput_load(); timeBeginPeriod(1);
+  xinput_load(); timeBeginPeriod(1); pad_layout_update();
   g_ready=CreateEventA(NULL,TRUE,FALSE,NULL);
   _beginthread(win_thread,1<<20,NULL);
   WaitForSingleObject(g_ready,INFINITE);
@@ -574,19 +600,13 @@ void video_poll(void){
     }
     rx=(g_mouse_invert&1)?-g_mouse_rx:g_mouse_rx; ry=(g_mouse_invert&2)?-g_mouse_ry:g_mouse_ry;
   }
-  int source=0; DWORD user=(DWORD)~0;
+  int source=0; DWORD user=(DWORD)~0; u64 pb=0;   /* pad buttons by position, mapped once below */
   vibration_lock(); pad_active=pad_active && !g_controller_shutdown; g_vib_accept=pad_active;
   { static int active=-1; if(active!=pad_active){ active=pad_active;
       LOG("controllers: input %s (focus=%d background=%d exclusive-probe=%d controls=%d)\n",active?"enabled":"suppressed",focused,background,probe_only,g_controls_open); } }
   if(xget && pad_active){
     for(DWORD i=0;i<4;i++){ XST s; if(xget(i,&s)) continue; XGP* g=&s.Gamepad; WORD x=g->wButtons;
-      user=i;
-      /* map by position like a Switch pad: A right (xbox B), B bottom (xbox A), X top, Y left */
-      if(x&0x2000) b|=1<<0; if(x&0x1000) b|=1<<1; if(x&0x8000) b|=1<<2; if(x&0x4000) b|=1<<3;
-      if(x&0x0040) b|=1<<4; if(x&0x0080) b|=1<<5; if(x&0x0100) b|=1<<6; if(x&0x0200) b|=1<<7;
-      if(g->bLeftTrigger>60) b|=1<<8; if(g->bRightTrigger>60) b|=1<<9;
-      if(x&0x0010) b|=1<<10; if(x&0x0020) b|=1<<11;
-      if(x&0x0004) b|=1<<12; if(x&0x0001) b|=1<<13; if(x&0x0008) b|=1<<14; if(x&0x0002) b|=1<<15;
+      user=i; pb|=xinput_buttons(x,g->bLeftTrigger,g->bRightTrigger);
       if(!lx&&!ly){ lx=dz(g->sThumbLX); ly=dz(g->sThumbLY); } if(!rx&&!ry){ rx=dz(g->sThumbRX); ry=dz(g->sThumbRY); }
       source=1; break; }
   }
@@ -599,13 +619,14 @@ void video_poll(void){
         if(g_sony.writable && g_sony.model==SONY_DS5) sony_write(&g_sony,0,0,0,1);
       } }
     if(sony_poll(&g_sony)){
-      b|=g_sony.state.buttons;
+      pb|=g_sony.state.buttons;
       if(!lx&&!ly){ lx=g_sony.state.lx; ly=g_sony.state.ly; }
       if(!rx&&!ry){ rx=g_sony.state.rx; ry=g_sony.state.ry; }
     }
     if(g_sony.h) source=3;
   }
-  if(pad_active && !source && joy_poll(&b,&lx,&ly,&rx,&ry)) source=2;
+  if(pad_active && !source && joy_poll(&pb,&lx,&ly,&rx,&ry)) source=2;
+  pad_layout_update(); b|=pad_map_apply(&g_padmap,pb);
   if(user!=g_xuser){
     if(xset && g_xuser!=(DWORD)~0){ XVIB zero={0}; xset(g_xuser,&zero); }
     g_xuser=user; g_vib_left=g_vib_right=0; InterlockedExchange(&g_vib_dirty,1);

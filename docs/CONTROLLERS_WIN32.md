@@ -92,23 +92,51 @@ tries one zero.
 two pointer buffers, 213 from raw data, keeps activation across permission toggles, and serializes vibration
 state separately from backend I/O.
 
-## Buttons
+## Buttons and button layout
 
-| Physical Sony button | Guest Switch button / bit |
+Every pad path reports buttons **by position** in the Switch bit order: XInput (`xinput_buttons`), native Sony HID
+(`sony_input`), WinMM (`joy_buttons`, Sony and generic pads alike) and Linux SDL2 (`PAD_SDL`, with
+`SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0`). `runtime/pad_layout.h` then maps that positional mask to the guest once,
+in `video_poll`/`pad_poll`, from two INI keys (section `[Controls]`, both apply live when the INI is saved):
+
+- `button_layout=nintendo` (default; aliases `position`, `positions`): the button where a Switch pad has A is A.
+- `button_layout=xbox` (aliases `label`, `labels`): Xbox labels, i.e. the bottom button is A.
+- `button_map=physical:guest ...` (optional, empty by default): per-button overrides on top of the layout,
+  separated by spaces, commas or semicolons, case-insensitive. Physical: `south east west north` (or `cross circle
+  square triangle`), `l r zl zr lstick rstick plus minus up down left right` (the Switch names of those positions).
+  Guest: `a b x y l r zl zr lstick rstick plus minus up down left right none`. Example: `button_map=south:a east:b`
+  on the nintendo layout swaps only A/B. Bad entries are logged and skipped; an unknown layout falls back to
+  `nintendo`.
+
+| Position | Xbox | Sony | `nintendo` | `xbox` |
+| --- | --- | --- | --- | --- |
+| right (east) | B | Circle | A / bit 0 | B / bit 1 |
+| bottom (south) | A | Cross | B / bit 1 | A / bit 0 |
+| top (north) | Y | Triangle | X / bit 2 | Y / bit 3 |
+| left (west) | X | Square | Y / bit 3 | X / bit 2 |
+
+| Other physical buttons (all layouts) | Guest Switch button / bit |
 | --- | --- |
-| Cross | A / 0 (Cross confirms) |
-| Circle | B / 1 |
-| Triangle | X / 2 |
-| Square | Y / 3 |
 | L3 / R3 | left/right stick click / 4, 5 |
-| L1 / R1 | L / R / 6, 7 |
-| L2 / R2 | ZL / ZR / 8, 9 |
-| Options / Create (Share) | Plus / Minus / 10, 11 |
+| L1 / R1 (LB / RB) | L / R / 6, 7 |
+| L2 / R2 (LT / RT) | ZL / ZR / 8, 9 |
+| Options / Create (Share), Start / Back | Plus / Minus / 10, 11 |
 | D-pad left/up/right/down | 12, 13, 14, 15 |
 
+Why `nintendo` is the default: the games' button prompts and muscle memory refer to the Switch positions, XInput and
+Linux were already positional, and emulators (Ryujinx, yuzu) map by position by default. Before this change the two
+Sony paths were the odd ones out with a hybrid (Cross = A and Circle = B by "confirm" label, but Triangle = X and
+Square = Y by position), so on a DualSense A/B felt swapped against the positional pads and X/Y felt swapped against
+Xbox labels. Now every pad follows the same layout, and `xbox` gives the full label layout (Cross = A, Circle = B,
+Square = X, Triangle = Y) for players who want PC-style confirm/back. The keyboard is not remapped. RecompLauncher
+writes `button_layout` (Settings > Controller default, per-game override in Properties > Runtime) into the game's INI.
+
+The log shows the active layout at startup and after a live change, e.g. `controllers: button layout nintendo
+(A=right B=bottom X=top Y=left)` or `controllers: button layout xbox (A=bottom B=right X=left Y=top) button_map:
+zl:zr zr:zl`; the Sony connect line names the face buttons for the layout.
+
 Sticks use the 7000 deadzone and positive-up guest Y. Diagonal hats produce both directions. PS, touchpad,
-microphone, Edge paddles, gyro, adaptive triggers and DualSense audio are not mapped or driven. XInput keeps the
-physical Switch layout (Xbox B = Switch A, Xbox A = Switch B).
+microphone, Edge paddles, gyro, adaptive triggers and DualSense audio are not mapped or driven.
 
 ## Switches and diagnostics
 
@@ -135,6 +163,8 @@ $env:PATH = "D:\Projects\RecompLauncher\third_party\gcc\Library\bin;$env:PATH"
 Hold the pad: blue lightbar and the centre player LED come on, then the left (low-frequency) motor, the right
 (high-frequency) motor, both, and everything turns off. Each write prints its report bytes and `write=OK bytes=48`.
 `--device` is the read-only variant (decodes input, sends nothing); `--pulse` is a short weak check.
+`--buttons [SECONDS]` (default 20, read-only) prints for every button you press the Switch button it becomes under
+both layouts, e.g. `Circle (right)   -> nintendo: a      xbox: b`.
 
 In a game: set `SWR_CONTROLLER_SELFTEST=1` (and `SWR_CONTROLLER_TRACE=1`) before starting it; the pad lights and
 pulses about 1.5 s after the window opens, then follows the game's rumble.
@@ -142,7 +172,9 @@ pulses about 1.5 s after the window opens, then follows the game's rumble.
 ## Verification
 
 `tests/test_controllers.py` (CI) compiles the production units and checks: packet bytes for both models and
-transports (lights, motors, stop, lightbar release, Bluetooth sequence and CRC against Python's zlib), the DualSense
+transports (lights, motors, stop, lightbar release, Bluetooth sequence and CRC against Python's zlib), every pad
+path (XInput, WinMM generic and Sony, Sony HID DualSense and DualShock 4, the SDL table) under both button layouts,
+`button_map` overrides/aliases/errors and the logged layout description, the DualSense
 vibration-v2 flag and its firmware gate, input decoding fixtures, the shared-write open mode, the real service
 dispatch for 201/206/213/214/220 (bounds, clamp, permission, activation) and shared-memory rings, and the backend's
 rate limit/stop/shutdown with a mock XInput device.

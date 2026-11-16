@@ -84,8 +84,9 @@ static int sony_input(int model,int transport,const uint8_t* in,size_t n,SonySta
     }
   } else return 0;
   uint64_t b=0; unsigned f=p[bo],x=p[bo+1],hat=f&15;
-  /* keep the WinMM Sony preference: Cross confirms, Circle goes back. */
-  if(f&0x20) b|=1ull<<0; if(f&0x40) b|=1ull<<1;
+  /* by position like every pad path (pad_layout.h applies button_layout): Circle (right) = A position, Cross
+     (bottom) = B, Triangle (top) = X, Square (left) = Y */
+  if(f&0x40) b|=1ull<<0; if(f&0x20) b|=1ull<<1;
   if(f&0x80) b|=1ull<<2; if(f&0x10) b|=1ull<<3;
   if(x&0x40) b|=1ull<<4; if(x&0x80) b|=1ull<<5;
   if(x&1) b|=1ull<<6; if(x&2) b|=1ull<<7;
