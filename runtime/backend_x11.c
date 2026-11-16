@@ -6,6 +6,7 @@
    trace F8 full res screenshot F11/Alt+Enter fullscreen Esc quit. the Xvfb tests run on this too (screenshots,
    scripted input) */
 #include "rt.h"
+#include "pad_layout.h"
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
@@ -25,6 +26,19 @@ extern int g_opt_fps;
 void backend_vibration_set(float low,float high){ (void)low; (void)high; }
 void backend_vibration_stop(void){}
 void hid_vibration_flush(void){}
+void backend_controller_shutdown(void){}
+
+/* button_layout / button_map (pad_layout.h), same as backend_win32.c: SDL reports by position, this maps to the guest */
+static PadMap g_padmap={{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},PAD_SWITCH,0};
+static char g_pad_layout[32]="switch", g_pad_buttons[512], g_pad_desc[400]; static volatile int g_pad_dirty=1;
+/* the INI only stores the strings; the table is rebuilt on the input thread (video_init, then video_poll), so a live
+   reload that changes both keys logs once, after both, and the poll never reads a half-written table */
+static void pad_layout_update(void){
+  if(!__atomic_exchange_n(&g_pad_dirty,0,__ATOMIC_ACQ_REL)) return;
+  char err[160],d[400]; PadMap m; int bad=pad_map_build(&m,g_pad_layout,g_pad_buttons,err,sizeof err);
+  g_padmap=m; if(bad) LOG("controllers: %s; %d setting(s) ignored\n",err,bad);
+  pad_map_describe(&m,d,sizeof d); if(strcmp(d,g_pad_desc)){ strcpy(g_pad_desc,d); LOG("controllers: button layout %s\n",d); }
+}
 
 void backend_ini(const char* k, const char* v){
   if(!strcmp(k,"fullscreen")) g_want_fs=atoi(v);
@@ -35,6 +49,8 @@ void backend_ini(const char* k, const char* v){
   else if(!strcmp(k,"press_at")) g_press_at=strtoull(v,NULL,10);
   else if(!strcmp(k,"press_len")) g_press_len=strtoull(v,NULL,10);
   else if(!strcmp(k,"script")) strncpy(g_script,v,8191);
+  else if(!strcmp(k,"button_layout")){ snprintf(g_pad_layout,sizeof g_pad_layout,"%s",v); __atomic_store_n(&g_pad_dirty,1,__ATOMIC_RELEASE); }
+  else if(!strcmp(k,"button_map")){ snprintf(g_pad_buttons,sizeof g_pad_buttons,"%s",v); __atomic_store_n(&g_pad_dirty,1,__ATOMIC_RELEASE); }
   else if(!strcmp(k,"renderer")){ extern int g_edenvk_want; g_edenvk_want= !strcmp(v,"vulkan"); }   /* opengl (default) or vulkan (edenvk.h) */
 }
 
@@ -81,10 +97,11 @@ static void pad_poll(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
     if(!g_pad_gc) return;
     LOG("controllers: %s\n",sdl.Name(g_pad_gc)? sdl.Name(g_pad_gc) : "connected"); }
   SDLGC* g=g_pad_gc;
-  /* SDL names buttons by Xbox position: A bottom, B right, X left, Y top */
-  static const struct { int sdl, bit; } m[]={{1,0},{0,1},{3,2},{2,3},{7,4},{8,5},{9,6},{10,7},{6,10},{4,11},{13,12},{11,13},{14,14},{12,15}};
-  for(unsigned i=0;i<sizeof m/sizeof m[0];i++) if(sdl.Button(g,m[i].sdl)) *b|=1ull<<m[i].bit;
-  if(sdl.Axis(g,4)>7700) *b|=1ull<<8; if(sdl.Axis(g,5)>7700) *b|=1ull<<9;
+  /* by position (PAD_SDL in pad_layout.h), then button_layout / button_map */
+  u64 pb=0;
+  for(unsigned i=0;i<sizeof PAD_SDL/sizeof PAD_SDL[0];i++) if(sdl.Button(g,PAD_SDL[i].sdl)) pb|=1ull<<PAD_SDL[i].bit;
+  if(sdl.Axis(g,4)>7700) pb|=1ull<<8; if(sdl.Axis(g,5)>7700) pb|=1ull<<9;
+  *b|=pad_map_apply(&g_padmap,pb);
   /* SDL's Y axes point down, the Switch's up */
   i32 x=sdl.Axis(g,0), y=-(i32)sdl.Axis(g,1), x2=sdl.Axis(g,2), y2=-(i32)sdl.Axis(g,3);
   if(y>32767) y=32767; if(y2>32767) y2=32767;
@@ -104,7 +121,7 @@ static void set_title(const char* t){ XStoreName(dpy,win,t); XFlush(dpy); }
 
 static const char* HELP=
   "SwitchRecomp - controls\n\n"
-  "Controller: same as the Switch controller (buttons by position).\n\n"
+  "Controller: same as the Switch controller (buttons by position; button_layout=xbox in the .ini: by label).\n\n"
   "Keyboard:\n"
   "  Arrows = D-Pad     W A S D = Left stick    I J K L = Right stick\n"
   "  X / Space = A    Z = B    C = X    V = Y\n"
@@ -115,6 +132,7 @@ static const char* HELP=
 
 void video_init(const char* title){
   snprintf(g_title,sizeof g_title,"%s - SwitchRecomp  (F1 help)",title);
+  pad_layout_update();
   XInitThreads();
   /* let mesa run its own glthread so the driver work isn't on our GPU thread (deck, AMD/intel on linux) */
   if(!getenv("SWR_NO_GLTHREAD")) setenv("mesa_glthread","true",0);
@@ -235,7 +253,7 @@ void video_poll(void){
     else if(e.type==ClientMessage && (Atom)e.xclient.data.l[0]==wm_delete){ LOG("window: closed by the user\n"); g_quit=1; } }
   u64 k=keys_held, b=k&0xFFFFull;
   i32 lx=axis(k,40,42), ly=axis(k,43,41), rx=axis(k,44,46), ry=axis(k,47,45);
-  pad_poll(&b,&lx,&ly,&rx,&ry);
+  pad_layout_update(); pad_poll(&b,&lx,&ly,&rx,&ry);
   /* stick-as-button bits 16..23 */
   if(lx<-16000) b|=1ull<<16; if(ly>16000) b|=1ull<<17; if(lx>16000) b|=1ull<<18; if(ly<-16000) b|=1ull<<19;
   if(rx<-16000) b|=1ull<<20; if(ry>16000) b|=1ull<<21; if(rx>16000) b|=1ull<<22; if(ry<-16000) b|=1ull<<23;

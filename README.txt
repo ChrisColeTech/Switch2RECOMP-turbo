@@ -86,8 +86,11 @@ notice) that the recompiler and every recompiled game show when they start.
 
   Controls
     Xbox / XInput controller: same as the Switch one, by position.
-    PlayStation and other Windows game controllers: native WinMM fallback, no
-      controller-emulation software required. Buttons are mapped by position.
+    PlayStation (DualSense / DualShock 4, native) and other Windows game
+      controllers: no controller-emulation software required. Buttons are
+      mapped by position too (Circle = A, Cross = B, Triangle = X, Square = Y).
+    button_layout=xbox in the .ini maps by Xbox label instead (bottom = A,
+      right = B, left = X, top = Y: Cross = A, Circle = B on PlayStation).
     Keyboard: Arrows = D-Pad, WASD = left stick, IJKL = right stick,
               X/Space = A, Z = B, C = X, V = Y, Q = L, E = R, 1 = ZL, 3 = ZR,
               Enter = +, Backspace = -
@@ -105,6 +108,10 @@ notice) that the recompiler and every recompiled game show when they start.
                            never included or copied)
     log=2                  log everything (for bug reports)
     renderer=opengl        opengl (default), vulkan, or eden (Eden's Vulkan GPU)
+    button_layout=switch   controller face buttons: switch = by position like
+                           the Switch, xbox = by Xbox label (Cross = A)
+    button_map=            optional per-button overrides, physical:guest pairs,
+                           e.g. south:a east:b (see the comments in the .ini)
 
   renderer=vulkan translates the game's shaders while it runs. It needs
   Python 3 (Install.bat downloads it) and the .NET 10 runtime

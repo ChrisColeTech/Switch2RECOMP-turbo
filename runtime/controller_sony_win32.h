@@ -11,7 +11,7 @@
 
 #define SONY_API_LIST(X) \
   X(hid,HidD_GetHidGuid) X(hid,HidD_GetAttributes) X(hid,HidD_GetPreparsedData) \
-  X(hid,HidD_FreePreparsedData) X(hid,HidP_GetCaps) \
+  X(hid,HidD_FreePreparsedData) X(hid,HidP_GetCaps) X(hid,HidD_GetFeature) \
   X(setup,SetupDiGetClassDevsW) X(setup,SetupDiEnumDeviceInterfaces) \
   X(setup,SetupDiGetDeviceInterfaceDetailW) X(setup,SetupDiDestroyDeviceInfoList)
 #define SONY_DECLARE(d,n) static __typeof__(&n) ps_##n;
@@ -30,15 +30,16 @@ static int sony_api(void){
 
 typedef struct {
   HANDLE h; OVERLAPPED read; uint8_t input[78]; SonyState state;
-  int model,transport,writable,pending,valid,lit,seq,output_failed;
-  unsigned input_len,output_len,pid,writes,errors; ULONGLONG last_input;
+  int model,transport,writable,pending,valid,lit,seq,output_failed,vib_v2;
+  unsigned input_len,output_len,feature_len,pid,firmware,writes,errors; ULONGLONG last_input;
+  uint8_t last_packet[78]; unsigned last_len; DWORD last_error;
 } SonyDevice;
 static SonyDevice g_sony;
 
 static int sony_write(SonyDevice* d,unsigned low,unsigned high,int lit,int reset){
   if(!d->h || !d->writable) return 0;
   uint8_t packet[78]={0}; DWORD done=0,err=0;
-  size_t n=sony_output(d->model,d->transport,d->seq++,low,high,lit,reset,packet,sizeof packet);
+  size_t n=sony_output_v(d->model,d->transport,d->seq++,low,high,lit,reset,d->vib_v2,packet,sizeof packet);
   if(n==48 && d->output_len==63) n=63;
   if(!n || n!=d->output_len) return 0;
   OVERLAPPED ov={0}; ov.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL); if(!ov.hEvent) return 0;
@@ -49,6 +50,7 @@ static int sony_write(SonyDevice* d,unsigned low,unsigned high,int lit,int reset
       else { ok=GetOverlappedResult(d->h,&ov,&done,FALSE); err=ok?0:GetLastError(); }
     } }
   CloseHandle(ov.hEvent); ok=ok && done==n;
+  memcpy(d->last_packet,packet,n); d->last_len=(unsigned)n; d->last_error=ok?0:(err?err:ERROR_WRITE_FAULT);
   if(!ok){ d->output_failed=1; if(d->errors++<8) LOG("controllers: Sony output FAILED id=%02x bytes=%lu/%u error=%lu\n",packet[0],(unsigned long)done,(unsigned)n,(unsigned long)err); }
   else { if(d->writes++<8 || getenv("SWR_CONTROLLER_TRACE")) LOG("controllers: Sony output sent id=%02x bytes=%u low=%u high=%u player1=%d reset=%d\n",packet[0],(unsigned)n,low,high,lit,reset); d->lit=lit; }
   return ok;
@@ -86,20 +88,25 @@ static int sony_open(SonyDevice* d,int output,int diagnostic){
     }
     if(model && diagnostic && bus==SONY_USB) LOG("controllers: HID candidate %04x:%04x usage=%x:%x input=%u output=%u transport=%s\n",a.VendorID,a.ProductID,caps.UsagePage,caps.Usage,caps.InputReportByteLength,caps.OutputReportByteLength,transport==SONY_USB?"USB":transport==SONY_BT?"Bluetooth":"unsupported");
     if(!transport || transport!=bus){ free(detail); continue; }
-    /* deny concurrent writers while owning output. never request an exclusive input handle. */
-    h=CreateFileW(detail->DevicePath,GENERIC_READ|(output?GENERIC_WRITE:0),output?FILE_SHARE_READ:FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
+    /* read+write with full sharing, as SDL/hidapi do. Denying FILE_SHARE_WRITE fails with error 32 whenever any
+       other handle on the pad has write access (on the owner's PC: always, even with no game or launcher running),
+       which left every session on read-only input: no lights and no rumble. */
+    h=CreateFileW(detail->DevicePath,GENERIC_READ|(output?GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL);
     int writable=output;
     if(h==INVALID_HANDLE_VALUE && output){
-      if(diagnostic) LOG("controllers: Sony output ownership unavailable error=%lu; trying shared input\n",(unsigned long)GetLastError());
+      LOG("controllers: Sony read+write open failed error=%lu; input only, no lights or rumble\n",(unsigned long)GetLastError());
       h=CreateFileW(detail->DevicePath,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,FILE_FLAG_OVERLAPPED,NULL); writable=0;
     }
     free(detail);
     if(h==INVALID_HANDLE_VALUE){ if(diagnostic) LOG("controllers: Sony input open failed error=%lu\n",(unsigned long)GetLastError()); continue; }
     memset(d,0,sizeof *d); d->h=h; d->model=model; d->transport=transport; d->pid=a.ProductID;
-    d->writable=writable; d->input_len=caps.InputReportByteLength; d->output_len=caps.OutputReportByteLength;
+    d->writable=writable; d->input_len=caps.InputReportByteLength; d->output_len=caps.OutputReportByteLength; d->feature_len=caps.FeatureReportByteLength;
+    if(model==SONY_DS5){ uint8_t f[80]={0x20}; unsigned fl=caps.FeatureReportByteLength>sizeof f?(unsigned)sizeof f:caps.FeatureReportByteLength;
+      int got=fl>=46 && ps_HidD_GetFeature(h,f,fl);
+      d->vib_v2=sony_vibration_v2(a.ProductID,got?f:NULL,got?fl:0); d->firmware=got?((unsigned)f[44]|(unsigned)f[45]<<8):0; }
     d->read.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL); d->last_input=GetTickCount64();
     if(!d->read.hEvent){ CloseHandle(h); memset(d,0,sizeof *d); continue; }
-    LOG("controllers: %s%s %04x:%04x %s backend=native-HID input=%u output=%u ownership=%s\n",model==SONY_DS5?"DualSense":"DualShock 4",a.ProductID==0x0df2?" Edge":"",a.VendorID,a.ProductID,transport==SONY_USB?"USB":"Bluetooth",d->input_len,d->output_len,writable?"input+LED+rumble":"shared input only");
+    LOG("controllers: %s%s %04x:%04x %s backend=native-HID input=%u output=%u output-access=%s firmware-update=%04x rumble=%s\n",model==SONY_DS5?"DualSense":"DualShock 4",a.ProductID==0x0df2?" Edge":"",a.VendorID,a.ProductID,transport==SONY_USB?"USB":"Bluetooth",d->input_len,d->output_len,writable?"read+write (lights+rumble)":"read-only (input only)",d->firmware,model==SONY_DS5?(d->vib_v2?"compatible-v2":"compatible-v1"):"classic");
     break;
   }
   ps_SetupDiDestroyDeviceInfoList(list); return d->h!=NULL;

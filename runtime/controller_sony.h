@@ -35,8 +35,16 @@ static uint32_t sony_crc(unsigned seed,const uint8_t* p,size_t n){
 static void sony_sign(uint8_t* p){
   uint32_t c=sony_crc(0xa2,p,74); for(int i=0;i<4;i++) p[74+i]=(uint8_t)(c>>(i*8));
 }
+/* DualSense firmware feature report 0x20 (64 bytes incl. ID): update version little-endian at byte 44.
+   Linux enables the "compatible vibration 2" rumble emulation from update version 2.21 (and always on Edge);
+   older firmware only knows the classic flag. Unknown firmware gets both flags, as SDL does on 2.24+. */
+static int sony_vibration_v2(unsigned pid,const uint8_t* feature,size_t n){
+  if(pid==0x0df2) return 1;
+  if(!feature || n<46 || feature[0]!=0x20) return 1;
+  return ((unsigned)feature[44]|(unsigned)feature[45]<<8)>=0x0215;
+}
 /* reset=1 is a separate DualSense lightbar-animation release packet. */
-static size_t sony_output(int model,int transport,unsigned seq,unsigned low,unsigned high,int lit,int reset,uint8_t* out,size_t cap){
+static size_t sony_output_v(int model,int transport,unsigned seq,unsigned low,unsigned high,int lit,int reset,int v2,uint8_t* out,size_t cap){
   if((model!=SONY_DS4 && model!=SONY_DS5) || (transport!=SONY_USB && transport!=SONY_BT)) return 0;
   /* Windows DualSense descriptors expose the 47-byte payload + ID, also used by SDL. */
   size_t n=transport==SONY_BT?78:model==SONY_DS5?48:32; if(cap<n) return 0;
@@ -46,7 +54,7 @@ static size_t sony_output(int model,int transport,unsigned seq,unsigned low,unsi
     out[0]=transport==SONY_BT?0x31:0x02;
     if(transport==SONY_BT){ out[1]=(seq&15)<<4; out[2]=0x10; }
     if(reset){ p[38]=2; p[41]=2; }
-    else { p[0]=3; p[1]=0x14; p[2]=high; p[3]=low;
+    else { p[0]=3; p[1]=0x14; p[2]=high; p[3]=low; if(v2) p[38]=4;
       p[43]=lit?4:0; p[44]=0; p[45]=lit?40:0; p[46]=lit?128:0; }
   } else {
     out[0]=transport==SONY_BT?0x11:0x05;
@@ -54,6 +62,9 @@ static size_t sony_output(int model,int transport,unsigned seq,unsigned low,unsi
     p[0]=7; p[3]=high; p[4]=low; p[6]=lit?40:0; p[7]=lit?128:0;
   }
   if(transport==SONY_BT) sony_sign(out); return n;
+}
+static size_t sony_output(int model,int transport,unsigned seq,unsigned low,unsigned high,int lit,int reset,uint8_t* out,size_t cap){
+  return sony_output_v(model,transport,seq,low,high,lit,reset,0,out,cap);
 }
 static int32_t sony_axis(unsigned v,int invert){
   int32_t a=(int32_t)v-128; a=a<0?a*32767/128:a*32767/127;
@@ -73,8 +84,9 @@ static int sony_input(int model,int transport,const uint8_t* in,size_t n,SonySta
     }
   } else return 0;
   uint64_t b=0; unsigned f=p[bo],x=p[bo+1],hat=f&15;
-  /* keep the WinMM Sony preference: Cross confirms, Circle goes back. */
-  if(f&0x20) b|=1ull<<0; if(f&0x40) b|=1ull<<1;
+  /* by position like every pad path (pad_layout.h applies button_layout): Circle (right) = A position, Cross
+     (bottom) = B, Triangle (top) = X, Square (left) = Y */
+  if(f&0x40) b|=1ull<<0; if(f&0x20) b|=1ull<<1;
   if(f&0x80) b|=1ull<<2; if(f&0x10) b|=1ull<<3;
   if(x&0x40) b|=1ull<<4; if(x&0x80) b|=1ull<<5;
   if(x&1) b|=1ull<<6; if(x&2) b|=1ull<<7;

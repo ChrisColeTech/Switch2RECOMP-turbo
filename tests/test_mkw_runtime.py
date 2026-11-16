@@ -65,7 +65,8 @@ def main():
     for sony in (0, 1):
         for raw, hid in ((4, 6), (5, 7), (10, 4), (11, 5), (6, 8), (7, 9), (3, 2), (0, 3)):
             assert lib.joy_buttons(1 << raw, sony) == 1 << hid
-    assert lib.joy_buttons(2, 1) == 1 and lib.joy_buttons(4, 1) == 2
+    # by position on every pad (button_layout maps to the guest later): circle (2) = A position, cross (1) = B position
+    assert lib.joy_buttons(4, 1) == 1 and lib.joy_buttons(2, 1) == 2
     assert lib.joy_buttons(1 << 9, 1) == 1 << 10
     assert lib.joy_buttons(0, 1) == 0
     print('PASS WinMM shoulders, stick clicks, triggers, face buttons, Options, neutral')

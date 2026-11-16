@@ -102,7 +102,7 @@ static int hid_applet_res(SvcObj* o, IpcCtx* c){
    we aggregate both LRA sides to the two host motors: low-frequency -> left, high-frequency -> right.
    handle byte order and inline command 201 follow libnx services/hid.c and services/hid.h. */
 static struct { float low,lowf,high,highf; u8 active; } g_vib[2];   /* device 0=left, 1=right */
-static u8 g_vib_permission=1, g_vib_list_created;
+static u8 g_vib_permission=1, g_vib_list_created; static int g_vib_trace;
 static PMutex g_vib_mutex;
 
 static int vib_side(u32 h){ u32 dev=(h>>16)&0xFF, id=(h>>8)&0xFF, style=h&0xFF;
@@ -124,6 +124,14 @@ static void vib_aggregate(void){
   backend_vibration_set(low,high); }
 
 static void vib_stop(void){ for(int s=0;s<2;s++) g_vib[s].low=g_vib[s].high=0; extern void backend_vibration_stop(void); backend_vibration_stop(); }
+
+/* 206 and Switch 2's 214: X-buffer 0 = handles, X-buffer 1 = 16-byte values. returns the pair count, -1 if malformed. */
+static int vib_values(IpcCtx* c){
+  u64 ha,hs,va,vs; if(!buf_xs(c,0,&ha,&hs) || !buf_xs(c,1,&va,&vs) || !ha || !va || hs<4 || vs<16) return -1;
+  u32 n=(u32)(hs/4); if(n>(vs/16)) n=(u32)(vs/16); if(n>256) n=256;
+  for(u32 k=0;k<n;k++){ const u8* hp=(const u8*)GP(ha+(u64)k*4); const u8* vp=(const u8*)GP(va+(u64)k*16);
+    u32 h; memcpy(&h,hp,4); int side=vib_side(h); if(side>=0 && g_vib_permission) vib_store(side,vp); }
+  vib_aggregate(); return (int)n; }
 
 static int hid_vibration_list(SvcObj* o, IpcCtx* c){
   if(c->cmd==0){ u32 h=in32(c,0); int side=vib_side(h); pm_lock(&g_vib_mutex); if(side>=0) g_vib[side].active=1; pm_unlock(&g_vib_mutex);
@@ -163,15 +171,19 @@ static int hid_dispatch(SvcObj* o, IpcCtx* c){
     case 203: g_vib_list_created=1; out_obj(c,svcobj_new("IActiveVibrationDeviceList",hid_vibration_list,0)); return 0;
     case 204: { u8 p=in8(c,0); g_vib_permission=p!=0; if(!p) vib_stop(); return 0; }  /* PermitVibration */
     case 205: out8(c,g_vib_permission); return 0;   /* IsVibrationPermitted */
-    case 206: { /* SendVibrationValues: X-buffer 0 = handles, X-buffer 1 = values */
-      u64 ha,hs,va,vs; if(buf_xs(c,0,&ha,&hs) && buf_xs(c,1,&va,&vs) && ha && va && hs>=4 && vs>=16){
-        u32 n=(u32)(hs/4); if(n>(vs/16)) n=(u32)(vs/16); if(n>256) n=256;
-        for(u32 k=0;k<n;k++){ const u8* hp=(const u8*)GP(ha+(u64)k*4); const u8* vp=(const u8*)GP(va+(u64)k*16);
-          u32 h; memcpy(&h,hp,4); int side=vib_side(h); if(side>=0 && g_vib_permission) vib_store(side,vp); }
-        vib_aggregate();
-        static int said; if(said++<8) LOG("hid: vibration batch count=%u active=%d,%d low=%.3f,%.3f high=%.3f,%.3f permitted=%d\n",n,g_vib[0].active,g_vib[1].active,g_vib[0].low,g_vib[1].low,g_vib[0].high,g_vib[1].high,g_vib_permission); }
+    case 206: case 214: { /* SendVibrationValues / Switch 2 SendVibrationValuesInMode (raw u64 mode + aruid, same buffers).
+      Switch 2 games (Mario Kart World, Donkey Kong Bananza) send all their rumble through 214, every frame. */
+      int n=vib_values(c);
+      static int said; if(n>=0 && (said++<8 || (g_vib_trace && (g_vib[0].low>0 || g_vib[0].high>0 || g_vib[1].low>0 || g_vib[1].high>0))))
+        LOG("hid: vibration batch cmd=%u mode=%u count=%d active=%d,%d low=%.3f,%.3f high=%.3f,%.3f permitted=%d\n",c->cmd,c->cmd==214 && c->raw_size>=4?in32(c,0):0,n,g_vib[0].active,g_vib[1].active,g_vib[0].low,g_vib[1].low,g_vib[0].high,g_vib[1].high,g_vib_permission);
       return 0; }
-    case 211: { u32 h=in32(c,0); int side=vib_side(h); out8(c,side>=0); return 0; }  /* IsVibrationDeviceMounted */
+    case 213: { /* SendVibrationValueInMode (17.0.0+): 0x18 raw bytes then aruid; the value is at 0x08 and the handle at
+      0x04 (mode first) or 0x00. a mode never passes as a handle, so the first offset with a valid handle wins. */
+      if(c->raw_size>=0x18){ u32 h=in32(c,4); int side=vib_side(h); if(side<0){ h=in32(c,0); side=vib_side(h); }
+        if(side>=0 && g_vib_permission){ vib_store(side,c->raw+8); vib_aggregate(); }
+        static int said; if(said++<8) LOG("hid: vibration in-mode handle=%08x side=%d raw=%u\n",h,side,c->raw_size); }
+      return 0; }
+    case 211: case 220: { u32 h=in32(c,0); int side=vib_side(h); out8(c,side>=0); return 0; }  /* IsVibrationDeviceMounted / Switch 2 IsOunceVibrationDeviceMounted */
     case 208: { u64 v=0; outbytes(c,&v,8); return 0; }   /* GetActualVibrationGcErmCommand: 8-byte Stop */
     case 400: out8(c,0); return 0;                                                 /* IsUsbFullKeyControllerEnabled */
     case 1000: g_comm_mode=in64(c,8); return 0;
@@ -187,7 +199,7 @@ static int hid_dispatch(SvcObj* o, IpcCtx* c){
   return stub_ok(o,c); }
 
 static int hid_disp(SvcObj* o,IpcCtx* c){
-  int vibration=c->cmd>=200 && c->cmd<=212;
+  int vibration=c->cmd>=200 && c->cmd<=220;
   if(vibration) pm_lock(&g_vib_mutex);
   int r=hid_dispatch(o,c);
   if(vibration) pm_unlock(&g_vib_mutex); return r;
@@ -208,7 +220,7 @@ static void no1_setup(void){ if(!g_hid_shm) return; u8* b=kshmem_ptr(g_hid_shm);
   if(g_style_ev[0]) kevent_signal(g_style_ev[0]); }
 
 void svc_hid_init(void){
-  pm_init(&g_vib_mutex);
+  pm_init(&g_vib_mutex); g_vib_trace=getenv("SWR_CONTROLLER_TRACE") && atoi(getenv("SWR_CONTROLLER_TRACE"));
   g_hid_shm=kshmem_new(0x40000,"hid"); kobj_ref(&g_hid_shm->o);
   u8* b=kshmem_ptr(g_hid_shm);
   no1_setup();

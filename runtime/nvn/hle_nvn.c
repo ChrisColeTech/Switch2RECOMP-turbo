@@ -1592,7 +1592,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     const char *e = getenv("NXRT_EXIT_AT_PRESENT");
     if (e && n >= strtoull(e, NULL, 0)) {
         LOG("NXRT_EXIT_AT_PRESENT: %llu presents, ending the run", (unsigned long long)n);
-        nxrt_log_summary(); ExitProcess(0);
+        nxrt_log_summary(); { extern void backend_controller_shutdown(void); backend_controller_shutdown(); } ExitProcess(0);
     }
 }
 

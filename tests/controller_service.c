@@ -52,6 +52,19 @@ int main(void){
   int before=sent; hid_disp(NULL,&c); assert(sent==before+1 && sent_low==.7f && sent_high==.8f);
   c.x[1].size=15; before=sent; hid_disp(NULL,&c); assert(sent==before);
   c.x[1].size=16; values[0]=.9f; memcpy(g_mem+64,values,16); hid_disp(NULL,&c); assert(sent_low==.9f && sent_high==.8f);
+  /* Switch 2 SendVibrationValuesInMode (214): raw u64 mode + aruid, same X buffers as 206; MKW/DKB send "2 0 1234 0". */
+  { u32 raw214[4]={2,0,0x1234,0}; values[0]=.15f; values[2]=.35f; values[4]=.05f; values[6]=.25f; memcpy(g_mem+64,values,sizeof values);
+    IpcCtx m={0}; m.cmd=214; m.raw=(u8*)raw214; m.raw_size=16; m.nx=2; m.x[0]=(IpcBuf){16,8,0}; m.x[1]=(IpcBuf){64,32,0};
+    before=sent; assert(hid_disp(NULL,&m)==0 && sent==before+1 && sent_low==.15f && sent_high==.35f);
+    m.nx=1; before=sent; hid_disp(NULL,&m); assert(sent==before); }
+  /* 213: 0x18 raw bytes then aruid; value at 0x08, handle at 0x04 (mode first) or at 0x00 */
+  { struct { u32 a,b; float v[4]; u64 aruid; } r213={2,0x10003,{.45f,160,.55f,320},0x1234};
+    command(213,&r213,sizeof r213); assert(sent_low==.45f && g_vib[1].high==.55f);
+    r213.a=3; r213.b=2; r213.v[0]=.65f; command(213,&r213,sizeof r213); assert(g_vib[0].low==.65f);
+    r213.a=0x300; r213.b=0x300; before=sent; command(213,&r213,sizeof r213); assert(sent==before);
+    before=sent; command(213,&r213,0x17); assert(sent==before); }
+  { u32 h=0x10003; IpcCtx m={0}; m.cmd=220; m.raw=(u8*)&h; m.raw_size=4; hid_disp(NULL,&m); assert(m.out_size==1 && m.out[0]==1);
+    h=0x300; IpcCtx bad={0}; bad.cmd=220; bad.raw=(u8*)&h; bad.raw_size=4; hid_disp(NULL,&bad); assert(bad.out_size==1 && bad.out[0]==0); }
   u8 permit=0; command(204,&permit,1); assert(stopped==1 && sent_low==0 && sent_high==0);
   before=sent; command(201,&req,sizeof req); assert(sent==before);
   permit=1; command(204,&permit,1); req.v[0]=.4f; req.v[2]=.6f;
@@ -73,6 +86,6 @@ int main(void){
   memset(&g_pad,0,sizeof g_pad); hid_update();
   u8* ring=base+HO_HidNpadInternalState_full_key_lifo;
   assert(read64(ring+0x20+read64(ring+0x10)*HS_HidNpadCommonStateAtomicStorage+8+HO_HidNpadCommonState_buttons)==0);
-  puts("PASS production HID handle layout, inline/batch dispatch, bounds, amplitude clamp, permission, activation and shared-memory rings (synthetic)");
+  puts("PASS production HID handle layout, inline/batch dispatch incl. Switch 2 commands 213/214/220, bounds, amplitude clamp, permission, activation and shared-memory rings (synthetic)");
   free(g_mem); free(g_hid_shm->host); return 0;
 }

@@ -210,7 +210,11 @@ void ini_load(const char* path){
     char* k=ln; while(*k==' '||*k=='\t') k++; char* ke=k+strlen(k); while(ke>k && (ke[-1]==' '||ke[-1]=='\t')) *--ke=0; while(*v==' '||*v=='\t') v++;
     { char* ve=v+strlen(v); while(ve>v && (ve[-1]==' '||ve[-1]=='\t')) *--ve=0; }
     if(!strcmp(k,"vsync")) continue;   /* removed option */
-    const char* kn=ini_norm(k); ini_store(kn,v); ini_apply(kn,v); }
+    const char* kn=ini_norm(k);
+    if(!strcmp(kn,"button_layout")){   /* old/alias values are read but written back under their current name */
+      if(!strcmp(v,"nintendo") || !strcmp(v,"position") || !strcmp(v,"positions")) v=(char*)"switch";
+      else if(!strcmp(v,"label") || !strcmp(v,"labels")) v=(char*)"xbox"; }
+    ini_store(kn,v); ini_apply(kn,v); }
   fclose(f); }
 
 /* rewrite the ini on every start: sorted, all keys, with help text */
@@ -229,6 +233,8 @@ static const IniOpt INI_INPUT[]={
   {"mouse_right_stick","0","Right stick: 0 = IJKL, 1 = mouse (change with F1)"},
   {"mouse_sensitivity","1.00","Mouse sensitivity: F1 10%..500% goes from 5x to 1250x speed, on a curve so 100% stays close to before"},
   {"mouse_invert","0","Mouse inversion: 0 = normal, 1 = horizontal, 2 = vertical, 3 = both"},
+  {"button_layout","switch","Controller face buttons: switch = by position like the Switch (right = A, bottom = B, top = X,\n;   left = Y; Circle = A, Cross = B on PlayStation), xbox = by Xbox label (bottom = A, right = B, left = X, top = Y;\n;   Cross = A, Square = X on PlayStation). Applies live"},
+  {"button_map","","Optional per-button overrides on top of button_layout, physical:guest pairs, e.g. south:a east:b.\n;   Physical: south east west north (or cross circle square triangle), l r zl zr lstick rstick plus minus up down\n;   left right. Guest: a b x y l r zl zr lstick rstick plus minus up down left right none"},
   {NULL,NULL,NULL}};
 
 static const IniOpt INI_GRAPHICS[]={
