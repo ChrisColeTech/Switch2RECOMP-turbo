@@ -1,166 +1,222 @@
-# Gameplay investigation (PLZA, DKB, MKW): hand-off
+<!-- SwitchRecomp - Copyright 2026 MZ Labs
+     Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+     Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
+# Gameplay investigation: Donkey Kong Bananza, Mario Kart World, Pokemon Legends Z-A
 
-Branch `gameplay-perf` (worktree `D:\Projects\Switch2RECOMP-plza`), based on turbo `4b4b239`. Not merged and not
-released. The owner asked for a hand-off: the main graphics bug (Donkey Kong Bananza terrain drawn black) was located
-but **not fixed**. This document is the complete state for the next agent.
+Status 2026-11-17. Owner's report: PLZA and DKB do not work past their title screens; in gameplay textures and graphics
+do not load (black screens, black gaps); MKW plays at about 30 FPS instead of 60.
 
-Owner's report: PLZA and DKB do not work past their title screens; in gameplay textures and graphics do not load (black
-screens, black gaps); MKW plays at ~30 FPS instead of 60.
+| game | before | now | open |
+|---|---|---|---|
+| Donkey Kong Bananza | gameplay reached, terrain black | terrain shaded, tutorial video plays | the console's own reset of the append counters is not identified (emulated by rule); queue order across GPU events; 40-60 FPS |
+| Mario Kart World | race at 44-51 FPS | race at 57 FPS mean, 59 in steady stretches | streaming and pipeline stalls (p99) |
+| Pokemon Legends Z-A | title -> Language -> Appearance | loads the save into the world; UI drawn, **world black** | deferred lighting / post-processing output black; transform feedback (skinned characters) not implemented |
 
-Display: console session (not RDP), Intel display adapter at 60 Hz, Vulkan on an RTX 5090 (driver 616.92). FPS numbers
-below are on the local display.
+Display: console session, 60 Hz, Vulkan on an RTX 5090. All numbers are from the real library builds, rebuilt through
+the engine CLI into each entry's `buildDir`, driven by `tools/plza_probe.py` (pad replay, runtime screenshots).
 
-## Commits on the branch
+## 1. Donkey Kong Bananza: black terrain
 
-| commit | what |
-|---|---|
-| `0ae160a` | Switch 2 video decoder: fences that wait, re-release accepted, bitstream back-pressure (`runtime/svc_ns2.c`) |
-| `8f5410f` | Metrics, input record/replay, dropped-work counters, logs; gameplay harness (`tools/plza_probe.py`, `tools/plza_inputs/`) |
-| (this doc) | hand-off |
+### What the frame does
 
-`python -m unittest discover -s tests -p "test_n*.py"`: 17 tests OK. All three library builds (DKB, MKW; PLZA not
-rebuilt this round) were rebuilt with the branch runtime through the engine CLI, into their real `buildDir`s.
+- Depth pre-pass (6 passes, 630-720 draws): each terrain chunk is drawn with VS `f9c807930abd1234`, FS
+  `7551b531372e364c` and a geometry shader `5d537f7630ec3671`, an NVIDIA passthrough GS. Two storage buffers are bound to
+  the geometry stage per chunk: slot 0 a 64-byte record, slot 1 a 15,000-byte list. Per visible triangle (front facing,
+  on screen, covering a pixel centre) the GS adds 3 to word 0 of the record (one `ATOMG` add for the whole warp) and
+  stores the triangle's three 16-bit indices into the list behind the old count (three `STG.U16`). The original Ampere
+  code has exactly these four memory instructions (checked with the opcode table of `runtime/sm86.c`); the translated
+  SPIR-V does the same.
+- Shading pass (one pass, same chunks): `nvnCommandBufferDrawElementsIndirect(TRIANGLES, U16, index buffer = the list,
+  arguments = the record)`, VS `d661413914c84d55`, FS `6d1b110994db5413`, depth EQUAL, no depth write.
 
-## Result per game
+So the record is both the GS's append counter and the draw's `NVNdrawElementsIndirectData`. The engine's own layout
+object for the record (class with vtable `0xa3dfe90`, the object at draw object + 120) says the same: one field of type
+19 with 5 components, element size 64.
 
-### Donkey Kong Bananza: past the title, plays; terrain black (OPEN)
+### What was wrong here
 
-Fixed (`0ae160a`): the game aborted (svcBreak, `nn::codec::ReleaseVp9DecoderOutputBuffer`, result `0xf201` =
-NotFound) the first time a tutorial video ended ("Y Punch" prompt, ~1 s into gameplay). After that was patched the game
-spun its video thread at a full core (~280 000 IPC/s) and the world stayed frozen. Three decoder bugs:
+The records were `{count, 0, 0, 0, 0}` with a count that only ever grew (+54 a frame for an 18-triangle chunk; 612,759
+after some minutes). Two things follow: every append lands past the end of its 15,000-byte list, and the draw has **0
+instances**, so the shading pass drew nothing. The pre-pass depth was there, nothing was shaded over it: black.
 
-1. **Decoder fences were complete at once.** `nn::gs::TryWaitNativeSync` -> `nn::syncpt::sdk::TryWaitSyncPoint` (soft
-   backend, sdk `0xad834f4` -> `0xad83550`) reads the syncpoint cache (transfer memory, `g_sc_ro + 0x40 + id*8`) and
-   treats an entry of `~0` ("unknown") as **signalled, without requesting a refresh**. The runtime seeds all 192 entries
-   with `~0` and only fills requested ones, so the decoder's syncpoint (20) was never filled. Fix: the decoder's syncpoint
-   is *published* (kept current every ms by the cache thread, `sc_publish`). Only runtime-owned syncpoints are published
-   on purpose: publishing GPU counters the emulation never advances could turn passing waits into hangs.
-2. **Re-release after flush.** After cmd 8 (flush) the game releases images 1, 2, 1; the SDK aborts on any error.
-   cmd 314 on an image the decoder already has is now accepted (same fence, newer client fence).
-3. **Pictures dropped.** The game submits a whole clip in ~0.1 s; pictures were decoded at submit into a 32-picture
-   queue and the oldest dropped (135 of 181). Now the bitstream waits in a packet FIFO and is decoded 6 pictures ahead as
-   output images return; ready event follows the FIFO. The 181-picture clip now plays in 3.34 s, 0 dropped.
+### What writes the record (everything that was checked)
 
-Verified: `build/plza-investigation/20261117-133337-dkb-punch` and `...-141344-dkb-cpuwins`: DK walks, punches gold
-(counter 0 -> 57.13), breaks the banana crystal, 45-60 FPS. The tutorial video panel still shows a flat yellow box
-(not investigated).
+Nothing but the GS:
 
-**OPEN: the destructible terrain is drawn black.** Evidence and analysis in the next section. This is the
-"black gaps" the owner reports, at least for DKB.
+- CPU: no store, ever. A polling thread on 8 records from their first use saw only write-back landings change them. A
+  page watch (PAGE_NOACCESS, re-armed every millisecond) on a record's page saw no guest read or write in 700 frames.
+  The pools the records come from (256 KB, flags CPU_CACHED | GPU_CACHED) were write-protected from their creation:
+  the guest never wrote a page of them. A scan of all 9 GB of committed guest memory found no array of
+  `{n, 1, 0, 0, 0}` at a 64-byte stride (no CPU-side copy to upload from). A watch on the engine's object for a
+  record saw only the command-list recorder read it.
+- GPU commands: the game never calls ClearBuffer, CopyBufferToBuffer or CopyTextureToBuffer (call census,
+  `SWR_NVN_CALLS=1`); its UpdateUniformBuffer calls all target the uniform pool; no dispatch and no other draw binds the
+  records (pass dump with every record listed); the terrain shaders have no memory instruction besides the GS's four.
+- Not the cause: write-back races (ruled out before), the two NVN queues' order (below), device information the game
+  asks for (only item 0x36 per frame).
 
-### Mario Kart World: race reached, ~45 FPS (OPEN)
+The same engine class is used once elsewhere with CPU initialisation: `F_819xxxx` (return address `0x81a01fc`) creates
+a counter record and an arguments record and writes `{0, 1, 0, 0, 0}` into the latter. The terrain's records get no such
+store.
 
-`build/plza-investigation/20261117-142014-mkw-race`: title -> L+R -> A x8 -> Grand Prix, Mario Bros. Circuit, racing
-(`tools/plza_inputs/mkw_drive.txt`). Graphics look correct in the race screenshots. FPS in the race (t >= 150 s):
-**45.1 mean** on the 60 Hz local display (not RDP). Frame time p50 17.0 ms, p95 28.3, p99 96.1.
+**Not found: what the console does so that each frame's list starts at 0 and is drawn once.** Either NVN2 has a
+behaviour not visible in the command stream, or a path of the game that does it does not run here. This is the open
+question of this investigation.
 
-Where the time goes (harness `report` metrics summary, last 30 % of frames): replay thread CPU **21.1 ms/frame**,
-GPU 6.5 ms/frame, replay waits 5.0 ms, pipelines 2.8 ms, texture uploads 3.7 ms. 135 shaders missed and 133 arrived
-from the live translator during the run (2011 draws skipped for a missing shader, pop-in). The exclusive monitor is off
-for 04 titles. **The limiter is the NVN replay thread's CPU time (> 16.7 ms), not the GPU and not guest CPU.** Not
-investigated further; next step: `gamectl set phases 1` / `NXRT_VK_PHASES` and the per-frame `frames.csv` columns to
-split the 21 ms (descriptor sets, `vkm_use` syncs, write-backs ~1000/frame).
+### The fix (emulation by rule, `7b5a28c`)
 
-### PLZA: not driven into gameplay this round
+`runtime/nvn/vk/vk_replay.c`, "Append counters that are indirect draw arguments": an indirect draw whose arguments a
+draw-stage shader wrote as a storage buffer in the same frame
 
-Earlier rounds reached Language -> Appearance at 30 FPS. Next screens (likely name entry: software keyboard applet,
-then the intro) were not attempted. Use `tools/plza_probe.py` with `--metrics --record`.
+- gets one instance when its record holds none (written into the record once),
+- has its count set back to 0 when the next frame begins, before anything appends again (`vkCmdFillBuffer` in command
+  order, mirrored to guest memory like every GPU write).
 
-## DKB black terrain: what is known
+It is keyed on the structure, not on the title: records written by compute dispatches or by the CPU are not touched.
+`gamectl set append_reset 0` (`NXRT_VK_APPEND_RESET=0`) turns it off. Metric `append_counter_reset` counts the resets
+(about 630 a frame in the mining tunnel).
 
-Run with the switches below to reproduce; every experiment ran in the live game via the control pipe
-(`tools/plza_probe.py action RUN ctl --ctl "<cmd>"`), dumps moved into the run folders.
+### Second fix: storage buffers bound with size 0
 
-**Frame structure** (pass dump `20261117-135123-dkb-pd`, frame at the start of gameplay, `pdscan.py`-style analysis):
+DKB's second NVN queue runs one dispatch (`7516216f8dcdb9e1`: 64 threads over the depth buffer, appending points to a
+list) whose storage buffer is bound with **size 0** (`BindStorageBuffer(compute, 2, addr, 0)` from the engine's generic
+bind at `0x82c7a38`). An NVN shader holds the buffer's address and reads and writes through it; the size is only what
+the driver tells the shader. The replay bound such a buffer to nothing, so every entry was lost while the CPU reads the
+buffer back each frame (`InvalidateMappedRange` of its 0x440 bytes). Now bound to the end of its pool (at most 1 MB).
+With this the game started a compute pass and several draws it had never issued before, and the tutorial video panel,
+a flat yellow box before, shows its video.
 
-- passes 13-18: **terrain depth pre-pass**, 720 non-indexed-indirect draws, VS `f9c807930abd1234`, FS `7551b531372e364c`,
-  depth LESS write on, with a **geometry shader `5d537f7630ec3671`**: an NVIDIA *passthrough* GS
-  (`SPV_NV_geometry_shader_passthrough`, `ShaderViewportMaskNV`; both extensions enabled on the device). The GS is a GPU
-  culling/compaction stage: per triangle a visibility test; visible: subgroup ballot, the highest lane does
-  `atomicAdd(gp_s0[0], 3*count)`, the base is shuffled, indices are written as u16 into `gp_s1` at byte
-  `(base + prefix*3)*2` (16-bit CAS helper), `gl_ViewportMask = 1`; culled: mask 0. **No wrap/modulo on the offset.**
-- pass 28: **terrain shading**, 721 *indexed indirect* draws, VS `d661413914c84d55` (same program as the pre-pass VS
-  minus the VertexIndex output), FS `6d1b110994db5413`, depth **EQUAL**, depth write off. Indirect args = the GS's
-  `gp_s0` (per chunk, `ind=` equals the GS's slot0 address), indices = `gp_s1` (15 000 bytes = 7 500 indices per chunk).
+### Result
 
-**Observations:**
+Same scripted run (title, Continue, walk, punch, walk):
 
-1. Texdumps (`...-134433-dkb-rt`, `...-135735-dkb-hide`): the material/ID target (RGBA8 1920x1080) has no terrain (clear
-   colour, blue); depth **has** the terrain; lit output black there.
-2. `hide f9c807930abd1234` (pre-pass hidden): the shading pass then draws terrain everywhere and the lit frame shows a
-   detailed tunnel (beams, walls). `hide d661413914c84d55`: ID target blue again. So the shading draws do rasterize; they
-   lose the depth test against the pre-pass.
-3. Relaxing depth EQUAL to LEQUAL for test-only draws (applied to ~850 draws/frame): **no visible change**. So it is not
-   an ulp mismatch; the pre-pass depth has geometry nearer than anything the shading pass draws (the cave walls around
-   the camera: they are in the pre-pass, missing from the appended lists).
-4. `set no_gs 1` (draw without the GS): identical screen and depth.
-5. **The append counters never return to 0.** Guest copies of `gp_s0` (written back from the GPU) at pass-dump time:
-   counts like 612 759 indices for a 587-vertex chunk, 544 of 721 chunks above the 7 500-index capacity; ratio vs frame
-   number fits ~50-740 appends/frame accumulated over ~830 frames. Instance word 0 in the guest copy. With accumulated
-   counters every append lands past the end of `gp_s1`, so after the first frames the shading pass draws only stale or
-   no indices, and the walls exist only in depth. **This is the most likely root cause.** On the console something
-   resets the counters every frame.
-6. The args addresses change between dumps (`0x2490721c0...` vs `0x249051540...`): per-frame sub-allocation from a
-   ring.
-7. What does *not* reset them (pass dump `...-dkb-pd2`, with logging of buffer ops added): no `ClearBuffer` (fill) and
-   no `CopyBufferToBuffer` in the frame; the 86 `UpdateUniformBuffer`s all target `0x15bec8xxx` (uniform data). None of
-   the frame's compute dispatches binds the `0x249...` range.
-8. Write-back race checked and **ruled out**: a version of `wr_land` that keeps a guest word the CPU changed after the
-   GPU work began (`g != base && g != after`) counted 0 such words over a whole run (metric `wb_cpu_newer`, kept as a
-   counter). Starting with `NXRT_VK_WB_OFF=1`: guest args read 0 (as expected with no write-back), image unchanged.
-9. Live switches with no effect on the terrain: `use_fast 0`, `use_seen 0`, `wb_off 1`, `set_reuse 0`, `dyn_dedupe 0`,
-   `tex_memo 0`, `up_barrier 0`, `wb_whole 1` (`...-dkb-switches`).
+| | before (`20261117-141344-dkb-cpuwins`) | after (`20261117-164844-dkb-after`) |
+|---|---|---|
+| start of gameplay: near-black pixels / black cells of 64 | 68.6 % / 11 | 21.6 % / 0 |
+| after walking | 73.7 % / 33 | 3.0 % / 0 |
+| after punching | 56.0 % / 22 | 6.6 % / 0 |
+| after the second walk | 56.6 % / 21 | 0.1 % / 0 |
+| FPS in gameplay (mean) | 45.8 (nothing shaded) | 39.6 at that commit; see section 4 for the final build |
 
-**Next steps (in order):**
+### Open for DKB
 
-1. Find who zeroes a chunk's args on the console. Most direct: a write watch in the dirty-tracking fault path
-   (`runtime/nvn/gfx/nvn_dirty.c`): for faults inside a watched range (`SWR_WATCH=<addr>,<len>`, e.g. the ring around
-   `0x249040000`), log the host RIP mapped to the guest function and the guest LR of the current thread, once per site.
-   If the CPU zeroes the slot: check whether `pool_sync`/pending-merge uploads it before the GS runs (the shadow may
-   already equal 0 when write-back is off; with write-back on, look at the ordering of landing vs the CPU write).
-   If nothing on the CPU writes it: look for a GPU write path the replay does not model (semaphore/report writes,
-   `nvnCommandBufferReportCounter`/`SetMemory`-style NVN2 commands, copy-engine ops), or check whether NVN2 resets
-   SSBO-bound atomics through the 0x644/c0 driver block.
-2. Alternatively find the allocator in the game: the args address is the GS's `gp_s0`, loaded from the driver constant
-   block at `c0 + 1040` (SSBO binding table); trace the command-buffer code that binds it
-   (`nvnCommandBufferBindStorageBuffer` HLE, `OP_BIND_SSBO`) back to the guest caller (`kthread` LR) and read the
-   recompiled C for the reset.
-3. Verify with the black audit: `tools/plza_probe.py report` prints per-screenshot near-black fraction and black cells;
-   the start-of-gameplay view is ~68 % near-black, 11-12/64 black cells today. A fixed frame should look like the
-   `hide f9c807...` frame in `...-dkb-hide/texdump`, but with the near walls drawn.
+- The console's reset (above).
+- GPU events across queues. The frame's two queues hand over with events: main `Signal(E0=0)`, pre-pass, `Wait(E1==1)`,
+  two passes and three dispatches, `Signal(E0=2)`, `Wait(E1==3)`, shading; second queue `Wait(E0==0)`, `Signal(E1=1)`,
+  `Wait(E0==2)`, its dispatch, `Signal(E1=3)`. The replay runs each submission whole, in submit order, so the second
+  queue's dispatch runs before the main queue's frame instead of between its pre-pass and its shading (it reads last
+  frame's depth), and the waits time out once ("a GPU wait on an event ... was not met in 250 ms") and are then skipped.
+  Doing it right means suspending a submission's walk at a wait and continuing another queue's (fibers). Pass dumps now
+  show the waits and signals.
+- One `[RED] a 3D texture read as another type` (texture 1x1x1, shader `4419f04c58bf1535`).
 
-Ruled-out theories, for the record: shader cache misses (the live translator fills the cache, ~0.7 s pop-in; three
-boot-time programs once failed to dump, timing dependent, now logged with the reason); missing NV extensions;
-indirect-count draws; conditional rendering (`draw_render_skip` = 0); depth-EQUAL invariance; vertex inputs missing.
+## 2. Mario Kart World: frame rate
 
-## Instrumentation (`8f5410f`): how to turn it on
+### Where the time went
+
+A race frame's period is the translation thread's time for the frame plus the landing of the frame's GPU write-backs:
+the game waits for the frame's fence every frame (`SyncWait` 4.8 ms a frame), and a fence is reported after the
+submission's completion work, which includes writing the GPU's storage-buffer changes back to guest memory. Neither the
+GPU (6.5 ms), nor the guest CPU (busiest thread 26 % of a core), nor the translation thread alone (12.7 of 18.4 ms)
+was saturated.
+
+New tool: `SWR_HOST_PROF=<start s>,<seconds>` samples the translation thread (or, with
+`SWR_HOST_PROF_THREAD=completion`, the completion thread) 2000 times a second; `tools/host_prof.py` prints the table by
+function, with time in other modules by export and by calling function. Findings in the race (30 s):
+
+| where | cost | cause |
+|---|---|---|
+| completion thread, `prep_write` | 4-5 ms a frame | each page a write-back changed scanned all 5,200 tracked ranges (pools) |
+| completion thread, `wb_land` compare | 3 ms a frame | 14.7 MB a frame of write-back compared (six buffers of 0.5-4.7 MB written by compute every frame; 214 KB really change) |
+| translation thread, `gpu_pending` + `guest_copy` | 2 ms a frame | 3,700 pages a frame copied aside when a GPU write is recorded; the pending counters' cache lines shared with the completion thread |
+| translation thread, `vkm_use_` + `nvn_dirty_since_span` | ~1 ms | each of 16,000 uses a frame looked at its pages' stamps again |
+| translation thread, `fl_draw` | 0.2 ms | two `strtoull` of the shader keys per draw |
+
+Left as they are (measured, not changed): descriptor set contents (texture and buffer lookups, 5 ms of the thread; the
+allocation and `vkUpdateDescriptorSets` are only 1.5 ms of it), `walk` (cache misses on the game's command lists),
+`vkt_resolve`, the Vulkan driver itself (4 ms).
+
+### Fixes (`5758e24`)
+
+- `nvn_dirty.c`: the tracked ranges sorted by address behind a reader lock, rebuilt when a pool comes or goes
+  (`NXRT_DIRTY_INDEX=0`: the old scan).
+- `vk_mem.c`: a range used once in a submission stays as copied for that submission (`use_fast 3`; `gamectl set
+  use_fast 1` restores the per-use look). The pending counts are taken down by the translation thread
+  (`NXRT_VK_PENDING_DIRECT=1`: as before). Large page copies and compares are split among the caller and three helper
+  threads (`NXRT_VK_PAR=0`: alone).
+- `vk_replay.c`: a shader's key as a number once.
+
+### Result
+
+Same scripted run (title, L+R, A x8, Grand Prix, Mario Bros. Circuit, 2 x 40 s of driving), window 150-185 s:
+
+| | before (`20261117-170738-mkw-prof2`) | after (`20261117-173453-mkw-perf3`) |
+|---|---|---|
+| FPS mean | 50.8 | 57.3 |
+| seconds at 58 FPS or more | 6 of 35 | 25 of 35 |
+| present interval p50 / p95 / p99 | 18.46 / 21.41 / 36.17 ms | 16.68 / 18.05 / 27.31 ms |
+| intervals over 20 ms / over 33 ms | 300 / 20 | 41 / 12 |
+| translation thread per frame | 12.7 ms | 9.5 ms |
+| game threads in SyncWait per frame | 4.8 ms | 0.2-1.9 ms |
+
+(`20261117-165429-mkw-base`, with phase tracing on: 44.3 FPS mean; the hand-off's run: 45.1.) The log's own 300-frame
+windows read 59.0 FPS (p50 16.66-16.70 ms) in steady stretches; the remaining dips are single long frames from texture
+streaming and first-use pipelines (p99), as in `MKW_PERFORMANCE_INVESTIGATION.md`. Graphics checked in the race
+screenshots: no black areas (near-black 0.0-0.3 %).
+
+Metric `ind_draw_no_instances` counts indirect draws whose record holds 0 instances *as guest memory has it at replay*;
+in MKW (about 50 a frame) those are records a compute pass of the same submission writes, not missing draws.
+
+## 3. Pokemon Legends Z-A: into the world, world black
+
+The library build has a save now (the owner chose language and appearance), so the game boots to its title, and A
+loads the save: a train station, speech bubbles, "A Talk". **Only the UI is on screen; the world is black**
+(`20261117-174600-plza-play2/0003-shot-settled.png`, near-black 98 %). The save was copied aside before the runs
+(`build/plza-investigation/plza-save-backup-20261117`) and is byte-identical after them.
+
+What the texture dump shows (`20261117-174922-plza-td/gbuffer_sheet.png`, pass dump in its `run.log`):
+
+- The G-buffer pass (1920x1080 targets, the game renders 1280x720 into them) is drawn: albedo (`RGBA8_SRGB`) has the
+  station, tiles, wall and train; normals and the material target too; depth is written.
+- The lit target (`R11G11B10F`, ser24979) is black except the sky and the train's lights. Two inputs of the lighting are
+  all zero: the fourth G-buffer target (`R11G11B10F`) and an `RGBA16F` pair. The final targets hold only the UI.
+- 190 transform feedback draws a frame (points, 3 buffers of 12 + 4 + 4 bytes a vertex: skinned positions, normals,
+  tangents). **Transform feedback is not implemented in the Vulkan replay** (`[RED] transform feedback is not captured
+  yet`): skinned characters cannot appear. Pass dumps now list the feedback buffers and begin/end.
+- `[RED] a cube view of a 64x64 / 128x128 texture that is not a cube map: viewed as a 2D array` (8 times): the
+  environment maps the lighting reads.
+- 160 draws skipped at first for 4 shaders the live translator then delivered.
+
+Not done: finding why the lighting output is black (suspects in order: the cube-view textures, the three 26x1x1
+dispatches that build the light lists, the shadow target), transform feedback (needs the varyings in the translated
+vertex shaders, `VK_EXT_transform_feedback` pipelines, capture and write-back).
+
+## 4. Regression checks and final numbers
+
+See the table at the end of this section in the commit that closes the round; runs under
+`build/plza-investigation/` are named `*-final-<game>`.
+
+## Instrumentation and switches added in this round
 
 | switch | what |
 |---|---|
-| `SWR_METRICS=1` (or a path), or `[Debug] metrics=1` in the game's ini (launcher per-game ini) | `metrics-<time>.csv` next to the log, once a second: frames, FPS, process/guest CPU, 3 busiest threads, time blocked per wait kind (condvar, mutex, address, waitsync, sleep, IPC) and counts, xmon, draws, skipped draws by reason, dispatches, shaders missing/arrived/failed/stale, textures made/dropped by reason, views failed, shaders unusable, draws dropped (primitive, mesh, conditional render), `wb_cpu_newer`, GOB order. Also turns on `SWR_FRAME_CSV` (`frames-<time>.csv`, per frame: present CPU/acquire/fence/wait, replay CPU/GPU/waits/pipelines/textures, cumulative). Off: one branch per SVC. |
-| `SWR_INPUT_RECORD=<file>` | every pad change: `<ms> <buttons hex> <lx> <ly> <rx> <ry>` |
-| `SWR_INPUT_REPLAY=<file>` | plays such a file over the pad when it appears; again whenever it is rewritten |
-| logs (always) | each texture format/layout combination once (linear / block-linear + GOB order); a draw skipped for a missing shader names the program and its keys; why a shader could not be dumped; NV passthrough/viewport-array2 in the features line; pass dumps show buffer copies/updates/fills |
-| `gamectl set no_gs 1` | draws without geometry shaders (diagnostic) |
+| `SWR_HOST_PROF=<start s>,<seconds>[,<file>]`, `SWR_HOST_PROF_THREAD=completion` | sampling profile of the translation or completion thread; `python tools/host_prof.py <Game>.log.hostprof.txt` |
+| `SWR_NVN_CALLS=1` | every 30 s, the NVN entries the game called and how often |
+| metrics columns `append_counter_reset`, `sbuf_size0`, `ind_draw_no_instances` | per second, with the other dropped-work counters (`SWR_METRICS`) |
+| pass dumps (`gamectl passdump 1`) | GPU event waits and signals, transform feedback buffers and begin/end |
+| `gamectl set append_reset 0`, `use_fast 1`; `NXRT_DIRTY_INDEX=0`, `NXRT_VK_PAR=0`, `NXRT_VK_PENDING_DIRECT=1` | each fix off, for A/B |
 
-Harness `tools/plza_probe.py` (works for any game folder via `--game`): `start LABEL --game DIR --seconds N
---shot-every S [--metrics] [--record] [--stacks] [--verbose] [--env K=V]`; `action RUN {a,b,x,y,lr,plus,up,down,left,
-right,shot,ctl,replay,stop} --observed TEXT [--settle S] [--ctl "cmd"] [--file script]`; `report RUN` (result, black
-audit per screenshot, metrics summary). Input scripts: `tools/plza_inputs/{dkb_walk,dkb_punch,mkw_drive}.txt`.
-
-Gotchas: `start` refuses while the game exe is running (wait for `result.json`); the ctl `texdump` writes PNGs beside
-the game log (move them out); the harness only ever stops processes it started.
+Earlier switches (metrics, input record/replay, harness) are in `PLZA_BLACK_SCREEN_INVESTIGATION.md` and in
+`tools/plza_probe.py`'s header. The harness's `ctl texdump` writes its images beside the game's log: move them into the
+run folder afterwards.
 
 ## Evidence
 
-All under `D:\Projects\Switch2RECOMP-plza\build\plza-investigation\`:
-`20261117-125403-dkb-play` (the abort), `-130601-dkb-play3` (spin/freeze), `-131949-dkb-video2` (syncpoint cache ~0),
-`-132645-dkb-sync`, `-133337-dkb-punch` (gameplay works), `-134433-dkb-rt` and `-135735-dkb-hide` (texdumps),
-`-135123-dkb-pd` and the `dkb-pd2` run (pass dumps), `-1347xx-dkb-gs` (GS A/B), `dkb-eq`, `dkb-switches`, `dkb-wboff`,
-`-141344-dkb-cpuwins`, `-142014-mkw-race`. Each has screenshots, `run.log`, `progress.jsonl`, `actions.jsonl`, and with
-`--metrics` `metrics.csv` + `frames.csv`.
+All under `build/plza-investigation/` of the worktree (not in git):
 
-## Not done (from the task)
-
-DKB terrain fix; MKW 60 FPS; PLZA gameplay; regressions on all three plus Zelda OoT / SMB Wonder; merge to turbo; Engine
-CI; launcher submodule bump and VERSION 0.1.0 -> 0.2.0 release. Nothing was merged or released.
+- DKB: `20261117-143517-argdbg` .. `-161911-obj3` (the record watches and engine object dumps), `-152753-pdops` and
+  `-160514-early` (pass dumps with every record), `-150633-hack` (first proof that reset + one instance gives the
+  right image), `-164844-dkb-after`.
+- MKW: `-165429-mkw-base`, `-170738-mkw-prof2` (`hostprof.txt`), `-172357-mkw-perf2` (completion thread profile),
+  `-173453-mkw-perf3`.
+- PLZA: `-174600-plza-play2`, `-174922-plza-td`.

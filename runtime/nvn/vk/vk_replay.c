@@ -1830,7 +1830,7 @@ static void state_op(uint32_t op, const void *a) {
     case OP_BLEND_COLOR: memcpy(S->blend_color, ((const p_blend_color *)a)->rgba, 16); break;
     case OP_ALPHA_REF: S->alpha_ref = ((const p_alpha_ref *)a)->ref; break;
     case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S->copy_img_stride = cs->stride; else S->copy_stride = cs->stride; break; }
-    case OP_TF_STATE: { const p_tf_state *b = a; S->tf_on = b->what == 0 || b->what == 3; if (S->tf_on) RED_ONCE(111, "transform feedback is not captured yet"); break; }
+    case OP_TF_STATE: { const p_tf_state *b = a; S->tf_on = b->what == 0 || b->what == 3; PD("transform feedback %s (control buffer %#llx)", b->what == 0 ? "begin" : b->what == 1 ? "end" : b->what == 2 ? "pause" : "resume", (unsigned long long)b->ctl); if (S->tf_on) RED_ONCE(111, "transform feedback is not captured yet"); break; }
     case OP_PRIM_RESTART: S->restart = *(const p_prim_restart *)a; break;
     case OP_RAST_DISCARD: S->rast_discard = ((const p_rast_discard *)a)->on; break;
     default: break;
@@ -1954,7 +1954,7 @@ static int walk(const uint8_t *p, int depth, uint64_t *budget) {
         case OP_DRAW_TEX: RED_ONCE(120, "DrawTexture is not replayed yet"); break;
         case OP_RENDER_COND: render_cond((const p_render_cond *)a); break;
         case OP_PUSH_CONST: { const p_push_const *r = (const p_push_const *)a; if ((uint32_t)r->offset + r->size <= DMSH_PUSH_SIZE) { memcpy(S->push[r->compute != 0] + r->offset, r->data, r->size); for (int k = 0; k < 6; k++) g_bver[k]++; } break; }
-        case OP_TF_BIND: break;
+        case OP_TF_BIND: { const p_tf_bind *b = (const p_tf_bind *)a; PD("transform feedback buffer %d: %#llx, %llu bytes", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); break; }
         default: state_op(h.op, a); break;
         }
         p += h.size;
