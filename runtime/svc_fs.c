@@ -393,10 +393,23 @@ static const u8 k_ng1_version[]={0,0,0,0x20}, k_ng2_version[]={0,0,0,0x1A};
 
 static const u8 k_ng2_ac[]={0x1F,0x8B,0x08,0x08,0x00,0x00,0x00,0x00,0x02,0xFF,0x61,0x63,0x72,0x61,0x77,0x00,0x63,0x60,0x18,0xD9,0x00,0x00,0x58,0x85,0x96,0x0D,0x00,0x01,0x00,0x00};
 
+/* MiiModel (0802), the textures and shapes of nn::mii's renderer. yuzu makes up its six files as the NFTR / NFSR
+   headers alone (file_sys/system_archive/mii_model.cpp) and the parts tables after them then read as zeros past the
+   end. here the game reads those tables out of its heap buffer: shape parts of 0x58 bytes at up to ~0x12000 in,
+   texture parts of 0x1C at up to ~0x3000, each valid when its size (+4) isn't 0. so the files carry the tables,
+   all zero: every part has size 0 and the renderer skips it (Miis draw without their face). Mario Kart 8 Deluxe
+   took heap garbage for sizes from the empty archive, mapped a memory pool it had never created and crashed */
+static u8 g_mii_tex[0x10000], g_mii_shape[0x20000];
+
 /* NULL when there is no synthetic version of that archive */
 static SvcObj* sysdata_open(u64 id){
   static char names[64][24]; SynFile f[64]; int n=0, k=0;
-  if(id==0x0100000000000806ull){
+  if(id==0x0100000000000802ull){
+    memcpy(g_mii_tex,"NFTR\1",5); memcpy(g_mii_shape,"NFSR\1",5);
+    static const char* const tex[4]={"NXTextureLowLinear.dat","NXTextureLowSRGB.dat","NXTextureMidLinear.dat","NXTextureMidSRGB.dat"};
+    for(int i=0;i<4;i++) f[n++]=(SynFile){tex[i],g_mii_tex,sizeof g_mii_tex};
+    f[n++]=(SynFile){"ShapeHigh.dat",g_mii_shape,sizeof g_mii_shape}; f[n++]=(SynFile){"ShapeMid.dat",g_mii_shape,sizeof g_mii_shape}; }
+  else if(id==0x0100000000000806ull){
     for(int i=0;i<16;i++){ snprintf(names[k],24,"%d.txt",i); f[n++]=(SynFile){names[k++],k_ng_word_txt,sizeof k_ng_word_txt}; }
     f[n++]=(SynFile){"common.txt",k_ng_word_txt,sizeof k_ng_word_txt};
     f[n++]=(SynFile){"version.dat",k_ng1_version,4}; }
