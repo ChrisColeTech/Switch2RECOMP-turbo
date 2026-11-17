@@ -6,6 +6,7 @@
 python tools/plza_probe.py start baseline --game "D:/path/to/game folder" --seconds 300 [--verbose] [--stacks]
 python tools/plza_probe.py action RUN a --observed "language selection"      (a b x y lr plus up down left right)
 python tools/plza_probe.py action RUN shot --observed "after confirming"
+python tools/plza_probe.py action RUN replay --file tools/plza_inputs/dkb_walk.txt --observed "in gameplay" --settle 14
 python tools/plza_probe.py action RUN stop --observed "done"
 python tools/plza_probe.py report RUN
 
@@ -15,6 +16,10 @@ request file (NXRT_VK_SHOT_FILE) and scripted input (SWR_INPUT_FILE). It writes,
   progress.jsonl       every 5 s: frames presented, FPS, texture count/MB, stall warnings so far (from the log)
   stall-N-threads.txt  threads.txt as it was at the N-th "s without a new image" warning, with the log's dump block
   stall-N-stacks.txt   with --stacks: native stacks of the game (cdb -pv), runtime frames resolved with nm
+  metrics.csv          with --metrics: once a second, guest CPU, waits by kind, draws and what was dropped (SWR_METRICS)
+  frames.csv           with --metrics: once a frame, the GPU / present breakdown (SWR_FRAME_CSV)
+  input-record.txt     with --record: the pad as it was played (SWR_INPUT_RECORD), replayable with action replay
+Each screenshot's progress.jsonl record carries its black audit: near-black fraction, fully black cells of an 8x8 grid.
   actions.jsonl, provenance.json (hashes), run.log, threads.txt, result.json
 It only ever stops processes it started (the startup relaunch child is verified by parent, path and start time).
 """
@@ -202,7 +207,10 @@ def worker(run):
     atomic(run / 'provenance.json', json.dumps({str(p): sha(p) for p in files if p.is_file()}, indent=2))
     if log.exists(): shutil.copy2(log, run / 'prior-run.log')
     env = dict(os.environ, NXRT_VK_SHOT_FILE=str(run / 'shot-request.txt'), NXRT_VK_SHOT_EVERY='0', NXRT_VK_SHOT_WINDOW='0',
-               SWR_INPUT_FILE=str(run / 'input.txt'), SWR_INPUT_EXCLUSIVE='1')
+               SWR_INPUT_FILE=str(run / 'input.txt'), SWR_INPUT_EXCLUSIVE='1',
+               SWR_INPUT_REPLAY=str(run / 'replay.txt'))
+    if config.get('metrics'): env['SWR_METRICS'] = str(run / 'metrics.csv'); env['SWR_FRAME_CSV'] = str(run / 'frames.csv')
+    if config.get('record'): env['SWR_INPUT_RECORD'] = str(run / 'input-record.txt')
     env.update(config['env'])
     args = [str(exe), '--fullscreen=0'] + (['-v'] if config['verbose'] else [])
     proc = subprocess.Popen(args, cwd=exe.parent, env=env, stdout=(run / 'stdout.log').open('wb'), stderr=subprocess.STDOUT)
@@ -229,7 +237,7 @@ def worker(run):
             if req.exists(): req.unlink()
             record(screenshot=None, name=name, note='no present within 10 s')
             return None
-        record(screenshot=path.name, name=name)
+        record(screenshot=path.name, name=name, **black_audit(path))
         return path.name
     def scan_log():
         """new log lines: progress counters and stall warnings"""
@@ -262,6 +270,15 @@ def worker(run):
                 record(**request)
                 if action == 'stop':
                     reason = 'requested stop'; atomic(run / f'{ident}.done.json', json.dumps(dict(stopping=True))); break
+                if action == 'replay':
+                    # the runtime picks the file up within 0.2 s and plays it from then (svc_hid.c)
+                    shutil.copyfile(request['file'], run / 'replay.txt')
+                    record(replay=request['file'])
+                    time.sleep(request['settle'])
+                    image = shot('replay-settled')
+                    atomic(run / f'{ident}.done.json', json.dumps(dict(screenshot=image)))
+                    next_shot = time.monotonic() + config['shot_every']
+                    continue
                 if action == 'ctl':
                     reply = ctl(request['ctl'])
                     record(ctl=request['ctl'], reply=reply.strip()[:2000])
@@ -320,11 +337,14 @@ def main():
     p.add_argument('--shot-every', type=float, default=10, help='seconds between periodic screenshots, 0 = none')
     p.add_argument('--verbose', action='store_true', help='runtime -v (log=2: IPC, thread starts, core masks)')
     p.add_argument('--stacks', action='store_true', help='native stacks with cdb at the first two stalls')
+    p.add_argument('--metrics', action='store_true', help='SWR_METRICS: metrics.csv (each second) and frames.csv (each frame) in the run folder')
+    p.add_argument('--record', action='store_true', help='SWR_INPUT_RECORD: the pad as played, in input-record.txt (replayable)')
     p.add_argument('--wait', action='store_true', help='block until the run ends, then print the report')
     p = sub.add_parser('worker'); p.add_argument('run', type=Path)
     p = sub.add_parser('report'); p.add_argument('run', type=Path)
-    p = sub.add_parser('action'); p.add_argument('run', type=Path); p.add_argument('action', choices=[*BUTTONS, 'shot', 'ctl', 'stop'])
+    p = sub.add_parser('action'); p.add_argument('run', type=Path); p.add_argument('action', choices=[*BUTTONS, 'shot', 'ctl', 'replay', 'stop'])
     p.add_argument('--observed', required=True); p.add_argument('--hold-ms', type=int, default=200); p.add_argument('--settle', type=float, default=1.5)
+    p.add_argument('--file', default='', help='with action replay: lines "<ms> <buttons hex> <lx> <ly> <rx> <ry>" (sticks -32767..32767)')
     p.add_argument('--ctl', default='', help='with action ctl: a control pipe command, e.g. "set a2c 0", "texat 34a000000", "flight"')
     a = ap.parse_args()
     if a.cmd == 'worker': return worker(a.run.resolve())
@@ -337,7 +357,7 @@ def main():
         run = RUNS / (time.strftime('%Y%m%d-%H%M%S-') + a.label); run.mkdir()
         env = dict(x.split('=', 1) for x in a.env)
         atomic(run / 'config.json', json.dumps(dict(game=str(Path(a.game).resolve()), seconds=a.seconds, env=env,
-               shot_every=a.shot_every, verbose=a.verbose, stacks=a.stacks), indent=2))
+               shot_every=a.shot_every, verbose=a.verbose, stacks=a.stacks, metrics=a.metrics, record=a.record), indent=2))
         w = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', str(run)],
                              stdout=(run / 'harness.log').open('wb'), stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
         print(run, flush=True)
@@ -349,13 +369,73 @@ def main():
     if (run / 'command.json').exists(): ap.error('a command is pending')
     ident = str(time.time_ns())
     if a.action == 'ctl' and not a.ctl: ap.error('action ctl needs --ctl "<command>"')
-    atomic(run / 'command.json', json.dumps(dict(id=ident, action=a.action, observed_before=a.observed, hold_ms=a.hold_ms, settle=a.settle, ctl=a.ctl)))
-    end = time.monotonic() + 45; done = run / f'{ident}.done.json'
+    if a.action == 'replay' and not (a.file and Path(a.file).is_file()): ap.error('action replay needs --file <input script>')
+    atomic(run / 'command.json', json.dumps(dict(id=ident, action=a.action, observed_before=a.observed, hold_ms=a.hold_ms, settle=a.settle, ctl=a.ctl, file=str(Path(a.file).resolve()) if a.file else '')))
+    end = time.monotonic() + 45 + a.settle; done = run / f'{ident}.done.json'   # the worker settles before it acknowledges
     while not done.exists() and time.monotonic() < end:
         if (run / 'result.json').exists(): raise RuntimeError((run / 'result.json').read_text())
         time.sleep(.1)
     if not done.exists(): raise TimeoutError('action not acknowledged; do not repeat blindly')
     print(done.read_text())
+
+
+def black_audit(path):
+    """how much of a screenshot is near-black: the whole image (luma < 16 of 255), and the cells of an 8x8 grid that are
+    at least 98 % near-black (a black gap where geometry or a texture is missing shows up as such cells)"""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert('L')
+    except Exception as e:  # noqa: BLE001  the audit never stops a run
+        return dict(black_error=str(e)[:200])
+    im.thumbnail((640, 360)); w, h = im.size; px = im.load()
+    dark = 0; total = 0; cells = [[0, 0] for _ in range(64)]
+    for y in range(h):
+        for x in range(w):
+            v = px[x, y]; total += v
+            c = cells[(y * 8 // h) * 8 + x * 8 // w]; c[1] += 1
+            if v < 16: dark += 1; c[0] += 1
+    return dict(black_fraction=round(dark / (w * h), 4), black_cells=sum(1 for d, n in cells if n and d / n >= 0.98),
+                mean_luma=round(total / (w * h), 1))
+
+
+def metrics_summary(run, since=None, until=None):
+    """metrics.csv (SWR_METRICS, once a second) and frames.csv (SWR_FRAME_CSV, once a frame), optionally limited to
+    t_s in [since, until): means of the per-second columns, totals of the dropped-work columns, frame-time percentiles"""
+    import csv
+    out = {}
+    m = run / 'metrics.csv'
+    if m.exists():
+        rows = [r for r in csv.DictReader(m.open(newline='')) if r.get('t_s')]
+        rows = [r for r in rows if (since is None or float(r['t_s']) >= since) and (until is None or float(r['t_s']) < until)]
+        if rows:
+            def mean(k): v = [float(r[k]) for r in rows if r.get(k) not in (None, '')]; return round(sum(v) / len(v), 1) if v else None
+            def total(k): v = [float(r[k]) for r in rows if r.get(k) not in (None, '')]; return int(sum(v)) if v else None
+            out['seconds'] = len(rows); out['fps_mean'] = mean('fps'); out['fps_min'] = min(float(r['fps']) for r in rows)
+            for k in ('guest_cpu_ms', 'process_cpu_ms', 'busy1_ms', 'condvar_ms', 'mutex_ms', 'address_ms', 'waitsync_ms', 'ipc_ms', 'ipc_n', 'draws'):
+                out[k + '_per_s'] = mean(k)
+            for k in ('draws_skipped', 'skip_no_shader', 'skip_no_pipeline', 'skip_no_target', 'shader_missing', 'shader_arrived', 'shader_failed',
+                      'tex_new', 'tex_no_format', 'tex_create_failed', 'tex_no_memory', 'tex_unaddressable', 'tex_unreadable', 'view_failed',
+                      'shader_unusable', 'draw_prim_unsupported', 'draw_no_mesh_shader', 'draw_render_skip'):
+                if k in rows[0]: out[k + '_total'] = total(k)
+            out['xmon'] = rows[-1].get('xmon'); out['tex_order'] = rows[-1].get('tex_order')
+    f = run / 'frames.csv'
+    if f.exists():
+        rows = [r for r in csv.DictReader(f.open(newline='')) if r.get('kind') == 'present']
+        if rows and since is not None:
+            t0 = int(rows[0]['unix_ns']); rows = [r for r in rows if since <= (int(r['unix_ns']) - t0) / 1e9 + 0 and (until is None or (int(r['unix_ns']) - t0) / 1e9 < until)] or rows
+        if len(rows) > 10:
+            def pct(k, q):
+                v = sorted(int(r[k]) for r in rows); return round(v[min(len(v) - 1, int(q * len(v)))] / 1e6, 2)
+            out['frame_ms_p50'] = pct('interval_ns', .5); out['frame_ms_p95'] = pct('interval_ns', .95); out['frame_ms_p99'] = pct('interval_ns', .99)
+            for k in ('cpu_ns', 'acquire_ns', 'fence_ns', 'wait_ns'):   # the present thread
+                v = [int(r[k]) for r in rows]; out['present_' + k.replace('_ns', '') + '_ms_mean'] = round(sum(v) / len(v) / 1e6, 2)
+        rep = [r for r in csv.DictReader(f.open(newline='')) if r.get('kind') == 'replay']
+        if len(rep) > 10:   # the replay of each frame's GPU work, cumulative columns: per frame over the run (and its last 30 %)
+            for part, rr in (('', rep), ('late_', rep[int(len(rep) * .7):])):
+                n = max(1, int(rr[-1]['frame']) - int(rr[0]['frame']))
+                for k in ('gpu_ns', 'cpu_ns', 'wait_ns', 'pipeline_ns', 'texture_ns', 'sparse_ns'):
+                    out['replay_' + part + k.replace('_ns', '') + '_ms_per_frame'] = round((int(rr[-1][k]) - int(rr[0][k])) / n / 1e6, 2)
+    return out
 
 
 def report(run):
@@ -366,6 +446,10 @@ def report(run):
     for f in sorted(run.glob('stall-*')): print('stall file', f.name)
     shots = sorted(run.glob('*.png'))
     print(f'{len(shots)} screenshots; latest:', shots[-1] if shots else 'none')
+    ms = metrics_summary(run)
+    if ms: print('metrics', json.dumps(ms))
+    for f in shots:   # the black audit of each screenshot (black_audit): a regression check for missing graphics
+        a = black_audit(f); print(f'  {f.name}: near-black {a.get("black_fraction", "?"):.1%} of the image, {a.get("black_cells", "?")}/64 black cells, mean luma {a.get("mean_luma", "?")}')
 
 
 if __name__ == '__main__': main()

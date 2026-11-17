@@ -200,6 +200,7 @@ static void ini_apply(const char* k, const char* v){
        crashed way later reading it back */
     else if(!strcmp(k,"null_trap")){ g_opt_null_trap=atoi(v)==1; if(g_opt_null_trap && g_mem) plat_vm_readonly(g_mem,0x10000); }
     else if(!strcmp(k,"memory_gb")){ extern int g_opt_mem_gb; g_opt_mem_gb=atoi(v); }
+    else if(!strcmp(k,"metrics")){ if(atoi(v)>0) g_metrics_on=1; }   /* kernel.c metrics_start: read at startup */
     else if(!strcmp(k,"heap_max_mb")){ extern u64 g_heap_max; g_heap_max=(u64)atoi(v)<<20; }
     { extern void lsfg_ini(const char*, const char*); lsfg_ini(k,v); }
     backend_ini(k,v); }
@@ -280,6 +281,7 @@ static const IniOpt INI_DBG[]={
   {"log","1","Log detail: 1 = normal, 2 = everything (slow)"},
   {"diag","0","1 = automatic diagnostic dumps (F5 always works)"},
   {"profile","0","1 = write profile.txt every 10 seconds (CPU profiler)"},
+  {"metrics","0","1 = write metrics-<time>.csv (each second: guest CPU, waits by kind) and frames-<time>.csv (each frame: GPU/present breakdown) next to the log"},
   {NULL,NULL,NULL}};
 
 static const IniSec INI_SECS[]={{"Display",INI_DISPLAY},{"Controls",INI_INPUT},{"Graphics",INI_GRAPHICS},{"Performance",INI_PERF},{"Frame generation",INI_FG},{"Audio",INI_AUDIO},{"Recording",INI_REC},{"Debug",INI_DBG},{NULL,NULL}};
@@ -470,6 +472,7 @@ int swr_main(int argc, char** argv){
     LOG("npdm: system resource %.1f MB\n",g_sysres_size/1048576.0); }
   services_init(); romfs_init(); gpu_init();
   { extern void hle_install(void); hle_install(); }
+  metrics_start();   /* before video_init: it also turns on the NVN layer's per-frame CSV */
   video_init(g_mod->title? g_mod->title : g_exename);
   { extern void plat_prof_start(int); if(g_opt_prof){ plat_prof_start(0); LOG("profile: active (profile.txt every 10 s)\n"); } }
   kernel_run_main(g_mod->mods[0].base+g_mod->mods[0].text_off,g_mod->main_stack?g_mod->main_stack:0x100000,(int)g_mod->main_prio,(int)g_mod->main_core);
@@ -481,7 +484,7 @@ int swr_main(int argc, char** argv){
     {extern void rec_watchdog(void); rec_watchdog(); }
 #endif
     {extern void swr_audout_tick(void); swr_audout_tick(); }
-    if(tick%60==0){ ini_poll(); { extern void nvn_census_tick(void); nvn_census_tick(); } }
+    if(tick%60==0){ ini_poll(); { extern void nvn_census_tick(void); nvn_census_tick(); } metrics_tick(); }
     { extern void kernel_heal_mutexes(void); kernel_heal_mutexes(); }
     /* bail out of the slow clock if nothing was presented for 3s */
     { static int lf=-1, still; if(g_vt_on && !g_rec_active){ if(g_frames!=lf){ lf=g_frames; still=0; } else if(++still==180){ vt_set(0); WARN("smooth recording: the game stopped presenting images; back to the normal clock\n"); } } else { lf=-1; still=0; } }

@@ -16,6 +16,7 @@
 #include "vk_hmap.h"
 #include "vk_shot.h"
 #include "vk_flight.h"
+#include "nxs_rt.h"
 #include "nvn_timestamp.h"
 #include "clear_vert.h"
 #include "clear_f_frag.h"
@@ -187,6 +188,22 @@ static void maybe_split(void);
 // ---------- Programs: the shader of each NVN stage, cached by program serial ----------
 typedef struct { const vks_shader *sh[6]; int done; } progc;
 static vk_hmap g_progc = {8};
+// a draw or dispatch skipped because a stage of its program has no shader: the program's keys and which of them resolved, once per
+// program (64 programs), so a black region can be traced to the shader (the cache, nxs_live.log, the dump)
+static void skip_why(const prog_t *p, int stage, const char *what) {
+    static uint64_t seen[64]; static int nseen;
+    if (!p || nseen >= 64) return;
+    for (int i = 0; i < nseen; i++) if (seen[i] == p->serial) return;
+    seen[nseen++] = p->serial;
+    char b[400]; int o = 0;
+    for (unsigned i = 0; i < p->nstage && i < 6 && o < (int)sizeof b - 40; i++) {
+        uint8_t k[8]; const nxs_shader *n = NULL; int r = nxs_resolve(p, i, &n);
+        if (!prog_key(p, i, k)) { o += snprintf(b + o, sizeof b - o, " [%u] no key", i); continue; }
+        o += snprintf(b + o, sizeof b - o, " [%u] %02x%02x%02x%02x%02x%02x%02x%02x %s", i, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+                      r != 1 ? "not in the cache" : vksh_get(p, i) ? "ready" : "unusable");
+    }
+    VKRED("%s skipped: program %llu has no shader for stage %d;%s", what, (unsigned long long)p->serial, stage, b);
+}
 static const vks_shader *prog_stage(const prog_t *p, int stage) {
     if (!p || !p->serial) return NULL;
     progc *c = vk_hm_get(&g_progc, &p->serial);
@@ -1092,11 +1109,11 @@ static vkf_row *fl_draw(const p_draw *dw, const p_draw_idx *di) {
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     vkf_row *fr = fl_draw(dw, di);
-    if (S->render_skip) { g_st.draws_skipped++; if (fr) fr->flags |= FL_RC_SKIP; return; }
+    if (S->render_skip) { g_st.draws_skipped++; VKC(VKC_DRAW_RENDER_SKIP); if (fr) fr->flags |= FL_RC_SKIP; return; }
     int prim = dw ? dw->prim : di->prim, expand;
     int mesh = dw && prim == DM_PRIM_MESH_TASKS;
     if (mesh && vkc_int("no_mesh", 0)) return;
-    if (mesh) { prim = NVN_DRAW_PRIMITIVE_TRIANGLES; if (!g_vk.has.mesh_shader || !vkCmdDrawMeshTasksEXT) { RED_ONCE(96, "task and mesh draws: the device has no VK_EXT_mesh_shader, they are not drawn"); return; }
+    if (mesh) { prim = NVN_DRAW_PRIMITIVE_TRIANGLES; if (!g_vk.has.mesh_shader || !vkCmdDrawMeshTasksEXT) { VKC(VKC_DRAW_NO_MESH); RED_ONCE(96, "task and mesh draws: the device has no VK_EXT_mesh_shader, they are not drawn"); return; }
         if (dw->first) RED_ONCE(97, "a mesh draw from a first workgroup other than 0: Vulkan has no parameter for it, drawn from 0"); }
     uint64_t ind = dw ? dw->ind : di->ind, mdi = dw ? dw->mdi_cnt : di->mdi_cnt; int mdi_i = dw ? dw->mdi_i : di->mdi_i;
     if (mdi) { uint32_t cnt; int rd = read_u32(mdi, &cnt);
@@ -1104,7 +1121,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (rd && (uint32_t)mdi_i >= cnt) { if (fr) { fr->flags |= FL_MDI_CUT; vkf_note_args(fr, ind, dw ? 16 : 20, mdi); } return; }
         RED_ONCE(52, "an indirect-count multi-draw: its count is read from guest memory at replay (a count the GPU writes in the same submission is missed)"); }
     VkPrimitiveTopology topo = vkp_topology(prim, &expand);
-    if (expand == VKP_EXPAND_UNSUPPORTED || expand == VKP_EXPAND_LINE_LOOP) { static int n; if (n++ < 4) VKRED("primitive type %d is not drawn", prim); g_st.draws_skipped++; return; }
+    if (expand == VKP_EXPAND_UNSUPPORTED || expand == VKP_EXPAND_LINE_LOOP) { VKC(VKC_DRAW_PRIM); static int n; if (n++ < 4) VKRED("primitive type %d is not drawn", prim); g_st.draws_skipped++; return; }
     if (S->poly.cull == NVN_FACE_FRONT_AND_BACK && !S->rast_discard) return;
     const vks_shader *sh[5] = {0};
     for (int s = 0; s < 5; s++) if (S->bst[s]) sh[s] = prog_stage(S->bst[s], s);
@@ -1113,11 +1130,12 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (mesh) {   // a mesh program has no vertex or geometry stage, and a task shader only if it is the same program's: what an earlier program left in those places goes
         sh[0] = sh[2] = NULL;
         if (sh[3] && (sh[3]->mesh != 1 || S->bst[3] != S->bst[4])) sh[3] = NULL;
-        if (!sh[4] || sh[4]->mesh != 2) { g_st.skip_no_shader++; g_st.draws_skipped++; return; }
+        if (!sh[4] || sh[4]->mesh != 2) { g_st.skip_no_shader++; g_st.draws_skipped++; skip_why(S->bst[4], 4, "a mesh draw"); return; }
     } else if (sh[4] && sh[4]->mesh) sh[3] = sh[4] = NULL;
-    if (!mesh && (!sh[0] || (S->bst[1] && !sh[1] && !S->rast_discard))) { g_st.skip_no_shader++; g_st.draws_skipped++; return; }
+    if (!mesh && (!sh[0] || (S->bst[1] && !sh[1] && !S->rast_discard))) { g_st.skip_no_shader++; g_st.draws_skipped++; skip_why(!sh[0] ? S->bst[0] : S->bst[1], !sh[0] ? 0 : 1, "a draw"); return; }
     if (!mesh) sh[0] = vin_shader(sh[0]);
     if (S->rast_discard) sh[1] = NULL;
+    { static const volatile int *ng; if (sh[2]) { if (!ng) ng = vkc_ptr("no_gs", 0); if (*ng) sh[2] = NULL; } }   // gamectl set no_gs 1: draws without their geometry shaders (diagnostic A/B)
     // the render pass, its scissor and viewport (nvn_mtl.m draw_: viewport flipped for the lower-left origin there; Vulkan's y axis runs the other way)
     // With every draw checkpointed: an indirect draw's arguments, as the GPU holds them, copied out first, outside the pass (the pass is ended and begun again). A GPU stuck inside the pass never gets to copies at its end
     if (ind && g_vk.has.checkpoints >= 2) { VkBuffer ab; VkDeviceSize ao; if (vkm_use(ind, dw ? 16 : 20, &ab, &ao)) { pass_end(); vk_ck_args(vks_cb(), vk_ck_next(), ab, ao, dw ? 16 : 20); } }
@@ -1375,7 +1393,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
 // ---------- Compute (nvn_mtl.m dispatch) ----------
 static void dispatch(const p_dispatch *dp) {
     const vks_shader *cs = S->cprog ? prog_stage(S->cprog, VKS_CS) : NULL;
-    if (!cs) { g_st.skip_no_shader++; return; }
+    if (!cs) { g_st.skip_no_shader++; skip_why(S->cprog, VKS_CS, "a dispatch"); return; }
     VkPipelineLayout layout; VkPipeline pipe = vkp_compute(cs, &layout);
     if (!pipe) return;
     pass_end();
@@ -1852,11 +1870,12 @@ static int walk(const uint8_t *p, int depth, uint64_t *budget) {
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); report_counter(t, ad); break; }
         case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); reset_counter(t); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); if (s) vk_note_fence_sync(s); break; }
-        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); vkr_copy(s_, d, n); break; }
+        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); if (g_pd) PD("buffer copy %#llx -> %#llx, %llu bytes", (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); vkr_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8);
             if (24 + n > h.size) { bad_record(p, h, "a uniform update longer than its record"); return -1; }
+            if (g_pd) { uint32_t w0 = 0, w1 = 0; memcpy(&w0, a + 16, n >= 4 ? 4 : 0); if (n >= 8) memcpy(&w1, a + 20, 4); PD("buffer update %#llx, %llu bytes, first words %#x %#x", (unsigned long long)d, (unsigned long long)n, w0, w1); }
             vkr_update(d, n, a + 16); break; }
-        case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; vkr_fill(cb->addr, cb->size, cb->value); break; }
+        case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; if (g_pd) PD("buffer fill %#llx, %llu bytes, value %#x", (unsigned long long)cb->addr, (unsigned long long)cb->size, cb->value); vkr_fill(cb->addr, cb->size, cb->value); break; }
         case OP_SET_RT: set_rt((const p_set_rt *)a); maybe_split(); break;
         case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;

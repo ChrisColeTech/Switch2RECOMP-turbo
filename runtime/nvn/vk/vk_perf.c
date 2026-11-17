@@ -3,6 +3,9 @@
 // Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
 #include "vk_internal.h"
 #include "vk_perf.h"
+#include "vk_replay.h"
+#include "nxs_rt.h"
+#include "nvn_texio.h"
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +48,31 @@ static unsigned __stdcall writer(void *arg) {
         Sleep(250);
     }
 }
+_Atomic uint64_t vkc_count[VKC_N];
+static const char *const vkc_name[VKC_N] = {"tex_new", "tex_no_format", "tex_create_failed", "tex_no_memory", "tex_unaddressable", "tex_unreadable",
+    "view_failed", "shader_unusable", "draw_prim_unsupported", "draw_no_mesh_shader", "draw_render_skip"};
+// the graphics columns of the metrics row (kernel.c metrics_tick): per second, except tex_order
+uint64_t vkm_wb_cpu_newer(void);
+static void metrics_gfx(FILE *f, int header) {
+    static vkr_stats_t ls; static nxs_counts ln; static uint64_t lc[VKC_N], lwn;
+    if (header == 2) { vkr_stats(&ls); nxs_counts_get(&ln); for (int i = 0; i < VKC_N; i++) lc[i] = atomic_load(&vkc_count[i]); lwn = vkm_wb_cpu_newer(); return; }
+    if (header) {
+        fputs(",draws,draws_skipped,skip_no_shader,skip_no_pipeline,skip_no_target,skip_state,dispatches,shader_missing,shader_arrived,shader_failed,shader_stale", f);
+        for (int i = 0; i < VKC_N; i++) fprintf(f, ",%s", vkc_name[i]);
+        fputs(",wb_cpu_newer,tex_order", f); return;
+    }
+    vkr_stats_t s; vkr_stats(&s); nxs_counts n; nxs_counts_get(&n);
+    fprintf(f, ",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu", (unsigned long long)(s.draws - ls.draws), (unsigned long long)(s.draws_skipped - ls.draws_skipped),
+            (unsigned long long)(s.skip_no_shader - ls.skip_no_shader), (unsigned long long)(s.skip_no_pipeline - ls.skip_no_pipeline), (unsigned long long)(s.skip_no_target - ls.skip_no_target),
+            (unsigned long long)(s.skip_state - ls.skip_state), (unsigned long long)(s.dispatches - ls.dispatches), (unsigned long long)(n.missing_keys - ln.missing_keys),
+            (unsigned long long)(n.arrived - ln.arrived), (unsigned long long)(n.failed - ln.failed), (unsigned long long)(n.stale - ln.stale));
+    for (int i = 0; i < VKC_N; i++) { uint64_t c = atomic_load_explicit(&vkc_count[i], memory_order_relaxed); fprintf(f, ",%llu", (unsigned long long)(c - lc[i])); lc[i] = c; }
+    { uint64_t wn = vkm_wb_cpu_newer(); fprintf(f, ",%llu", (unsigned long long)(wn - lwn)); lwn = wn; }
+    fprintf(f, ",%s", nvn_texio_order() == S2TEX_TX1 ? "tx1" : "switch2");
+    ls = s; ln = n;
+}
 void vkperf_init(void) {
+    { extern void (*g_metrics_gfx)(FILE *, int); g_metrics_gfx = metrics_gfx; }
     const char *p = getenv("SWR_FRAME_CSV"); if (!p || !*p) return;
     // do not overwrite earlier evidence
     g_file = fopen(p, "wx"); if (!g_file) { VKRED("cannot create frame telemetry %s", p); return; }

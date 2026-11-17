@@ -4,6 +4,7 @@
 /* HLE kernel: handles, objects, guest threads (1:1 with host threads), sync (events, mutex/condvar, address
    arbiter) and the SVCs games really call */
 #include "rt.h"
+#include <time.h>
 
 PMutex g_klock;
 u64 g_title_id = 0x0100000000001000ull;
@@ -911,12 +912,71 @@ extern KShmem* kshmem_new(u64 size, const char* name);
 
 static void swr_svc_(CPU* c, u32 imm);
 
+/* ============================================================ metrics
+   SWR_METRICS=1 (or a file path) or [Debug] metrics=1 in the game's ini: once a second a row in metrics-<time>.csv
+   next to the log, with what the game's own threads did: CPU time (all guest threads, and the three busiest), and
+   the time they spent blocked, per kind of wait (condvar, mutex, address, WaitSynchronization, sleep/yield, IPC),
+   summed over threads. The GPU / present side per frame is the NVN layer's SWR_FRAME_CSV (frames-<time>.csv, turned
+   on with it). Off: one predictable branch per SVC */
+int g_metrics_on;
+enum { MW_CV, MW_MUTEX, MW_ADDR, MW_SYNC, MW_SLEEP, MW_IPC, MW_OTHER, MW_N };
+static const char* const g_mw_name[MW_N]={"condvar","mutex","address","waitsync","sleep","ipc","other_svc"};
+static u64 g_mw_ns[MW_N], g_mw_n[MW_N];
+static FILE* g_metrics_f;
+void (*g_metrics_gfx)(FILE*, int header);   /* set by the NVN layer (vk_perf.c): its columns of the row; mode 2 = take the baseline */
+static int mw_kind(u32 imm){ switch(imm){ case 0x1C: return MW_CV; case 0x1A: return MW_MUTEX; case 0x34: return MW_ADDR; case 0x18: return MW_SYNC;
+  case 0x0B: return MW_SLEEP; case 0x21: case 0x22: case 0x23: case 0x43: case 0x44: return MW_IPC; } return MW_OTHER; }
+
+void metrics_start(void){
+  const char* e=getenv("SWR_METRICS"); if(e && *e && strcmp(e,"0")) g_metrics_on=1;
+  if(!g_metrics_on) return;
+  char stamp[32]; { time_t now=time(NULL); struct tm* tm=localtime(&now); strftime(stamp,sizeof stamp,"%Y%m%d-%H%M%S",tm); }
+  char p[1200];
+  if(e && *e && strcmp(e,"1")) snprintf(p,sizeof p,"%s",e); else snprintf(p,sizeof p,"%smetrics-%s.csv",g_exedir,stamp);
+  g_metrics_f=fopen(p,"w"); if(!g_metrics_f){ WARN("metrics: cannot create %s\n",p); g_metrics_on=0; return; }
+  setvbuf(g_metrics_f,NULL,_IOFBF,1<<16);
+  if(!getenv("SWR_FRAME_CSV")){ static char fe[1300]; snprintf(fe,sizeof fe,"SWR_FRAME_CSV=%sframes-%s.csv",g_exedir,stamp); putenv(fe); }
+  LOG("metrics: %s once a second (guest CPU, waits by kind, SVCs); per frame GPU/present in %s\n",p,getenv("SWR_FRAME_CSV")); }
+
+/* once a second from the frontend loop */
+void metrics_tick(void){
+  if(!g_metrics_f) return;
+  static u64 t0, last_ns, last_proc, last_mw_ns[MW_N], last_mw_n[MW_N], last_cpu[256]; static int last_frames, rows;
+  u64 now=plat_ns();
+  static int hdr;
+  if(!t0) t0=now;
+  /* the header once the NVN layer has registered its columns (when the game brings graphics up), at most 20 s: rows start then */
+  if(!hdr){ if(!g_metrics_gfx && now-t0<20000000000ull) return;
+    hdr=1; last_ns=now; last_proc=plat_process_cpu_ns(); last_frames=g_frames;
+    for(int k=0;k<MW_N;k++){ last_mw_ns[k]=__atomic_load_n(&g_mw_ns[k],__ATOMIC_RELAXED); last_mw_n[k]=__atomic_load_n(&g_mw_n[k],__ATOMIC_RELAXED); }
+    fprintf(g_metrics_f,"t_s,frames,fps,process_cpu_ms,guest_cpu_ms,guest_threads,busy1_tid,busy1_ms,busy2_tid,busy2_ms,busy3_tid,busy3_ms");
+    for(int k=0;k<MW_N;k++) fprintf(g_metrics_f,",%s_ms,%s_n",g_mw_name[k],g_mw_name[k]);
+    fprintf(g_metrics_f,",xmon"); if(g_metrics_gfx){ g_metrics_gfx(g_metrics_f,1); g_metrics_gfx(NULL,2); } fprintf(g_metrics_f,"\n"); return; }
+  double dt=(now-last_ns)/1e9; if(dt<=0) return; last_ns=now;
+  u64 proc=plat_process_cpu_ns(); u64 dproc=proc-last_proc; last_proc=proc;
+  int frames=g_frames-last_frames; last_frames=g_frames;
+  /* guest threads: CPU since the last row, the three busiest */
+  u64 sum=0; int nthr=0; u64 best[3]={0,0,0}; u64 bid[3]={0,0,0};
+  for(int i=0;i<g_nthreads && i<256;i++){ KThread* t=g_threads[i]; if(!t) continue;
+    host_lock(); void* h=__atomic_load_n(&t->host,__ATOMIC_ACQUIRE); u64 c= (h && t->state==1)? plat_thread_cpu_ns_of(h) : last_cpu[i]; host_unlock();
+    u64 d= c>=last_cpu[i]? c-last_cpu[i] : 0; last_cpu[i]=c; if(t->state!=1) continue;
+    nthr++; sum+=d;
+    for(int k=0;k<3;k++) if(d>best[k]){ for(int j=2;j>k;j--){ best[j]=best[j-1]; bid[j]=bid[j-1]; } best[k]=d; bid[k]=t->id; break; } }
+  fprintf(g_metrics_f,"%.1f,%d,%.2f,%.1f,%.1f,%d",(now-t0)/1e9,frames,frames/dt,dproc/1e6,sum/1e6,nthr);
+  for(int k=0;k<3;k++) fprintf(g_metrics_f,",%llu,%.1f",(unsigned long long)bid[k],best[k]/1e6);
+  for(int k=0;k<MW_N;k++){ u64 ns=__atomic_load_n(&g_mw_ns[k],__ATOMIC_RELAXED), n=__atomic_load_n(&g_mw_n[k],__ATOMIC_RELAXED);
+    fprintf(g_metrics_f,",%.1f,%llu",(ns-last_mw_ns[k])/1e6,(unsigned long long)(n-last_mw_n[k])); last_mw_ns[k]=ns; last_mw_n[k]=n; }
+  fprintf(g_metrics_f,",%d",g_rtapi.excl_mon!=NULL); if(g_metrics_gfx) g_metrics_gfx(g_metrics_f,0); fprintf(g_metrics_f,"\n");
+  if(++rows%5==0) fflush(g_metrics_f); }
+
 void swr_svc(CPU* c, u32 imm){
   u64 a0=c->x[0],a1=c->x[1],a2=c->x[2];
   u64 a3=c->x[3];
   int blk= g_ct_on>0 && ct_blocking(imm);
   if(blk) ct_release();
+  u64 mt0= g_metrics_on? plat_ns() : 0;
   swr_svc_(c,imm);
+  if(mt0){ int k=mw_kind(imm); __atomic_fetch_add(&g_mw_ns[k],plat_ns()-mt0,__ATOMIC_RELAXED); __atomic_fetch_add(&g_mw_n[k],1,__ATOMIC_RELAXED); }
   if(g_ct_on>0) ct_check(kthread_cur());
   { KThread* t=kthread_cur(); if(t){ u32 k=t->svc_hist_n;
       if(k && t->svc_hist[(k-1)%24].imm==imm && t->svc_hist[(k-1)%24].lr==c->x[30]) t->svc_hist[(k-1)%24].n++;

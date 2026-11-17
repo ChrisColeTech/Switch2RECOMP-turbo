@@ -39,7 +39,8 @@ static pool_t_ *g_pool[MAXPOOL]; static int g_npool;
 static _Atomic uint32_t g_pool_gen = 1;   // moves whenever a pool comes or goes (vkm_use's remembered buffers and offsets are then stale)
 static SRWLOCK g_lk = SRWLOCK_INIT;
 static uint64_t g_frame = 1;
-static _Atomic uint64_t s_wb_words, s_wb_kept, s_wb_stale, s_wb_merged;
+static _Atomic uint64_t s_wb_words, s_wb_kept, s_wb_stale, s_wb_merged, s_wb_cpu_newer;   // cpu_newer: GPU words landed over a value the CPU wrote while the GPU work ran (wr_land; metrics column wb_cpu_newer)
+uint64_t vkm_wb_cpu_newer(void) { return atomic_load(&s_wb_cpu_newer); }   // metrics (vk_perf.c)
 static VkBufferUsageFlags g_usage;
 static VkDeviceSize g_gran = GRAN, g_max_buffer;
 static int g_alias;   // overlapping windows: sparse binding with aliasing (NXRT_VK_NO_ALIAS=1 turns them off, for tests)
@@ -570,14 +571,14 @@ static void wr_shadow(uint32_t **shadow, uint64_t off, const uint32_t *a, const 
 // The words that differ between base and after reach guest memory, page by page; a page the shader left alone is not touched (a touch sends it to the device again)
 static void wr_land(wb_t *w) {
     const uint32_t *b = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->base_at), *a = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->after_at);
-    uint32_t *g = (uint32_t *)(uintptr_t)w->addr; uint64_t n = w->len / 4, changed = 0, kept = 0;
+    uint32_t *g = (uint32_t *)(uintptr_t)w->addr; uint64_t n = w->len / 4, changed = 0, kept = 0, newer = 0;
     for (uint64_t i = 0; i < n; ) {
         uint64_t e = ((((uintptr_t)(g + i)) | (PAGE - 1)) + 1 - (uintptr_t)g) / 4; if (e > n) e = n;   // to the end of the guest page
         if (!memcmp(a + i, b + i, (size_t)(e - i) * 4)) { i = e; continue; }
         dm_guest_write_prepare(g + i, (size_t)(e - i) * 4);
-        for (; i < e; i++) if (a[i] != b[i]) { g[i] = a[i]; changed++; } else if (g[i] != a[i]) kept++;
+        for (; i < e; i++) if (a[i] != b[i]) { if (g[i] != b[i] && g[i] != a[i]) newer++; g[i] = a[i]; changed++; } else if (g[i] != a[i]) kept++;
     }
-    atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept);
+    atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept); atomic_fetch_add(&s_wb_cpu_newer, newer);
     AcquireSRWLockShared(&g_lk);
     { pool_t_ *p = pool_find((uintptr_t)w->addr, w->len);
       if (p && p->shadow) { static int skip = -1; if (skip < 0) skip = vkc_int("wb_shadow_skip", 1);

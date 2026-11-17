@@ -38,6 +38,8 @@ int  plat_thread(PThreadFn fn, void* arg, size_t stack);
 void plat_thread_low_priority(void);
 void plat_thread_exit(void);
 int  plat_thread_suspend(void* h, u64* pc); void plat_thread_resume(void* h); int plat_code_range(u64* lo, u64* hi);
+u64  plat_thread_cpu_ns_of(void* h);   /* CPU time of another thread (its host handle) */
+void metrics_start(void); void metrics_tick(void); extern int g_metrics_on;   /* kernel.c: SWR_METRICS / [Debug] metrics=1 */
 void* plat_thread_self(void); void plat_thread_forget(void* h); int plat_thread_pc(void* h, u64* pc); int plat_addr_module(u64 a, char* name, int n, u64* off); int plat_addr_base(u64 a, char* name, int n, u64* off);
 void plat_sleep_ns(i64 ns);
 void plat_yield(void);

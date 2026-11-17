@@ -5,6 +5,7 @@
 #include "rt.h"
 #include "hid_layout.h"
 #include <math.h>
+#include <sys/stat.h>
 
 KShmem* kshmem_new(u64 size, const char* name);
 u8* kshmem_ptr(KShmem* s);
@@ -42,8 +43,41 @@ static void npad_setup(u8* base, int idx, u32 style, u32 devtype){
   u8 ftype= idx==8? 4 : 3; e[HO_HidNpadInternalState_applet_footer_ui_type]=ftype;   /* handheld / pro controller */
 }
 
+/* input recording and replay, for reproducing a play session (harness: tools/plza_probe.py).
+   SWR_INPUT_RECORD=<file>: every change of the pad (buttons, sticks) is appended as "<ms> <buttons hex> <lx> <ly> <rx> <ry>",
+     ms counted from the first sample.
+   SWR_INPUT_REPLAY=<file>: once that file exists (it can be written while the game runs), its lines replace the pad from
+     that moment, each state held until the next line's ms; after the last line the pad goes back to the real input.
+     Written again (another time or size), it is played again from the start.
+   Lines starting with # are comments. */
+typedef struct { u32 ms; PadState p; } InRec;
+static void input_record_replay(void){
+  static int init; static FILE* rec; static const char* rpath; static InRec* rp; static int rn, ri; static u64 rt0, rec_t0, next_check, rstamp; static PadState last;
+  if(!init){ init=1; const char* e=getenv("SWR_INPUT_RECORD"); if(e && *e){ rec=fopen(e,"a"); if(rec){ setvbuf(rec,NULL,_IOLBF,4096); LOG("input: recording to %s\n",e); } }
+    rpath=getenv("SWR_INPUT_REPLAY"); if(rpath && !*rpath) rpath=NULL; }
+  u64 now=plat_ns();
+  if(rpath && now>=next_check){ next_check=now+200000000ull;   /* the replay file is looked at 5 times a second */
+    struct stat st; u64 stamp= stat(rpath,&st)? 0 : ((u64)st.st_mtime<<24)^(u64)st.st_size^1;
+    FILE* f= stamp && stamp!=rstamp? fopen(rpath,"rb") : NULL;
+    if(f){ char line[256]; int cap=0; rstamp=stamp; free(rp); rp=NULL; rn=0;
+      while(fgets(line,sizeof line,f)){ if(line[0]=='#' || line[0]=='\n' || line[0]=='\r') continue;
+        unsigned ms; unsigned long long bt; int lx,ly,rx,ry; int n=sscanf(line,"%u %llx %d %d %d %d",&ms,&bt,&lx,&ly,&rx,&ry);
+        if(n<2) continue; if(n<6) lx=ly=rx=ry=0;
+        if(rn==cap){ cap=cap? cap*2 : 256; rp=realloc(rp,sizeof *rp*cap); }
+        memset(&rp[rn],0,sizeof rp[rn]); rp[rn].ms=ms; rp[rn].p.buttons=bt; rp[rn].p.lx=lx; rp[rn].p.ly=ly; rp[rn].p.rx=rx; rp[rn].p.ry=ry; rn++; }
+      fclose(f); rt0=now; ri=0; if(!rp){ rp=calloc(1,sizeof *rp); }
+      LOG("input: replaying %d states from %s (%u ms)\n",rn,rpath,rn? rp[rn-1].ms : 0); } }
+  if(rp && ri>=0){ u32 el=(u32)((now-rt0)/1000000ull);
+    while(ri+1<rn && rp[ri+1].ms<=el) ri++;
+    if(rn && el>=rp[0].ms){ if(ri==rn-1 && el>rp[ri].ms+100){ ri=-1; LOG("input: replay finished\n"); }
+      else { int t=g_pad.touch, tx=g_pad.tx, ty=g_pad.ty; g_pad=rp[ri].p; g_pad.touch=t; g_pad.tx=tx; g_pad.ty=ty; } } }
+  if(rec && memcmp(&g_pad,&last,sizeof last)){ if(!rec_t0) rec_t0=now; last=g_pad;
+    fprintf(rec,"%llu %llx %d %d %d %d\n",(unsigned long long)((now-rec_t0)/1000000ull),(unsigned long long)g_pad.buttons,g_pad.lx,g_pad.ly,g_pad.rx,g_pad.ry); }
+}
+
 void hid_update(void){
   if(!g_hid_shm) return;
+  input_record_replay();
   u8* b=kshmem_ptr(g_hid_shm);
   g_samp++;
   u8 st[0x28]; memset(st,0,sizeof st);

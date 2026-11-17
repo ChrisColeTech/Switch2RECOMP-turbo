@@ -4,6 +4,7 @@
 #include "vk_json.h"
 #include "vk_hmap.h"
 #include "nxs_rt.h"
+#include "vk_perf.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -999,7 +1000,7 @@ static vks_shader *get_l(const nxs_shader *n) {   // g_shl held
     if (!s) {
         const char *why = NULL;
         s = vksh_make(n->key, n->spv, n->spv_size, n->json, n->json_size, &why);
-        if (!s) { g_failed++; VKRED("shader %s cannot be used: %s; its draws are skipped", n->key, why ? why : "?"); vk_hm_put(&g_sh, n->key, &g_failed_mark); return NULL; }
+        if (!s) { g_failed++; VKC(VKC_SHADER_UNUSABLE); VKRED("shader %s cannot be used: %s; its draws are skipped", n->key, why ? why : "?"); vk_hm_put(&g_sh, n->key, &g_failed_mark); return NULL; }
         g_loaded++;
         vk_hm_put(&g_sh, n->key, s);
         { char k[128]; int o = 0; int cnt[VKB_UNKNOWN + 1] = {0}; for (int i = 0; i < s->nb; i++) cnt[s->b[i].kind]++;
