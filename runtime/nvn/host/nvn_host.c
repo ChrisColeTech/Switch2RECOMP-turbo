@@ -44,7 +44,6 @@ NxwGuestCpu *nxrt_cur_cpu(void) { return swr_nvn_cur_cpu(); }
 uint64_t nxrt_guest_call(uint64_t va, int n, const uint64_t *args) { return swr_nvn_guest_call(va, n, args); }
 void dm_backtrace(uint64_t fp) { LOG("guest frame pointer %#llx", (unsigned long long)fp); }
 module_t *module_of(const void *p) { (void)p; return NULL; }
-int dm_sdk_major(void) { return 19; }
 void nxrt_symbolize(uint64_t a, char *out, size_t n) { swr_nvn_symbol(a, out, n); }
 void nxrt_log_summary(void) {}
 const char *nxrt_log_path(void) { return swr_nvn_log_dir(); }
@@ -152,6 +151,23 @@ int dm_sdk_ounce(void) {
     for (const char *q = b; q + 11 <= e; q++) if (*q == 's' && !memcmp(q, "spec: Ounce", 11)) { ounce = 1; break; }
     if (ounce) LOG("sdk: built for the Switch 2 (spec: Ounce)");
     return ounce;
+}
+// The game's NintendoSDK major, from its sdk's "NintendoSdk_nnSdk-<major>_<minor>_<micro>-Release". It picks the NVN API the device reports (hle_nvn.c nvn_api): SDK 10 and older are
+// API 53, and games check it and create no device on a mismatch. Mario Kart 8 Deluxe (SDK 4.4.0) requires major == 53 and minor >= 105 before it creates its graphics system and the
+// global it locks right after (main+0x1353408); told 55.15 it skipped both and crashed on that NULL. 19 when the sdk has no such string, the value this used to return for every game
+int dm_sdk_major(void) {
+    static int major = -1;
+    if (major >= 0) return major;
+    major = 19;
+    static const char k[] = "NintendoSdk_nnSdk-";
+    const char *b = (const char *)(uintptr_t)g_sdk_base, *e = b + g_sdk_size;
+    for (const char *q = b; q + sizeof k < e; q++)
+        if (*q == 'N' && !memcmp(q, k, sizeof k - 1) && q[sizeof k - 1] >= '0' && q[sizeof k - 1] <= '9') {
+            int v = 0; for (const char *d = q + sizeof k - 1; d < e && *d >= '0' && *d <= '9' && v < 1000; d++) v = v * 10 + (*d - '0');
+            major = v; break;
+        }
+    LOG("sdk: NintendoSDK %d", major);
+    return major;
 }
 // The constants NVN2's own nvnDeviceGetInteger answers: the driver is compiled into the game's sdk, and its API and GPU code versions move with the SDK (20.5.19: API 231.30, GPU code minor 17;
 // 21.4.4: 231.39 and 20). Games check them: Splatoon Raiders requires minor >= 39 and otherwise creates no graphics system (main+0x31b86b0). The driver's switch over the items loads w0 with the
