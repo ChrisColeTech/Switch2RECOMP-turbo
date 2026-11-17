@@ -86,6 +86,7 @@ void nvn_hook_install(u64 (*find)(const char*)){
 /* main loop, once a second */
 void nvn_census_tick(void){
 #ifdef SWR_HAVE_NVN
+  { extern int g_gpu_nvn; extern void nvn_calls_tick(void); if(g_gpu_nvn) nvn_calls_tick(); }
   { extern int g_gpu_nvn; extern void vkt_log_stats(void); static int s; if(g_gpu_nvn && getenv("NXRT_GFX") && !strcmp(getenv("NXRT_GFX"),"vulkan") && !(++s%5)){ vkt_log_stats(); if(getenv("SWR_NVN_STACKS")){ extern void plat_dump_native_stacks(void); plat_dump_native_stacks(); } } }
 #endif
   if(!g_cnt) return;
@@ -106,8 +107,22 @@ void nvn_census_tick(void){
 #include "nvn/host/nvn_rt_api.h"
 int g_gpu_nvn;
 static GuestFn g_hle_boot;
+/* SWR_NVN_CALLS=1: how often the game calls each NVN entry, in the log every 30 s (the names called since the last list).
+   Shows which of the calls the layer answers with nothing (hle_nvn.c's empty functions) are part of a game's frame */
+static u32 g_hle_cnt[NVN_SLOTS]; static int g_hle_count_on=-1;
 static void nvn_hle_thunk(CPU* RESTRICT c, u64 e){
-  nxrt_hle_table[(e-g_nvn_lo)>>2].adapter((void*)c); c->pc=c->x[30]; }
+  u32 i=(u32)((e-g_nvn_lo)>>2);
+  if(g_hle_count_on>0) g_hle_cnt[i]++;   /* unlocked on purpose: a census, not an account */
+  nxrt_hle_table[i].adapter((void*)c); c->pc=c->x[30]; }
+void nvn_calls_tick(void){   /* once a second (nvn_census_tick) */
+  if(g_hle_count_on<0) g_hle_count_on=getenv("SWR_NVN_CALLS")!=NULL;
+  static int sec; static u32 last[NVN_SLOTS];
+  if(g_hle_count_on<=0 || ++sec%30) return;
+  char line[900]; int o=0;
+  for(u32 i=0;i<nxrt_hle_count && i<NVN_SLOTS;i++){ u32 n=g_hle_cnt[i], d=n-last[i]; last[i]=n; if(!d) continue;
+    o+=snprintf(line+o,sizeof line-o," %s=%u",nxrt_hle_table[i].name+3,d);
+    if(o>760){ LOG("nvn calls (30 s):%s\n",line); o=0; } }
+  if(o) LOG("nvn calls (30 s):%s\n",line); }
 
 int gpu_nvn_wanted(void){ const char* g=getenv("SWR_GPU"); return g && !strcmp(g,"nvn"); }
 

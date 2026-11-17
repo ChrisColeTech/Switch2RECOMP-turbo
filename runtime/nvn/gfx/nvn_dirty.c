@@ -105,10 +105,49 @@ static int page_wp(void *addr) {
     for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end && atomic_load(&r->state[(a - r->base) >> g_shift]) != PG_NONE) return 1; }
     return 0;
 }
+// The ranges by address. A host write (prep_write) and a write fault looked at every range: Mario Kart World has 5,200 pools, and each page a GPU write-back changed
+// cost one scan over all of them on the thread that completes submissions (about 10 us a page, 4-5 ms a frame: the game's wait for the frame's fence ended that much
+// later). g_ri is the live ranges sorted by start, with the largest end so far beside each (ranges overlap: pools share their first and last pages, and a pool can
+// lie inside another's memory), rebuilt at the first lookup after a pool came or went. Readers hold g_ri_lk shared; a fault that finds the index stale scans as before
+// (no allocation in the fault path). NXRT_DIRTY_INDEX=0: every lookup scans, as before
+typedef struct { uintptr_t base, end, maxend; int slot; } ridx_e;
+static ridx_e *g_ri; static int g_ri_n, g_ri_cap; static _Atomic int g_ri_stale = 1; static SRWLOCK g_ri_lk = SRWLOCK_INIT;
+static int g_ri_on = -1;
+static int ri_cmp(const void *a, const void *b) { uintptr_t x = ((const ridx_e *)a)->base, y = ((const ridx_e *)b)->base; return x < y ? -1 : x > y; }
+static void ri_rebuild(void) {   // the caller holds g_ri_lk exclusively
+    int n = atomic_load(&g_nr), k = 0;
+    if (n > g_ri_cap) { int cap = n + 1024; ridx_e *t = realloc(g_ri, (size_t)cap * sizeof *t); if (!t) { g_ri_n = -1; return; } g_ri = t; g_ri_cap = cap; }
+    for (int i = 0; i < n; i++) if (live_at(i)) { range_t *r = rg(i); g_ri[k].base = r->base; g_ri[k].end = r->end; g_ri[k].slot = i; k++; }
+    qsort(g_ri, (size_t)k, sizeof *g_ri, ri_cmp);
+    uintptr_t me = 0; for (int i = 0; i < k; i++) { if (g_ri[i].end > me) me = g_ri[i].end; g_ri[i].maxend = me; }
+    g_ri_n = k;
+}
+// 1 with g_ri_lk held shared and the index current; 0: scan every range (the index is off, stale in a fault, or could not be built)
+static int ri_enter(int may_build) {
+    if (g_ri_on < 0) { const char *e = getenv("NXRT_DIRTY_INDEX"); g_ri_on = !e || atoi(e) != 0; }
+    if (!g_ri_on) return 0;
+    if (atomic_load(&g_ri_stale)) {
+        if (!may_build) return 0;
+        AcquireSRWLockExclusive(&g_ri_lk);
+        if (atomic_exchange(&g_ri_stale, 0)) ri_rebuild();   // the flag first: a pool added while this runs asks again
+        ReleaseSRWLockExclusive(&g_ri_lk);
+    }
+    AcquireSRWLockShared(&g_ri_lk);
+    if (g_ri_n < 0 || atomic_load(&g_ri_stale)) { ReleaseSRWLockShared(&g_ri_lk); if (g_ri_n < 0) atomic_store(&g_ri_stale, 1); return 0; }
+    return 1;
+}
+// The index of the first entry that starts at or after e: the ranges overlapping [a, e) are below it, down to where the largest end so far is no longer above a
+static int ri_upper(uintptr_t e) { int lo = 0, hi = g_ri_n; while (lo < hi) { int m = (lo + hi) / 2; if (g_ri[m].base < e) lo = m + 1; else hi = m; } return lo; }
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    if (ri_enter(0)) {
+        for (int i = ri_upper(a + 1) - 1; i >= 0 && g_ri[i].maxend > a; i--) { int sl = g_ri[i].slot; range_t *r = rg(sl);
+            if (live_at(sl) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+        ReleaseSRWLockShared(&g_ri_lk);
+        return ours;
+    }
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
     return ours;
@@ -132,6 +171,14 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
     if (!len) return;
+    if (ri_enter(1)) {
+        for (int i = ri_upper(e) - 1; i >= 0 && g_ri[i].maxend > a; i--) { int sl = g_ri[i].slot; range_t *r = rg(sl);
+            if (!live_at(sl) || e <= r->base || a >= r->end) continue;
+            uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end;
+            release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, &g_preps); }
+        ReleaseSRWLockShared(&g_ri_lk);
+        return;
+    }
     for (int i = 0; i < n; i++) {
         range_t *r = rg(i);
         if (!live_at(i) || e <= r->base || a >= r->end) continue;
@@ -177,6 +224,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    atomic_store(&g_ri_stale, 1);
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
@@ -184,7 +232,7 @@ void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); atomic_store(&g_ri_stale, 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) {

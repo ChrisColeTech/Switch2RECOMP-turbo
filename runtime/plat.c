@@ -346,6 +346,10 @@ int plat_thread_suspend(void* h, u64* pc){ if(!h || SuspendThread((HANDLE)h)==(D
   if(!GetThreadContext((HANDLE)h,&cx)){ ResumeThread((HANDLE)h); return 0; }
   *pc=cx.Rip; return 1; }
 void plat_thread_resume(void* h){ if(h) ResumeThread((HANDLE)h); }
+/* metrics (kernel.c): CPU time (user + kernel) a thread used so far, 0 if unknown */
+u64 plat_thread_cpu_ns_of(void* h){ FILETIME c,e,k,u; if(!h || !GetThreadTimes((HANDLE)h,&c,&e,&k,&u)) return 0;
+  return ((((u64)k.dwHighDateTime<<32)|k.dwLowDateTime)+(((u64)u.dwHighDateTime<<32)|u.dwLowDateTime))*100ull; }
+
 
 /* the host addresses of the recompiled game code (the _code module): a thread stopped there holds no runtime lock */
 int plat_code_range(u64* lo, u64* hi){
@@ -646,6 +650,9 @@ void plat_thread_forget(void* h){ free(h); }
 int plat_thread_suspend(void* h, u64* pc){ (void)h; (void)pc; return 0; }
 void plat_thread_resume(void* h){ (void)h; }
 int plat_code_range(u64* lo, u64* hi){ (void)lo; (void)hi; return 0; }
+u64 plat_thread_cpu_ns_of(void* hv){ HostThread* h=hv; clockid_t id; struct timespec ts; if(!h || pthread_getcpuclockid(h->t,&id) || clock_gettime(id,&ts)) return 0;
+  return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
+
 
 int plat_thread_pc(void* hv, u64* pc){ HostThread* h=hv; if(!h) return 0;
   pthread_mutex_lock(&g_samp_lk);

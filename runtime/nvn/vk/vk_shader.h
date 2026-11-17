@@ -44,6 +44,8 @@ typedef struct vks_shader {
     uint8_t dual, alpha; uint32_t fs_flags;                 // a fragment variant: output 1 is Location 0 Index 1; the alpha test reads its push constants; what made it (bit 2 + 2 i: target i's kind, 1 unsigned, 2 signed)
     uint32_t vin_mask; uint8_t vin_ct[32];                  // a vertex input variant: what made it (the pipeline manifest names variants by these)
     uint8_t ds_reuse;                                       // vk_replay.c set_reusable: 0 not looked at yet, 1 its set may serve the next draw, 2 never
+    uint8_t app_look; uint16_t app_regs;                    // vk_replay.c app_regs: the storage buffer slots it writes (looked up once)
+    uint64_t keyn;                                          // vk_replay.c sh_keyn: the key as a number (0 until asked for)
 } vks_shader;
 
 int vksh_init(void);

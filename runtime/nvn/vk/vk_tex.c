@@ -10,6 +10,7 @@
 #include "nvn_dirty.h"
 #include "nvn_texio.h"
 #include "s2tex.h"
+#include "vk_perf.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -223,7 +224,17 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1);
 static vkt_image *image_create(const tex_t *t, int cls) { return image_create_(t, cls, 0); }
 static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
     const vkf_info *fi = vkf_get(t->d.format);
-    if (!fi) { static int n; if (n++ < 16) VKRED("texture format %#x has no Vulkan counterpart on this device: not created", t->d.format); return NULL; }
+    if (!fi) { VKC(VKC_TEX_NOFMT); static int n; if (n++ < 16) VKRED("texture format %#x has no Vulkan counterpart on this device: not created", t->d.format); return NULL; }
+    VKC(VKC_TEX_NEW);
+    {   // each combination of format and storage layout once in the log: which decode path the game's textures take
+        static uint32_t seen[256]; static int nseen; static SRWLOCK lk = SRWLOCK_INIT;
+        int lin = t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET));
+        uint32_t id = (uint32_t)t->d.format << 2 | (uint32_t)lin << 1 | (uint32_t)(t->has_layout != 0); int fresh = 1;
+        AcquireSRWLockExclusive(&lk); for (int i = 0; i < nseen; i++) if (seen[i] == id) { fresh = 0; break; } if (fresh && nseen < 256) seen[nseen++] = id; else fresh = 0; ReleaseSRWLockExclusive(&lk);
+        if (fresh) VKLOG("texture layout: format %#x %s (%s%s), %s%s, first %ux%u target %d levels %u", t->d.format, fi->name, fi->flags & VKF_COMPRESSED ? "compressed" : "plain",
+                         fi->flags & VKF_FALLBACK ? ", fallback format" : "", lin ? "linear" : nvn_texio_order() == S2TEX_TX1 ? "block-linear, Tegra X1 GOB order" : "block-linear, Switch 2 GOB order",
+                         t->has_layout ? ", packed layout" : "", t->d.width, t->d.height, t->d.target, t->d.levels);
+    }
     vkt_image *im = calloc(1, sizeof *im);
     im->pool = t->pool; im->off = t->off; im->mem = t->mem; im->d = t->d; im->cls = cls; im->has_layout = t->has_layout; im->storage = t->L.size; im->fi = fi; im->serial = t->serial;
     VkImageType type; int cube;
@@ -265,10 +276,10 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
       if (on && !no_bc1 && !sp && fi->conv == VKF_ASTC_BC7 && bc1_of(fi->vk) != fi->vk && opaque_hint(t)) {
           fi = bc1_info(fi); im->fi = fi; im->bc1 = 1; ci.format = fi->vk; atomic_fetch_add(&s_bc1_images, 1); } }
     if (sp) { ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | (g_vk.has.sparse_aliased ? VK_IMAGE_CREATE_SPARSE_ALIASED_BIT : 0); ci.usage = im->usage = u; sp->gpu = !(fi->flags & VKF_COMPRESSED) && !t->has_layout; im->sp = sp; im->rest = VK_IMAGE_LAYOUT_GENERAL; }
-    if (vkCreateImage(g_vk.dev, &ci, NULL, &im->img) != VK_SUCCESS) { VKRED("vkCreateImage %ux%ux%u format %s (%d) levels %u layers %u failed", im->w, im->h, im->depth, fi->name, fi->vk, im->levels, im->layers); free(im); return NULL; }
+    if (vkCreateImage(g_vk.dev, &ci, NULL, &im->img) != VK_SUCCESS) { VKC(VKC_TEX_CREATE_FAIL); VKRED("vkCreateImage %ux%ux%u format %s (%d) levels %u layers %u failed", im->w, im->h, im->depth, fi->name, fi->vk, im->levels, im->layers); free(im); return NULL; }
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_vk.dev, im->img, &mr);
     if (sp) { if (sparse_setup(im, sp, &mr)) { static int k; if (k++ < 4) VKRED("sparse texture %ux%u %s could not be set up", im->w, im->h, fi->name); } }
-    else if (vk_rt_alloc = (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0, vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &im->alloc)) { vk_rt_alloc = 0; VKRED("no device memory for a %ux%u %s texture (%llu bytes)", im->w, im->h, fi->name, (unsigned long long)mr.size); vkDestroyImage(g_vk.dev, im->img, NULL); free(im); return NULL; }
+    else if (vk_rt_alloc = (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0, vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &im->alloc)) { vk_rt_alloc = 0; VKC(VKC_TEX_NOMEM); VKRED("no device memory for a %ux%u %s texture (%llu bytes)", im->w, im->h, fi->name, (unsigned long long)mr.size); vkDestroyImage(g_vk.dev, im->img, NULL); free(im); return NULL; }
     vk_rt_alloc = 0;
     if (!sp) vkBindImageMemory(g_vk.dev, im->img, im->alloc.mem, im->alloc.off);
     im->view = make_view(im, fi->vk, im->vtype, fi->swz, 0, im->levels, 0, im->layers, im->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? im->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : im->aspect);
@@ -356,7 +367,7 @@ static int64_t upload(vkt_image *im, const tex_t *t, VkCommandBuffer cb) {
             uint32_t level = dl + im->trim;   // the game's level; dl is the image's
             s2tex_surface s; uint64_t base; size_t row = 0;
             int k = nvn_texio_surface(t, level, layer, &s, &base, &row);
-            if (k < 0) { if (!level) { static int n; if (n++ < 8) VKRED("texture %ux%u format %s: level %u layer %u is not addressable in its storage", im->w, im->h, fi->name, level, layer); } continue; }
+            if (k < 0) { VKC(VKC_TEX_UNADDRESSABLE); if (!level) { static int n; if (n++ < 8) VKRED("texture %ux%u format %s: level %u layer %u is not addressable in its storage", im->w, im->h, fi->name, level, layer); } continue; }
             uint32_t lw = mip(im->w, dl), lh = im->vtype == VK_IMAGE_VIEW_TYPE_1D || im->vtype == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? 1 : mip(im->h, dl), ld = is3d ? mip(im->depth, dl) : 1;
             size_t lrow = (size_t)s.width * s.bytes_per_block, lsize = lrow * s.height * s.depth;
             uint8_t *lin = malloc(lsize ? lsize : 1);
@@ -365,7 +376,7 @@ static int64_t upload(vkt_image *im, const tex_t *t, VkCommandBuffer cb) {
                 rc = 0; for (uint32_t y = 0; y < s.height && !rc; y++) rc = guarded_copy(lin + y * lrow, t->mem + base + y * row, lrow);
             } else rc = guarded_deswizzle(&s, t->mem + base, (size_t)(t->L.size - base), lin, lrow, lrow * s.height);
             atomic_fetch_add(&s_tm_read, now_ns() - tm0); tm0 = now_ns();
-            if (rc) { static int n; if (n++ < 8) VKRED("texture %ux%u format %s: level %u layer %u storage could not be read (%d)", im->w, im->h, fi->name, level, layer, rc); free(lin); continue; }
+            if (rc) { VKC(VKC_TEX_UNREADABLE); static int n; if (n++ < 8) VKRED("texture %ux%u format %s: level %u layer %u storage could not be read (%d)", im->w, im->h, fi->name, level, layer, rc); free(lin); continue; }
             // what goes to the staging buffer, and how Vulkan reads it
             const uint8_t *out = lin; size_t out_size = lsize; uint8_t *conv = NULL; uint32_t row_texels = s.width * fi->bw, img_rows = s.height * fi->bh;
             if (fi->conv == VKF_RGB_TO_RGBA) { conv = malloc((size_t)s.width * s.height * s.depth * fi->vbpb); expand_rgb(lin, conv, (size_t)s.width * s.height * s.depth, fi->bpb, t->d.format); out = conv; out_size = (size_t)s.width * s.height * s.depth * fi->vbpb; }
@@ -693,7 +704,7 @@ VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_
     VkComponentMapping m = mp ? *mp : (VkComponentMapping){0};
     if (bl >= im->levels) bl = im->levels - 1; if (!nl || bl + nl > im->levels) nl = im->levels - bl;
     if (im->vtype == VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_3D) {
-        if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) { VKRED("invalid 3D slice view type %d, ser%llu", (int)vt, (unsigned long long)im->serial); return VK_NULL_HANDLE; }
+        if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) { VKC(VKC_VIEW_FAIL); VKRED("invalid 3D slice view type %d, ser%llu", (int)vt, (unsigned long long)im->serial); return VK_NULL_HANDLE; }
         nl = 1;   // a slice view exposes one mip; its layers are that mip's depth, not the image's arrayLayers=1
     }
     uint32_t all = im->vtype == VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_3D ? mip(im->depth, bl) : im->layers;   // a 3D level viewed as a 2D array: its depth slices

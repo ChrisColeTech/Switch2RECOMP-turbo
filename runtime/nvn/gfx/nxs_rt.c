@@ -144,12 +144,19 @@ void nxs_rt_wait_idle(uint64_t timeout_ns) {
 }
 
 // The dump in DM_NVN_SHDUMP's format (nvn_mtl.m): <key>.ctl, the 0x880-byte control section (a Switch 2 block is its 0xe0 bytes, the rest zeros), <key>.code, the code area
+static char g_dump_why[160];   // why the last dump failed (g_lk held), for the miss's log line
 static int dump(const char *key, const NVNshaderData *sd) {
-    if (!sd->control) return 0;
-    const uint8_t *c = sd->control; uint32_t a, b, v, ncode; memcpy(&a, c + 4, 4); memcpy(&b, c + 8, 4); memcpy(&v, c + 0x18, 4); memcpy(&ncode, c + 0x704, 4);
-    int s2 = a == 0xc9 && (b == 0x11 || b == 0xb);   // SWR: some games (Mario Kart World) leave +0x18 at 0, so the version word alone decides
+    if (!sd->control) { snprintf(g_dump_why, sizeof g_dump_why, "no control section"); return 0; }
+    const uint8_t *c = sd->control; uint32_t m, a, b, v, ncode; memcpy(&m, c, 4); memcpy(&a, c + 4, 4); memcpy(&b, c + 8, 4); memcpy(&v, c + 0x18, 4); memcpy(&ncode, c + 0x704, 4);
+    // SWR: some games (Mario Kart World) leave +0x18 at 0, so the version word alone decides. The magic with version 0xc9 is what
+    // prog_key (hle_nvn.c nvn2_ctl) keys as Switch 2: a +8 other than 0x11 / 0xb read +0x704, past the 0xe0-byte block, and was never dumped
+    int s2 = a == 0xc9 && (b == 0x11 || b == 0xb || m == 0x98761234u);
     if (s2) memcpy(&ncode, c + 0x44, 4);
-    if (!sd->data || !ncode || ncode >= (1u << 24)) return 0;
+    if (!sd->data || !ncode || ncode >= (1u << 24)) {
+        snprintf(g_dump_why, sizeof g_dump_why, "control %08x %08x %08x version %08x, %s code area %#llx, %u bytes", m, a, b, v, s2 ? "Switch 2" : "Switch 1",
+                 (unsigned long long)sd->data, ncode);
+        return 0;
+    }
     uint8_t ctl[0x880] = {0}; memcpy(ctl, c, s2 ? 0xe0 : 0x880);
     mkdirs(g_dump);
     char p[1200]; FILE *f;
@@ -166,16 +173,19 @@ static const nxs_shader *get(const char *key, const NVNshaderData *sd) {
     if (e->state == E_FOUND) { g_n.found++; ReleaseSRWLockExclusive(&g_lk); return &e->sh; }
     uint64_t now = now_ns();
     if (e->state == E_UNKNOWN || now >= e->next_look) {   // a missing entry is looked for again twice a second (on-demand results, a build run meanwhile)
-        if (load(e)) { if (e->state == E_FOUND && e->miss_t0) LOG("[nxs] shader %s is in the cache now (%.1f s after it was missed)", key, (now - e->miss_t0) / 1e9); g_n.found++; ReleaseSRWLockExclusive(&g_lk); return &e->sh; }
+        if (load(e)) { if (e->state == E_FOUND && e->miss_t0) g_n.arrived++, LOG("[nxs] shader %s is in the cache now (%.1f s after it was missed)", key, (now - e->miss_t0) / 1e9); g_n.found++; ReleaseSRWLockExclusive(&g_lk); return &e->sh; }
         e->next_look = now + 500000000ull;
     }
     int first = e->state == E_UNKNOWN;
     if (first) { e->state = E_MISSING; e->miss_t0 = now; g_n.missing_keys++; }
     int dumped = 0;
+    char why[160] = "";
     if (!e->dumped && sd && dump(key, sd)) { dumped = e->dumped = 1; g_n.dumped++; if (*g_tool) { e->requested = 1; g_n.requested++; } }
+    else if (sd) memcpy(why, g_dump_why, sizeof why);
     ReleaseSRWLockExclusive(&g_lk);
-    if (first || dumped) LOG("[RED] shader %s is not in the shader cache (%s)%s", key, g_cache,
-                             dumped ? (*g_tool ? ": dumped, on-demand translation requested" : ": dumped (no on-demand translation: NXRT_SHADER_TOOL)") : sd ? ": could not be dumped" : "");
+    if (first || dumped) LOG("[RED] shader %s is not in the shader cache (%s)%s%s", key, g_cache,
+                             dumped ? (*g_tool ? ": dumped, on-demand translation requested" : ": dumped (no on-demand translation: NXRT_SHADER_TOOL)") : sd ? ": could not be dumped: " : "",
+                             why);
     if (dumped && *g_tool) request(key);
     return NULL;
 }

@@ -114,7 +114,47 @@ static LONG WINAPI veh_nvn(EXCEPTION_POINTERS *e) {
     e->ContextRecord->Rbp = (DWORD64)b[0]; e->ContextRecord->Rip = (DWORD64)b[1]; e->ContextRecord->Rsp = (DWORD64)b[2];
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-void nvn_host_init(void) { g_t0_ns = now_ns(); AddVectoredExceptionHandler(1, veh_nvn); }
+/* SWR_HOST_PROF=<start s>,<seconds>[,<file>]: samples the NVN translation thread (the one that replays the game's command buffers, g_host_focus_tid) 2000 times
+   a second for that window and writes where it was: the instruction address when it is in this program, else the module it is in and the nearest return address into
+   this program on its stack (which of our calls led there). tools/host_prof.py turns the file into a table by function (x86_64-w64-mingw32-nm on the runtime).
+   Costs nothing unless set. The thread is suspended for a few microseconds per sample; its own time is otherwise unchanged */
+extern volatile DWORD g_host_focus_tid;
+extern volatile DWORD g_host_focus_tid2;   /* the thread that completes submissions (vk_submit.c): SWR_HOST_PROF_THREAD=completion samples it instead */
+static DWORD WINAPI host_prof_main(LPVOID arg) {
+    (void)arg; double start = 0, secs = 10; char path[1200] = "";
+    sscanf(getenv("SWR_HOST_PROF"), "%lf,%lf,%1199[^\n]", &start, &secs, path);
+    if (!path[0]) snprintf(path, sizeof path, "%s.hostprof.txt", swr_nvn_log_dir());
+    HMODULE self = GetModuleHandleW(NULL); int mi_ = 0; uintptr_t lo = (uintptr_t)self, hi = lo;
+    uintptr_t tlo = lo, thi = lo;   /* the code section: a return address is a stack word that points into it */
+    { const IMAGE_DOS_HEADER *d = (const IMAGE_DOS_HEADER *)self; const IMAGE_NT_HEADERS *n = (const IMAGE_NT_HEADERS *)((const char *)self + d->e_lfanew); hi = lo + n->OptionalHeader.SizeOfImage; (void)mi_;
+      const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(n); tlo = lo + sec[0].VirtualAddress; thi = tlo + sec[0].Misc.VirtualSize; }
+    const char *which = getenv("SWR_HOST_PROF_THREAD"); volatile DWORD *tidp = which && which[0] == 'c' ? &g_host_focus_tid2 : &g_host_focus_tid;
+    while ((now_ns() - g_t0_ns) / 1e9 < start || !*tidp) Sleep(50);
+    HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, *tidp);
+    if (!th) { LOG("host profile: cannot open the translation thread"); return 0; }
+    enum { MAXS = 1 << 16 }; struct { uintptr_t ip, ret; } *smp = calloc(MAXS, sizeof *smp); int n = 0;
+    uint64_t t_end = now_ns() + (uint64_t)(secs * 1e9); FILETIME c0, e0, k0, u0, k1, u1; GetThreadTimes(th, &c0, &e0, &k0, &u0);
+    while (now_ns() < t_end && n < MAXS) {
+        uint64_t t = now_ns(); while (now_ns() - t < 480000) YieldProcessor();   /* ~0.5 ms, without the 1 ms sleep granularity */
+        if (SuspendThread(th) == (DWORD)-1) break;
+        CONTEXT cx; cx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(th, &cx)) { smp[n].ip = (uintptr_t)cx.Rip; smp[n].ret = 0;
+            if (cx.Rip < lo || cx.Rip >= hi) { const uintptr_t *sp = (const uintptr_t *)cx.Rsp; MEMORY_BASIC_INFORMATION mb;   /* the first stack word that points into our code */
+                if (VirtualQuery(sp, &mb, sizeof mb) && mb.State == MEM_COMMIT) { uintptr_t end = (uintptr_t)mb.BaseAddress + mb.RegionSize; for (int k = 0; k < 512 && (uintptr_t)(sp + k + 1) <= end; k++) if (sp[k] >= tlo && sp[k] < thi) { smp[n].ret = sp[k]; break; } } }
+            n++; }
+        ResumeThread(th);
+    }
+    GetThreadTimes(th, &c0, &e0, &k1, &u1); CloseHandle(th);
+    double cpu = ((((uint64_t)u1.dwHighDateTime << 32 | u1.dwLowDateTime) - ((uint64_t)u0.dwHighDateTime << 32 | u0.dwLowDateTime)) + (((uint64_t)k1.dwHighDateTime << 32 | k1.dwLowDateTime) - ((uint64_t)k0.dwHighDateTime << 32 | k0.dwLowDateTime))) / 1e7;
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "# host profile of the NVN translation thread: %d samples in %.1f s, thread CPU %.2f s, image %llx..%llx\n", n, secs, cpu, (unsigned long long)lo, (unsigned long long)hi);
+        for (int i = 0; i < n; i++) { char mod[260] = "-"; uintptr_t rel = smp[i].ip - lo;   /* in another module: the address from that module's start, and its path (its exports name the function) */
+            if (smp[i].ip < lo || smp[i].ip >= hi) { HMODULE m; rel = smp[i].ip; if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)smp[i].ip, &m)) { GetModuleFileNameA(m, mod, sizeof mod); rel = smp[i].ip - (uintptr_t)m; } else snprintf(mod, sizeof mod, "?"); }
+            fprintf(f, "%llx %llx %s\n", (unsigned long long)rel, (unsigned long long)(smp[i].ret ? smp[i].ret - lo : 0), mod); }
+        fclose(f); LOG("host profile: %d samples written to %s (thread CPU %.2f s of %.1f s)", n, path, cpu, secs); }
+    free(smp); return 0;
+}
+void nvn_host_init(void) { g_t0_ns = now_ns(); AddVectoredExceptionHandler(1, veh_nvn); if (getenv("SWR_HOST_PROF")) CloseHandle(CreateThread(NULL, 0, host_prof_main, NULL, 0, NULL)); }
 #endif
 void dm_gfx_shot_at(const char *path) { if (dm_gfx_ctl.shot_at) dm_gfx_ctl.shot_at(path); }
 

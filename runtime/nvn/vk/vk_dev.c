@@ -304,11 +304,11 @@ int vk_dev_open(const vk_dev_opts *o, const char *const *inst_exts, uint32_t n_i
     VKLOG("features: geometry %d tessellation %d multiViewport %d dualSrcBlend %d logicOp %d depthClamp %d samplerAnisotropy %d BC %d ASTC %d sparse buffers %d "
           "custom border %d/%d transform feedback %d depth clip control %d uint8 index %d conditional rendering %d provoking last %d null descriptor %d "
           "eds2 logic op %d eds3 %d NV viewport swizzle %d memory budget %d present wait %d line raster %d vertex divisor %d list restart %d stencil export %d "
-          "fs interlock %d GPL %d mirror clamp to edge %d min/max filter %d bufferDeviceAddress %d shaderInt64 %d shaderFloat16 %d",
+          "fs interlock %d GPL %d mirror clamp to edge %d min/max filter %d bufferDeviceAddress %d shaderInt64 %d shaderFloat16 %d NV gs passthrough %d NV viewport array2 %d",
           en.geometryShader, en.tessellationShader, en.multiViewport, en.dualSrcBlend, en.logicOp, en.depthClamp, en.samplerAnisotropy, h->bc, h->astc_ldr, h->sparse_buffer,
           h->custom_border, h->custom_border_noformat, h->xfb, h->depth_clip_control, h->index_u8, h->cond_render, h->provoking_last, h->null_descriptor,
           h->eds2_logic_op, h->eds3, h->viewport_swizzle_nv, h->memory_budget, h->present_wait, h->line_raster, h->vertex_divisor, h->prim_list_restart, h->stencil_export,
-          h->fs_interlock, h->gpl, h->mirror_clamp_edge, h->minmax_filter, f12.bufferDeviceAddress, en.shaderInt64, f12.shaderFloat16);
+          h->fs_interlock, h->gpl, h->mirror_clamp_edge, h->minmax_filter, f12.bufferDeviceAddress, en.shaderInt64, f12.shaderFloat16, h->gs_passthrough_nv, h->viewport_array2_nv);
     VKLOG("if the GPU stops responding: checkpoints %s, the driver's fault report %s", h->checkpoints == 2 ? "before every dispatch and draw" : h->checkpoints ? "before every dispatch" : "off",
           h->device_fault ? "on" : "not available");
     VKLOG("3D slice descriptors: storage %d sampled %d", h->image_2d_of_3d, h->sampler_2d_of_3d);

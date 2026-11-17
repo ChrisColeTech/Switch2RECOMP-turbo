@@ -105,13 +105,22 @@ static int image_size(const u32* p, u32 count, u64* size, u64* align){
    are copied into, in two transfer memories (requests in rw, values and acks in ro), refreshed every millisecond */
 #define SC_N 192
 static u64 g_sc_rw, g_sc_ro; static KEvent *g_sc_req, *g_sc_done; static u64 g_sc_prev[SC_N];
+/* syncpoints this runtime's own services signal (the video decoder's) are published: kept current in the cache every
+   millisecond. The SDK's TryWaitSyncPoint (nn::syncpt::sdk, under nn::gs::TryWaitNativeSync) takes a cache entry of ~0
+   ("unknown") as signalled and never asks for it, so an unpublished decoder fence was complete at once: the game drained
+   decoded frames without waiting (Donkey Kong Bananza's tutorial videos ran ~3.6x fast, dropping most frames) and, after
+   the end of a video, released and re-acquired one output image ~280000 times a second forever, its video thread at a
+   full core and the game frozen behind it */
+static u64 g_sc_pub[(SC_N+63)/64];
+static void sc_publish_one(u32 id){ u32 cur=syncpt_read(id); u64 prev=g_sc_prev[id];
+  u64 v= prev==~0ull? cur : ((prev&0xFFFFFFFF00000000ull)+((u32)cur<(u32)prev? 1ull<<32 : 0))|cur; g_sc_prev[id]=v; gw64(g_sc_ro+0x40+id*8,v); }
+static void sc_publish(void){ if(!g_sc_ro) return; for(u32 g=0;g<(SC_N+63)/64;g++) for(u64 m=g_sc_pub[g];m;m&=m-1){ u32 id=g*64+(u32)__builtin_ctzll(m); if(id<SC_N) sc_publish_one(id); } }
 static void sc_refresh(void){
   if(!g_sc_rw) return;
   u64 req=gr64(g_sc_rw), ack=gr64(g_sc_ro+0x640), groups=(req^ack)&7; if(!groups) return;
   for(u32 g=0;g<3;g++){ if(!(groups>>g&1)) continue;
     u64 want=gr64(g_sc_rw+8+g*8), slots=want^gr64(g_sc_ro+0x648+g*8);
-    for(u32 b=0;b<64;b++) if(slots>>b&1){ u32 id=g*64+b; u32 cur=syncpt_read(id); u64 prev=g_sc_prev[id];
-      u64 v= prev==~0ull? cur : ((prev&0xFFFFFFFF00000000ull)+((u32)cur<(u32)prev? 1ull<<32 : 0))|cur; g_sc_prev[id]=v; gw64(g_sc_ro+0x40+id*8,v); }
+    for(u32 b=0;b<64;b++) if(slots>>b&1){ u32 id=g*64+b; if(id<SC_N) sc_publish_one(id); }
     __atomic_thread_fence(__ATOMIC_RELEASE); gw64(g_sc_ro+0x648+g*8,want); }
   __atomic_thread_fence(__ATOMIC_RELEASE); gw64(g_sc_ro+0x640,req);
   kevent_clear(g_sc_req); kevent_signal(g_sc_done); }
@@ -123,7 +132,7 @@ static void sps_poll(void){ for(int i=0;i<64;i++) if(g_sps[i].armed && (i32)(syn
 /* vi2 31/32 events: the display's vsync, every 16.7 ms (the main thread waits on 32 before its first frame) */
 static KEvent* g_vsync[2];
 static void sc_thread(void* a){ (void)a; u64 next=plat_ns()+16666667;
-  for(;;){ plat_sleep_ns(1000000); ns2_lock(); sc_refresh(); sps_poll();
+  for(;;){ plat_sleep_ns(1000000); ns2_lock(); sc_publish(); sc_refresh(); sps_poll();
     if(plat_ns()>=next){ next+=16666667; if(plat_ns()>next) next=plat_ns()+16666667; for(int i=0;i<2;i++) if(g_vsync[i]) kevent_signal(g_vsync[i]); }
     ns2_unlock(); } }
 
@@ -285,10 +294,18 @@ static int chat_disp(SvcObj* o, IpcCtx* c){
 typedef struct { u32 id,target,release_id,release_val; int state,has_release; } VDecImage; /* 1 queued, 2 held by client */
 typedef struct { u8 *y,*uv; u32 w,h,uv_pitch; u64 pts,serial; int end; } VDecFrame;
 typedef struct { u32 image,w,h; u64 pts,serial; int end; } VDecOutput;
+/* the bitstream the game submitted beyond VDEC_AHEAD decoded pictures: it waits here, like in the hardware decoder's input
+   queue, and is decoded as output images come back (vdec_pump). Decoding at once into a 32-picture queue made Donkey
+   Kong Bananza's tutorial videos drop ~3 of 4 pictures (the game submits a whole clip in a fraction of a second) */
+typedef struct { u8* data; u32 n; u64 pts; int end; } VDecPacket;
+#define VDEC_AHEAD 6
+#define VDEC_PK_READY 24
+#define VDEC_PK_BYTES (64u<<20)
 typedef struct {
   PMutex lock; KEvent* ready; u32 width,height,rate,syncpt,sync_base,handed; u64 submitted,pictures,dropped,queue_bytes,next_serial;
   int configured,started,ended,ctx_ok; char codec[32]; VDecImage images[VDEC_IMAGES]; u32 nimages,free[VDEC_IMAGES],nfree;
   VDecFrame frames[VDEC_FRAMES]; u32 nframes; VDecOutput outputs[VDEC_OUTPUTS]; u32 noutputs;
+  VDecPacket* pk; u32 npk,cappk; u64 pk_bytes,pk_waited;
 #ifdef SWR_HAVE_VP9
   vpx_codec_ctx_t ctx;
 #endif
@@ -297,13 +314,14 @@ static PMutex g_vpx_lock; static int g_vpx_lock_init;
 static u64 vdec_frame_bytes(VDec* v){ u64 w=v->width,h=v->height; return w*h+((w+1)&~1ull)*((h+1)/2); }
 static int vdec_room(VDec* v,u32 reserve){ u64 one=vdec_frame_bytes(v); return one && reserve && v->nframes+reserve<=VDEC_FRAMES && one<=VDEC_QUEUE_BYTES/reserve && v->queue_bytes<=VDEC_QUEUE_BYTES-one*reserve; }
 static KEvent* vdec_ready_event(VDec* v){ if(!v->ready){ v->ready=kevent_new("video decoder ready",0); kobj_ref(&v->ready->o); } return v->ready; }
-static void vdec_ready_update(VDec* v){ if(!v->ready) return; if(!v->ended && vdec_room(v,2)) kevent_signal(v->ready); else kevent_clear(v->ready); }
+static void vdec_ready_update(VDec* v){ if(!v->ready) return; if(!v->ended && v->npk<VDEC_PK_READY && vdec_room(v,2)) kevent_signal(v->ready); else kevent_clear(v->ready); }
 static VDecImage* vdec_image(VDec* v,u32 id){ for(u32 i=0;i<v->nimages;i++) if(v->images[i].id==id) return &v->images[i]; return NULL; }
 static void vdec_complete(VDec* v,u32 target){ if(!v->syncpt) return; u32 cur=syncpt_read(v->syncpt); while((i32)(target-cur)>0){ syncpt_incr(v->syncpt); cur++; } }
 static void vdec_complete_all(VDec* v){ if(v->syncpt) vdec_complete(v,v->sync_base+v->handed); }
 static void vdec_cancel_free(VDec* v){ for(u32 i=0;i<v->nfree;i++){ VDecImage* vi=vdec_image(v,v->free[i]); if(vi) vi->state=2; } v->nfree=0; }
 static void vdec_free_frame(VDec* v,VDecFrame* f){ v->queue_bytes-=f->y? (u64)f->w*f->h+(u64)f->uv_pitch*((f->h+1)/2) : 0; free(f->y); memset(f,0,sizeof *f); }
-static void vdec_clear_frames(VDec* v){ while(v->nframes) vdec_free_frame(v,&v->frames[--v->nframes]); }
+static void vdec_clear_frames(VDec* v){ while(v->nframes) vdec_free_frame(v,&v->frames[--v->nframes]);
+  while(v->npk) free(v->pk[--v->npk].data); v->pk_bytes=0; }   /* and the bitstream still waiting */
 /* A submission may already be scheduled from an older ready signal. Keep it successful and bounded by discarding the
    oldest picture it overtook. Frames in output images aren't in this queue, and an EOS marker is never discarded. */
 static int vdec_make_room(VDec* v,u64 bytes,u64 pts){
@@ -344,6 +362,19 @@ static int vdec_capture(VDec* v,const vpx_image_t* im,u64 fallback_pts,u64* seri
     for(u32 y=0;y<ch;y++){ u8* d=f->uv+(u64)y*uvp; const u8* u=up+(i64)y*us; const u8* q=vp+(i64)y*vs;
       for(u32 x=0;x<cw;x++){ if(high){ u16 a,b; memcpy(&a,u+x*2,2); memcpy(&b,q+x*2,2); d[x*2]=(u8)(a>>shift); d[x*2+1]=(u8)(b>>shift); } else { d[x*2]=u[x]; d[x*2+1]=q[x]; } } } }
   v->queue_bytes+=total; v->nframes++; return 1; }
+/* one submitted packet (cmd 109/400) into decoded pictures; with end, the decoder is drained and the last picture marked */
+static int vdec_decode(VDec* v,const u8* data,u64 n,u64 pts,int end){
+  u64 last=0; const vpx_image_t* im; vpx_codec_iter_t it=NULL; int cap=1;
+  pm_lock(&g_vpx_lock); int e=vpx_codec_decode(&v->ctx,n? data : NULL,(unsigned)n,(void*)(uintptr_t)(pts+1),0);
+  while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break;
+  if(!e && cap==1 && end){ e=vpx_codec_decode(&v->ctx,NULL,0,(void*)(uintptr_t)(pts+1),0); it=NULL; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break; }
+  pm_unlock(&g_vpx_lock);
+  if(e){ WARN("switch 2 video: VP9 decode failed: %s\n",vpx_codec_err_to_string((vpx_codec_err_t)e)); return K_INVSIZE; }
+  if(cap!=1){ WARN("switch 2 video: decoded output could not be queued (%s, %u frames, %.1f MB)\n",cap<0? (cap==-1? "capacity" : "allocation") : "format",v->nframes,v->queue_bytes/1048576.0); return cap==-2? K_OUTOFRES : K_INVSIZE; }
+  if(end){ if(last){ for(u32 i=0;i<v->nframes;i++) if(v->frames[i].serial==last) v->frames[i].end=1; for(u32 i=0;i<v->noutputs;i++) if(v->outputs[i].serial==last) v->outputs[i].end=1; }
+    else if(vdec_make_room(v,0,pts)){ VDecFrame* f=&v->frames[v->nframes++]; memset(f,0,sizeof *f); f->pts=pts; f->serial=++v->next_serial; f->end=1; }
+    v->ended=1; }
+  return 0; }
 #endif
 static int vdec_write(VDec* v,VDecImage* vi,VDecFrame* f,u32* ow,u32* oh){
   NsImage* im=image_find(vi->id); if(!im || !im->decoder) return 0; u32 lw=(im->pref[2]&0xFFFF)+1,lh=(im->pref[2]>>16)+1; u64 pitch=(lw+63)&~63ull,chroma=pitch*((lh+127)&~127ull),size=chroma+pitch*(((lh+1)/2+127)&~127ull);
@@ -352,7 +383,11 @@ static int vdec_write(VDec* v,VDecImage* vi,VDecFrame* f,u32* ow,u32* oh){
   if(!f->y) return 1;
   for(u32 y=0;y<*oh;y++) memcpy(d+(u64)y*pitch,f->y+(u64)y*f->w,*ow);
   u32 cw=(*ow+1)&~1u,ch=(*oh+1)/2; for(u32 y=0;y<ch;y++) memcpy(d+chroma+(u64)y*pitch,f->uv+(u64)y*f->uv_pitch,cw); return 1; }
+#ifdef SWR_HAVE_VP9
+static int vdec_decode(VDec* v,const u8* data,u64 n,u64 pts,int end);
+#endif
 static void vdec_pump(VDec* v){
+ for(;;){
   while(v->nframes && v->nfree && v->noutputs<VDEC_OUTPUTS){ u32 id=v->free[0]; memmove(v->free,v->free+1,(--v->nfree)*sizeof *v->free); VDecImage* vi=vdec_image(v,id); if(!vi || vi->state!=1) continue;
     if(vi->has_release && vi->release_id<192) syncpt_wait(vi->release_id,vi->release_val,100000000);
     vi->has_release=0;
@@ -361,18 +396,28 @@ static void vdec_pump(VDec* v){
     vi->state=2; v->outputs[v->noutputs++]=(VDecOutput){id,w,h,f.pts,f.serial,f.end}; vdec_complete(v,vi->target); v->pictures++;
     if(v->pictures==1 || !(v->pictures%120) || f.end) LOG("switch 2 video: frame %llu (%ux%u, pts %llu us%s) in image %u, %u queued, %llu dropped\n",(unsigned long long)v->pictures,w,h,(unsigned long long)f.pts,f.end? ", end" : "",id,v->nframes,(unsigned long long)v->dropped);
     vdec_free_frame(v,&f); }
+#ifdef SWR_HAVE_VP9
+  /* pictures went out: decode what waited, up to VDEC_AHEAD pictures ahead of them */
+  if(v->npk && v->nframes<VDEC_AHEAD && v->ctx_ok){ VDecPacket p=v->pk[0]; memmove(v->pk,v->pk+1,(--v->npk)*sizeof *v->pk); v->pk_bytes-=p.n;
+    int rc=vdec_decode(v,p.data,p.n,p.pts,p.end); free(p.data); if(rc) WARN("switch 2 video: a waiting packet failed to decode (%x)\n",rc); continue; }
+#endif
+  break; }
   vdec_ready_update(v); }
 static void vdec_handout(VDec* v,IpcCtx* c,u32 id,u32 release_word,u32 release_val,int release){
   VDecImage* vi=vdec_image(v,id); if(!vi && v->nimages<VDEC_IMAGES){ vi=&v->images[v->nimages++]; memset(vi,0,sizeof *vi); vi->id=id; }
   if(!vi || vi->state==1){ out32(c,~0u); out32(c,0); out32(c,0); out32(c,0); return; }
   vi->state=1; vi->target=v->sync_base+(++v->handed); vi->has_release=release && release_word!=~0u; vi->release_id=~release_word; vi->release_val=release_val; v->free[v->nfree++]=id;
   out32(c,~v->syncpt); out32(c,0); out32(c,vi->target); out32(c,0); vdec_pump(v); }
-static void vdec_destroy(SvcObj* o){ VDec* v=o->data; pm_lock(&v->lock); vdec_complete_all(v); vdec_codec_close(v); vdec_clear_frames(v); pm_unlock(&v->lock); if(v->ready) kobj_unref(&v->ready->o); }
+static void vdec_destroy(SvcObj* o){ VDec* v=o->data; pm_lock(&v->lock); vdec_complete_all(v); vdec_codec_close(v); vdec_clear_frames(v); free(v->pk); v->pk=NULL; v->cappk=0; pm_unlock(&v->lock); if(v->ready) kobj_unref(&v->ready->o); }
+static int g_vdec_trace;   /* decoder releases logged after a flush */
 static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data; int rc=0; pm_lock(&v->lock);
   switch(c->cmd){
     case 3: out_copy_h(c,ev_h(vdec_ready_event(v))); vdec_ready_update(v); break;
     case 6: v->started=1; if(v->configured && !v->ctx_ok) vdec_codec_open(v); vdec_ready_event(v); vdec_ready_update(v); break;
-    case 8: case 207: vdec_complete_all(v); vdec_cancel_free(v); vdec_reset(v); v->noutputs=0; vdec_ready_event(v); vdec_ready_update(v); break;
+    case 8: case 207: vdec_complete_all(v); vdec_cancel_free(v); vdec_reset(v); v->noutputs=0; vdec_ready_event(v); vdec_ready_update(v); g_vdec_trace=12;
+      { u32 sp=v->syncpt, g=sp/64; LOG("switch 2 video: flush (cmd %u): syncpoint %u at %u, %u images; cache %llx, request %llx/%llx, want %llx ack %llx\n",c->cmd,sp,syncpt_read(sp),v->nimages,
+          g_sc_ro && sp<SC_N? (unsigned long long)gr64(g_sc_ro+0x40+sp*8) : 0ull, g_sc_rw? (unsigned long long)gr64(g_sc_rw) : 0ull, g_sc_ro? (unsigned long long)gr64(g_sc_ro+0x640) : 0ull,
+          g_sc_rw && g<3? (unsigned long long)gr64(g_sc_rw+8+g*8) : 0ull, g_sc_ro && g<3? (unsigned long long)gr64(g_sc_ro+0x648+g*8) : 0ull); } break;
     case 115: vdec_complete_all(v); vdec_cancel_free(v); vdec_codec_close(v); vdec_clear_frames(v); v->started=0; v->ended=1; break;
     case 200: case 201: case 202: case 210: break;
     case 101: { u64 a=0,n=0; char name[32]={0}; if(buf_in(c,0,&a,&n) && n && guest_span_readable(a,n,1)){ u64 z=n<sizeof name-1?n:sizeof name-1; memcpy(name,GP(a),(size_t)z); }
@@ -382,37 +427,43 @@ static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data; int rc=0; pm_lo
     case 311: { u32 id=in32(c,0); NsImage* im=image_find(id); u64 base=im?nvmap_addr(im->mem):0,msz=im?nvmap_size(im->mem):0;
       if(!im || !im->decoder || !base || im->off>msz || im->size>msz-im->off || !guest_span_writable(base+im->off,im->size,1) || vdec_image(v,id) || v->nimages>=VDEC_IMAGES){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); }
       else { vdec_handout(v,c,id,0,0,0); LOG("switch 2 video: registered output image %u on syncpoint %u value %u\n",id,v->syncpt,v->handed); } break; }
-    case 314: { u32 id=in32(c,0); VDecImage* vi=vdec_image(v,id); if(!vi || vi->state!=2){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); } else vdec_handout(v,c,id,in32(c,8),in32(c,16),1); break; }
+    /* ReleaseVp9DecoderOutputBuffer. Donkey Kong Bananza releases an image again after a flush (cmd 8: 1, 2, 1) and the SDK
+       aborts on any error (f201), so releasing an image the decoder already has is accepted: same fence, the newer client fence */
+    case 314: { u32 id=in32(c,0); VDecImage* vi=vdec_image(v,id);
+      if(vi && vi->state==1){ u32 rw=in32(c,8), rv=in32(c,16); vi->has_release= rw!=~0u; vi->release_id=~rw; vi->release_val=rv;
+        out32(c,~v->syncpt); out32(c,0); out32(c,vi->target); out32(c,0);
+        static u64 n; n++; if(n<=8 || !(n&(n-1))) LOG("switch 2 video: image %u released again while the decoder has it, accepted (%llu so far; fence %u, syncpoint %u at %u, cache %llx, client fence %08x/%u)\n",
+          id,(unsigned long long)n,vi->target,v->syncpt,syncpt_read(v->syncpt),g_sc_ro && v->syncpt<SC_N? (unsigned long long)gr64(g_sc_ro+0x40+v->syncpt*8) : 0ull,rw,rv); break; }
+      if(!vi || vi->state!=2){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); } else { vdec_handout(v,c,id,in32(c,8),in32(c,16),1);
+        if(g_vdec_trace>0){ g_vdec_trace--; LOG("switch 2 video: image %u released: fence %u, syncpoint %u at %u, client fence %08x/%u\n",id,vi->target,v->syncpt,syncpt_read(v->syncpt),in32(c,8),in32(c,16)); } } break; }
     case 212: { u32 id=in32(c,0); VDecImage* vi=vdec_image(v,id); if(!vi){ rc=K_NOTFOUND; break; } if(vi->state==1) vdec_complete(v,vi->target);
       for(u32 i=0;i<v->nfree;i++) if(v->free[i]==id){ memmove(v->free+i,v->free+i+1,(--v->nfree-i)*sizeof *v->free); break; }
       for(u32 i=0;i<v->noutputs;) if(v->outputs[i].image==id) memmove(v->outputs+i,v->outputs+i+1,(--v->noutputs-i)*sizeof *v->outputs); else i++;
       *vi=v->images[--v->nimages]; break; }
     case 213: if(!v->noutputs) rc=0x1c286f; else { VDecOutput q=v->outputs[0]; memmove(v->outputs,v->outputs+1,(--v->noutputs)*sizeof *v->outputs); u64 ns=q.pts*1000;
       out32(c,q.image); out32(c,q.w); out32(c,q.h); out32(c,q.w); out32(c,q.h); out32(c,0); out32(c,(u32)ns); out32(c,(u32)(ns>>32)); out32(c,q.end?1:0); for(int i=0;i<7;i++) out32(c,0); } break;
-    case 109: case 400: { u64 a=0,n=0,pts=in64(c,0),last=0; int end=in8(c,8)!=0; if(!v->configured || !v->ctx_ok) rc=K_INVSTATE;
+    case 109: case 400: { u64 a=0,n=0,pts=in64(c,0); int end=in8(c,8)!=0; if(!v->configured || !v->ctx_ok) rc=K_INVSTATE;
       else if(!buf_in(c,0,&a,&n) || n>64u<<20 || (n && !guest_span_readable(a,n,1))) rc=K_INVSIZE;
 #ifdef SWR_HAVE_VP9
-      else { pm_lock(&g_vpx_lock); int e=vpx_codec_decode(&v->ctx,n?GP(a):NULL,(unsigned)n,(void*)(uintptr_t)(pts+1),0); vpx_codec_iter_t it=NULL; const vpx_image_t* im;
-        int cap=1; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break;
-        pm_unlock(&g_vpx_lock); vdec_pump(v);
-        if(!e && cap==1 && end){ pm_lock(&g_vpx_lock); e=vpx_codec_decode(&v->ctx,NULL,0,(void*)(uintptr_t)(pts+1),0); it=NULL; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break; pm_unlock(&g_vpx_lock); vdec_pump(v); }
-        if(e){ WARN("switch 2 video: VP9 decode failed: %s\n",vpx_codec_err_to_string((vpx_codec_err_t)e)); rc=K_INVSIZE; }
-        else if(cap!=1){ WARN("switch 2 video: decoded output could not be queued (%s, %u frames, %.1f MB)\n",cap<0? (cap==-1? "capacity" : "allocation") : "format",v->nframes,v->queue_bytes/1048576.0); rc= cap==-2? K_OUTOFRES : K_INVSIZE; }
-        else if(end){ if(last){ for(u32 i=0;i<v->nframes;i++) if(v->frames[i].serial==last) v->frames[i].end=1; for(u32 i=0;i<v->noutputs;i++) if(v->outputs[i].serial==last) v->outputs[i].end=1; }
-          else if(vdec_make_room(v,0,pts)){ VDecFrame* f=&v->frames[v->nframes++]; memset(f,0,sizeof *f); f->pts=pts; f->serial=++v->next_serial; f->end=1; }
-          v->ended=1; vdec_pump(v); }
-      }
+      else if(!v->npk && v->nframes<VDEC_AHEAD){ rc=vdec_decode(v,GP(a),n,pts,end); vdec_pump(v); }
+      else if(v->pk_bytes+n>VDEC_PK_BYTES) rc=K_OUTOFRES;
+      else {   /* VDEC_AHEAD pictures ahead already: the bitstream waits (VDecPacket) */
+        if(v->npk==v->cappk){ u32 nc=v->cappk? v->cappk*2 : 64; VDecPacket* q=realloc(v->pk,nc*sizeof *q); if(q){ v->pk=q; v->cappk=nc; } }
+        u8* d= n? malloc((size_t)n) : NULL;
+        if(v->npk==v->cappk || (n && !d)){ free(d); rc=K_OUTOFRES; }
+        else { if(n) memcpy(d,GP(a),(size_t)n); v->pk[v->npk++]=(VDecPacket){d,(u32)n,pts,end}; v->pk_bytes+=n; v->pk_waited++; if(end) v->ended=1; vdec_pump(v); } }
 #else
-      else { (void)last; rc=K_NOTIMPL; }
+      else rc=K_NOTIMPL;
 #endif
-      if(!rc){ u64 id=++v->submitted; out64(c,id); if(id<=24 || !(id%120)) LOG("switch 2 video: submit %llu, %llu bytes, pts %llu us%s, %llu output, %u queued (%.1f MB), %llu dropped\n",(unsigned long long)id,(unsigned long long)n,(unsigned long long)pts,end? ", end" : "",(unsigned long long)v->pictures,v->nframes,v->queue_bytes/1048576.0,(unsigned long long)v->dropped); }
+      if(!rc){ u64 id=++v->submitted; out64(c,id); if(id<=24 || !(id%120)) LOG("switch 2 video: submit %llu, %llu bytes, pts %llu us%s, %llu output, %u queued (%.1f MB), %u packets waiting, %llu dropped\n",(unsigned long long)id,(unsigned long long)n,(unsigned long long)pts,end? ", end" : "",(unsigned long long)v->pictures,v->nframes,v->queue_bytes/1048576.0,v->npk,(unsigned long long)v->dropped); }
       vdec_ready_update(v);
       break; }
     default: pm_unlock(&v->lock); return ns2_unknown(o,c);
   }
   pm_unlock(&v->lock); return rc; }
 static int vdec_disp(SvcObj* o, IpcCtx* c){
-  if(c->cmd==1){ SvcObj* s=svcobj_new("IVideoDecoderService",vdec_svc_disp,sizeof(VDec)); VDec* v=s->data; pm_init(&v->lock); ns2_lock(); if(!g_vpx_lock_init){ pm_init(&g_vpx_lock); g_vpx_lock_init=1; } ns2_unlock(); v->syncpt=syncpt_alloc(); v->sync_base=syncpt_read(v->syncpt); s->destroy=vdec_destroy; return move_obj(c,s,0); }
+  if(c->cmd==1){ SvcObj* s=svcobj_new("IVideoDecoderService",vdec_svc_disp,sizeof(VDec)); VDec* v=s->data; pm_init(&v->lock); ns2_lock(); if(!g_vpx_lock_init){ pm_init(&g_vpx_lock); g_vpx_lock_init=1; } ns2_unlock(); v->syncpt=syncpt_alloc(); v->sync_base=syncpt_read(v->syncpt);
+    if(v->syncpt<SC_N){ ns2_lock(); g_sc_pub[v->syncpt/64]|=1ull<<(v->syncpt%64); if(g_sc_ro) sc_publish_one(v->syncpt); ns2_unlock(); }   /* its fences wait (sc_publish) */ s->destroy=vdec_destroy; return move_obj(c,s,0); }
   return ns2_unknown(o,c); }
 
 static int vi2_disp(SvcObj* o, IpcCtx* c){   /* IVi2Session */

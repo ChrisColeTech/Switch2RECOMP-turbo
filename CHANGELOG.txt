@@ -1,5 +1,18 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Donkey Kong Bananza: the terrain is shaded instead of black. Its depth pre-pass appends each chunk's visible
+  triangles with a geometry shader and the shading pass draws that list with DrawElementsIndirect from the same
+  64-byte record; the record's count grew without end and had 0 instances. Such counts now start each frame at 0 and
+  a record without instances draws once (gamectl set append_reset 0 turns it off). What the console does for this was
+  not found: docs/GAMEPLAY_INVESTIGATION.md.
+- A storage buffer bound with size 0 is bound to the end of its memory pool instead of to nothing (Donkey Kong
+  Bananza's second queue appends to one that the CPU reads back; its tutorial video panel plays now).
+- Mario Kart World races run at 57 FPS instead of 51 (present interval p50 18.5 -> 16.7 ms): the dirty-page tracker
+  finds a range by address instead of scanning all 5,200 pools for every page a GPU write-back changes, a range used
+  once in a submission is not looked at again, and the large write-back copies and compares use helper threads.
+- SWR_HOST_PROF=<start s>,<seconds> samples the NVN translation thread (SWR_HOST_PROF_THREAD=completion: the
+  completion thread); tools/host_prof.py prints the table by function. SWR_NVN_CALLS=1 lists the NVN entries a game
+  calls. Pass dumps show GPU event waits and signals and transform feedback.
 - Windows: DualSense/DualShock 4 lights and rumble work. The native HID output open denied shared write access,
   which Windows refuses (error 32) whenever any other handle on the pad can write, so every session silently fell
   back to read-only input. Switch 2 games (Mario Kart World, Donkey Kong Bananza) send all rumble through

@@ -12,6 +12,7 @@ void pm_init(PMutex* m){ InitializeSRWLock(&m->l); }
 void pm_lock(PMutex* m){ AcquireSRWLockExclusive(&m->l); }
 void pm_unlock(PMutex* m){ ReleaseSRWLockExclusive(&m->l); }
 void logf_(int level,const char* fmt,...){ (void)level; (void)fmt; }
+u64 plat_ns(void){ static u64 t; return t+=1000000; }   /* svc_hid.c's input record/replay asks the time; a millisecond a call here */
 int stub_ok(SvcObj* o,IpcCtx* c){ (void)o; (void)c; return 0; }
 u32 h_new(KObj* o){ (void)o; return 1; }
 void kobj_ref(KObj* o){ (void)o; }
