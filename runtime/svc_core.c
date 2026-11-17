@@ -1140,6 +1140,9 @@ static int mii_db(SvcObj* o, IpcCtx* c){ (void)o; static u32 seen[4]; u32 b=c->c
   else if(c->cmd==0) out32(c,0);
   else if(c->cmd==1) out8(c,0);                         /* IsFullDatabase */
   else if(c->cmd==6 || c->cmd==7) mii_default(c);       /* BuildRandom / BuildDefault -> CharInfo */
+  /* UpdateLatest / GetIndex look a mii up in the database, which is empty: NotFound, and the game keeps its own copy.
+     answered as success with no data, Mario Kart 8 Deluxe took an all-zero CharInfo for the Mii in its save */
+  else if(c->cmd==5 || c->cmd==21) return RC(126,4);
   return 0; }
 
 static int mii_disp(SvcObj* o, IpcCtx* c){ if(c->cmd==0){ out_obj(c,svcobj_new("IDatabaseService",mii_db,0)); return 0; } return quiet_ok(o,c); }
