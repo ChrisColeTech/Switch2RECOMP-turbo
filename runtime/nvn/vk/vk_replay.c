@@ -137,7 +137,7 @@ static void view_keep(VkBufferView v) {
 static struct { VkBuffer zero, sink, support, quads, bounce; vk_alloc zero_m, sink_m, support_m, quads_m, bounce_m; VkSampler samp; VkQueryPool qp; } R0;
 // A storage buffer at an offset Vulkan cannot bind (minStorageBufferOffsetAlignment; Metal binds at any 4-byte offset): for a dispatch its bytes are copied into
 // an aligned place of R0.bounce, bound there and, when the shader writes it, copied back after the dispatch (M6: a 4-byte counter of a gameplay compute shader)
-enum { BOUNCE_SIZE = 1 << 20, BOUNCE_MAX = 64 << 10 };
+enum { BOUNCE_SIZE = 1 << 20, BOUNCE_MAX = 64 << 10, SBUF_UNSIZED = 1 << 20 };
 static struct { VkBuffer pool; VkDeviceSize poff, boff, n; } g_bnc[16]; static int g_nbnc; static VkDeviceSize g_bnc_next;
 static int mkbuf(VkDeviceSize n, VkBufferUsageFlags u, VkMemoryPropertyFlags want, VkBuffer *b, vk_alloc *m, const char *name) {
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
@@ -915,26 +915,32 @@ static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites) {
                 if (read_u32(at, &w_[0]) && read_u32(at + 4, &w_[1]) && read_u32(at + 8, &w_[2])) { memset(&ptr_, 0, sizeof ptr_); ptr_.addr = (uint64_t)w_[1] << 32 | w_[0]; ptr_.size = w_[2]; u = &ptr_; }
             }
             VkBuffer bb; VkDeviceSize oo;
-            if (u && u->addr && u->size && vkm_use(u->addr, u->size, &bb, &oo)) {
-                VkDeviceSize al = g_vk.props.limits.minStorageBufferOffsetAlignment, need = (u->size + 255) & ~(VkDeviceSize)255;
-                if (oo % al && st == 5 && R0.bounce && u->size <= BOUNCE_MAX && g_nbnc < 16) {   // a dispatch (no pass open): through the bounce buffer
+            // A buffer bound with size 0 is still the memory at its address: an NVN shader holds the address (c0) and reads and writes through it, the size is only what the
+            // driver tells the shader. Donkey Kong Bananza binds the list its depth-sampling dispatch appends to this way (0x440 bytes the CPU reads back every frame), and
+            // bound to nothing it lost every entry. Without a size the binding runs to the end of the pool, at most SBUF_UNSIZED
+            uint64_t usz = u ? u->size : 0;
+            if (u && u->addr && !usz) { usz = vkm_room(u->addr); if (usz > SBUF_UNSIZED) usz = SBUF_UNSIZED; VKC(VKC_SBUF_SIZE0);
+                { static int said; if (!said++) VKLOG("a storage buffer bound with size 0 (%#llx, shader %s binding %u): bound to the end of its memory pool, %llu bytes (later ones are not logged)", (unsigned long long)u->addr, sh->key, b->binding, (unsigned long long)usz); } }
+            if (u && u->addr && usz && vkm_use(u->addr, usz, &bb, &oo)) {
+                VkDeviceSize al = g_vk.props.limits.minStorageBufferOffsetAlignment, need = (usz + 255) & ~(VkDeviceSize)255;
+                if (oo % al && st == 5 && R0.bounce && usz <= BOUNCE_MAX && g_nbnc < 16) {   // a dispatch (no pass open): through the bounce buffer
                     if (g_bnc_next + need > BOUNCE_SIZE) g_bnc_next = 0;
                     VkDeviceSize bo = g_bnc_next; g_bnc_next += need < al ? al : need;
-                    VkCommandBuffer cb = vks_cb(); VkBufferCopy c = {oo, bo, u->size}; barrier_all(cb);   // earlier GPU writes of the pool first
+                    VkCommandBuffer cb = vks_cb(); VkBufferCopy c = {oo, bo, usz}; barrier_all(cb);   // earlier GPU writes of the pool first
                     vkCmdCopyBuffer(cb, bb, R0.bounce, 1, &c);   // dispatch's barrier_all orders it before the shader
-                    *o = (VkDescriptorBufferInfo){R0.bounce, bo, u->size};
-                    if (b->rw) { g_bnc[g_nbnc].pool = bb; g_bnc[g_nbnc].poff = oo; g_bnc[g_nbnc].boff = bo; g_bnc[g_nbnc].n = u->size; g_nbnc++;
-                        if (swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == u->size;
-                                       if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = u->size; g_wb[g_nwb].base = 0; g_nwb++; } } }
+                    *o = (VkDescriptorBufferInfo){R0.bounce, bo, usz};
+                    if (b->rw) { g_bnc[g_nbnc].pool = bb; g_bnc[g_nbnc].poff = oo; g_bnc[g_nbnc].boff = bo; g_bnc[g_nbnc].n = usz; g_nbnc++;
+                        if (swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == usz;
+                                       if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = usz; g_wb[g_nwb].base = 0; g_nwb++; } } }
                     RED_ONCE(45, "a storage buffer at an address Vulkan cannot bind (%#llx, %#llx bytes, %s; shader %s binding %u): bound through a copy (later ones are not logged)",
                              (unsigned long long)u->addr, (unsigned long long)u->size, b->rw ? "written" : "read only", sh->key, b->binding);
                 }
                 else if (oo % al) RED_ONCE(44, "a storage buffer at an address Vulkan cannot bind (%#llx, %#llx bytes, %s; shader %s binding %u): not bound",
                                                                                    (unsigned long long)u->addr, (unsigned long long)u->size, b->rw ? "written" : "read only", sh->key, b->binding);
                 else {
-                    *o = (VkDescriptorBufferInfo){bb, oo, u->size};
-                    if (b->rw && swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == u->size;
-                        if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = u->size; g_wb[g_nwb].base = 0; g_nwb++; } }
+                    *o = (VkDescriptorBufferInfo){bb, oo, usz};
+                    if (b->rw && swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == usz;
+                        if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = usz; g_wb[g_nwb].base = 0; g_nwb++; } }
                 }
             }
             x->pBufferInfo = o; break; }
@@ -1107,6 +1113,59 @@ static vkf_row *fl_draw(const p_draw *dw, const p_draw_idx *di) {
     else { r->a[0] = (uint32_t)di->count; r->a[1] = (uint32_t)di->instances; r->a[3] = (uint32_t)di->base_vertex; r->a[4] = (uint32_t)di->base_instance; }
     return r;
 }
+// ---------- Append counters that are indirect draw arguments ----------
+// Donkey Kong Bananza's terrain (docs/GAMEPLAY_INVESTIGATION.md). Every chunk has a 64-byte record in a pool the CPU never touches: the engine's own layout for it is
+// one NVNdrawElementsIndirectData, all zero. The depth pre-pass draws the chunk with a passthrough geometry shader that has the record as a written storage buffer: per
+// visible triangle it adds 3 to word 0 (ATOMG) and stores the three indices behind the old count into a second buffer. The shading pass then draws that list with
+// DrawElementsIndirect(index buffer = the list, arguments = the record), depth EQUAL. Nothing in the game's command stream or on its CPU writes the record again:
+// no fill, copy or update, no dispatch, no CPU store (page watches on the records and on the engine's objects for them). Taken literally the count grows without end
+// (the list is 15,000 bytes) and the draw has 0 instances; that is what this replay did, and the terrain stayed black: depth from the pre-pass, nothing shaded.
+// What the console does to start each frame's list at 0 and to draw it once was not found (see the document for what was ruled out). What a frame needs is certain:
+// a list holding this frame's triangles, drawn once. So an indirect draw whose arguments a draw's shader wrote as a storage buffer in the same frame
+// - gets one instance when its record says none (written into the record once);
+// - has its count set back to 0 when the next frame begins, before anything appends again.
+// Records written by compute dispatches or by the CPU are not touched: only a draw-stage storage buffer that is also a draw's arguments. gamectl set append_reset 0
+// (NXRT_VK_APPEND_RESET=0) turns it off.
+enum { APP_N = 8192 };
+static struct { uint64_t addr, bound; uint8_t on; } g_app[APP_N];   // by address: the frame a draw last bound it as a written storage buffer; on: an indirect draw used it
+static uint64_t g_app_on[APP_N]; static int g_app_non;               // the ones in use, in order
+static uint64_t g_app_frame = 1, g_app_started;                       // vkr_frame's count; the frame whose resets are done
+static inline unsigned app_h(uint64_t a) { return (unsigned)(((uint32_t)(a >> 6) * 0x9E3779B1u) >> 19) & (APP_N - 1); }
+static int app_find(uint64_t a, int make) {
+    unsigned h = app_h(a);
+    for (int k = 0; k < 64; k++, h = (h + 1) & (APP_N - 1)) { if (g_app[h].addr == a) return (int)h; if (!g_app[h].addr) { if (!make) return -1; g_app[h].addr = a; g_app[h].bound = 0; g_app[h].on = 0; return (int)h; } }
+    return -1;
+}
+static uint16_t app_regs(const vks_shader *sh) {   // the storage buffer slots a draw's shader writes
+    if (!sh->app_look) { uint16_t m = 0; for (int i = 0; i < sh->nb; i++) if (sh->b[i].kind == VKB_SBUF && sh->b[i].rw && sh->b[i].reg >= 0 && sh->b[i].reg < 16) m |= (uint16_t)(1u << sh->b[i].reg);
+        ((vks_shader *)sh)->app_regs = m; ((vks_shader *)sh)->app_look = 1; }
+    return sh->app_regs;
+}
+void vkr_fill(uint64_t dst, uint64_t n, uint32_t value);
+static int read_u32(uint64_t a, uint32_t *v);
+static void app_frame_start(void) {   // the first draw of a frame: the counts the last frame's draws used start again at 0
+    g_app_started = g_app_frame;
+    int keep = 0;
+    for (int i = 0; i < g_app_non; i++) { int h = app_find(g_app_on[i], 0); if (h < 0) continue;
+        if (g_app[h].bound + 600 < g_app_frame) { g_app[h].on = 0; continue; }   // not appended to for ten seconds: the game may have given the memory to something else
+        vkr_fill(g_app[h].addr, 4, 0); VKC(VKC_APPEND_RESET); g_app_on[keep++] = g_app_on[i]; }
+    g_app_non = keep;
+}
+static void app_draw(const vks_shader *const *sh, uint64_t ind, int indexed) {
+    static const volatile int *on; if (!on) on = vkc_ptr("append_reset", 1);
+    if (!*on) return;
+    if (g_app_started != g_app_frame) app_frame_start();
+    for (int s = 0; s < 5; s++) if (sh[s]) { uint16_t m = app_regs(sh[s]); for (int r = 0; m; r++, m >>= 1) if ((m & 1) && S->ssbo[s][r].addr) { int h = app_find(S->ssbo[s][r].addr, 1); if (h >= 0) g_app[h].bound = g_app_frame; } }
+    if (!ind) return;
+    int h = app_find(ind, 0);
+    if (h < 0 || g_app[h].bound + 1 < g_app_frame) return;   // not appended to by a draw of this frame (or the one before: a list may be drawn a frame late)
+    if (g_app[h].on || g_app_non == APP_N) return;
+    g_app[h].on = 1; g_app_on[g_app_non++] = ind;
+    uint32_t inst = 1; if (read_u32(ind + 4, &inst) && !inst) vkr_fill(ind + 4, 4, 1);   // no instances in the record: the list is drawn once
+    { static int said; if (!said++) VKLOG("append counters: a draw's shader appends to the arguments of a later indirect %sdraw (%#llx); such counts start each frame at 0, and a record with 0 instances draws once "
+                                           "(docs/GAMEPLAY_INVESTIGATION.md; gamectl set append_reset 0 turns it off)", indexed ? "indexed " : "", (unsigned long long)ind); }
+}
+
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     vkf_row *fr = fl_draw(dw, di);
     if (S->render_skip) { g_st.draws_skipped++; VKC(VKC_DRAW_RENDER_SKIP); if (fr) fr->flags |= FL_RC_SKIP; return; }
@@ -1135,7 +1194,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!mesh && (!sh[0] || (S->bst[1] && !sh[1] && !S->rast_discard))) { g_st.skip_no_shader++; g_st.draws_skipped++; skip_why(!sh[0] ? S->bst[0] : S->bst[1], !sh[0] ? 0 : 1, "a draw"); return; }
     if (!mesh) sh[0] = vin_shader(sh[0]);
     if (S->rast_discard) sh[1] = NULL;
-    { static const volatile int *ng; if (sh[2]) { if (!ng) ng = vkc_ptr("no_gs", 0); if (*ng) sh[2] = NULL; } }   // gamectl set no_gs 1: draws without their geometry shaders (diagnostic A/B)
+    { static const volatile int *ng; if (sh[2]) { if (!ng) ng = vkc_ptr("no_gs", 0); if (*ng) sh[2] = NULL; } }
+    if (!mesh) app_draw(sh, ind, di != NULL);   // gamectl set no_gs 1: draws without their geometry shaders (diagnostic A/B)
     // the render pass, its scissor and viewport (nvn_mtl.m draw_: viewport flipped for the lower-left origin there; Vulkan's y axis runs the other way)
     // With every draw checkpointed: an indirect draw's arguments, as the GPU holds them, copied out first, outside the pass (the pass is ended and begun again). A GPU stuck inside the pass never gets to copies at its end
     if (ind && g_vk.has.checkpoints >= 2) { VkBuffer ab; VkDeviceSize ao; if (vkm_use(ind, dw ? 16 : 20, &ab, &ao)) { pass_end(); vk_ck_args(vks_cb(), vk_ck_next(), ab, ao, dw ? 16 : 20); } }
@@ -1865,8 +1925,8 @@ static int walk(const uint8_t *p, int depth, uint64_t *budget) {
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); if (!t) { bad_record(p, h, "a JUMP to 0"); return -1; } p = t; continue; }
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8 || !t) { bad_record(p, h, depth >= 8 ? "CALLs nested deeper than 8" : "a CALL of handle 0"); return -1; }
             if (walk((const uint8_t *)(uintptr_t)t, depth + 1, budget)) return -1; break; }
-        case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); if (val) { vks_post_event(val, m == NVN_EVENT_SIGNAL_MODE_ADD ? 1 : 0, v); ev_recorded(val, m, v); } break; }
-        case OP_WAIT_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); wait_event(val, m, v); break; }
+        case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); PD("event signal %p %s %u (holds %u)", (void *)val, m == NVN_EVENT_SIGNAL_MODE_ADD ? "add" : "write", v, val ? *val : 0); if (val) { vks_post_event(val, m == NVN_EVENT_SIGNAL_MODE_ADD ? 1 : 0, v); ev_recorded(val, m, v); } break; }
+        case OP_WAIT_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); PD("event wait %p %s %u (holds %u)", (void *)val, m == NVN_EVENT_WAIT_MODE_EQUAL ? "equal" : "at least", v, val ? *val : 0); wait_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); report_counter(t, ad); break; }
         case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); reset_counter(t); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); if (s) vk_note_fence_sync(s); break; }
@@ -2013,6 +2073,7 @@ static void slow_frame(uint64_t frame) {
     t0 = now; pb = b; pn = n; pw = w; pu = u; pp = ps.create_ns; pd = ms.up_ns;
 }
 void vkr_frame(uint64_t frame) {
+    g_app_frame = frame + 2;   // from 1: 0 means "never bound"
     static vkr_stats_t prev; static uint64_t pf;
     g_dl_frame = frame;
     slow_frame(frame);

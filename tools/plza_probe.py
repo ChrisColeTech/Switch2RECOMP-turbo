@@ -415,7 +415,7 @@ def metrics_summary(run, since=None, until=None):
                 out[k + '_per_s'] = mean(k)
             for k in ('draws_skipped', 'skip_no_shader', 'skip_no_pipeline', 'skip_no_target', 'shader_missing', 'shader_arrived', 'shader_failed',
                       'tex_new', 'tex_no_format', 'tex_create_failed', 'tex_no_memory', 'tex_unaddressable', 'tex_unreadable', 'view_failed',
-                      'shader_unusable', 'draw_prim_unsupported', 'draw_no_mesh_shader', 'draw_render_skip'):
+                      'shader_unusable', 'draw_prim_unsupported', 'draw_no_mesh_shader', 'draw_render_skip', 'ind_draw_no_instances', 'append_counter_reset', 'sbuf_size0'):
                 if k in rows[0]: out[k + '_total'] = total(k)
             out['xmon'] = rows[-1].get('xmon'); out['tex_order'] = rows[-1].get('tex_order')
     f = run / 'frames.csv'

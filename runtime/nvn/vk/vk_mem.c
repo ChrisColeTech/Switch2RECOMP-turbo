@@ -247,6 +247,15 @@ static int pool_window(pool_t_ *p, uint64_t addr, uint64_t len, VkBuffer *buf, V
     return 1;
 }
 
+uint64_t vkm_room(uint64_t addr) {
+    uint64_t n = 0;
+    AcquireSRWLockShared(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, 1);
+    if (p) { uint64_t o = addr - p->base; int k = win_of(p, o); uint64_t wend = p->win_lo[k] + p->win_n[k], pend = p->hi - p->base; n = (wend < pend ? wend : pend) - o; }
+    ReleaseSRWLockShared(&g_lk);
+    return n;
+}
+
 int vkm_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     AcquireSRWLockShared(&g_lk);
     pool_t_ *p = pool_find((uintptr_t)addr, len ? len : 1);
