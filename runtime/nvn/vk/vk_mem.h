@@ -17,6 +17,7 @@ int vkm_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   /
 // The replay's access to pool memory in the submission being recorded: brings the range's written pages up to date (uploads in this submission's upload
 // command buffer, before its main one) and returns the buffer and offset. 1 on success
 int vkm_use(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
+void vkm_host_wrote(void);   // the replay itself wrote guest memory (a fill or copy done on the CPU): ranges used earlier in this submission are looked at again
 uint64_t vkm_room(uint64_t addr);   // bytes from addr to the end of its pool (of the buffer window holding it); 0 when addr is in no pool
 uint32_t vkm_pool_gen(void);
 uint64_t vkm_up_ns(void);       // time spent copying pool pages so far (vkm_stats' up_ns without its walk over every pool)   // moves whenever a memory pool comes or goes (a buffer and offset found before may be stale)

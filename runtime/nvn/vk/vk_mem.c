@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <process.h>
 
 void dm_guest_write_prepare(void *addr, size_t len);   // host/crash.c: unprotect before the host writes guest memory
 
@@ -52,6 +53,49 @@ static struct {
 } g_st;
 
 static uint64_t g_budget = 64ull << 20, g_budget_used;
+
+// ---------- Helper threads for the large copies and compares ----------
+// Mario Kart World's compute passes write six buffers of 0.5 to 4.7 MB every frame, and each such write costs two walks over guest memory: the pages' contents as the
+// device has them, copied aside when the write is recorded (on the translation thread, 3,700 pages a frame), and the compare of what the GPU left when it lands (on the
+// thread that completes submissions, 14.7 MB a frame against the copy made before the shader ran). The first was 2 of the translation thread's 12 ms a frame, the second
+// 3 ms that the game's wait for the frame's fence ended later. Both are per page and the pages are independent, so above PAR_MIN pages they are split among the caller
+// and three helper threads. One loop at a time: a caller that finds the helpers busy does its pages alone. NXRT_VK_PAR=0: always alone, as before
+enum { PAR_MIN = 96, PAR_CHUNK = 32, PAR_THREADS = 3 };
+typedef void (*par_fn)(void *ctx, uint64_t lo, uint64_t hi);
+static struct { SRWLOCK lk, one; CONDITION_VARIABLE cv, done; par_fn fn; void *ctx; uint64_t n; _Atomic uint64_t next; int active, started; uint64_t gen; } g_par = {SRWLOCK_INIT, SRWLOCK_INIT};
+static void par_work(void) {
+    for (;;) { uint64_t i = atomic_fetch_add(&g_par.next, PAR_CHUNK); if (i >= g_par.n) return; uint64_t e = i + PAR_CHUNK; g_par.fn(g_par.ctx, i, e < g_par.n ? e : g_par.n); }
+}
+static unsigned __stdcall par_main(void *arg) {
+    (void)arg; uint64_t seen = 0;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_par.lk);
+        while (g_par.gen == seen) SleepConditionVariableSRW(&g_par.cv, &g_par.lk, INFINITE, 0);
+        seen = g_par.gen; g_par.active++;
+        ReleaseSRWLockExclusive(&g_par.lk);
+        par_work();
+        AcquireSRWLockExclusive(&g_par.lk);
+        if (!--g_par.active) WakeAllConditionVariable(&g_par.done);
+        ReleaseSRWLockExclusive(&g_par.lk);
+    }
+    return 0;
+}
+static void par_for(uint64_t n, par_fn fn, void *ctx) {   // fn over [0, n) in pieces; returns when all of it is done
+    static int on = -1; if (on < 0) on = vkc_int("par", 1);
+    if (n < PAR_MIN || !on || !TryAcquireSRWLockExclusive(&g_par.one)) { fn(ctx, 0, n); return; }
+    AcquireSRWLockExclusive(&g_par.lk);
+    if (!g_par.started) { g_par.started = 1; InitializeConditionVariable(&g_par.cv); InitializeConditionVariable(&g_par.done);
+        for (int i = 0; i < PAR_THREADS; i++) { uintptr_t th = _beginthreadex(NULL, 0, par_main, NULL, 0, NULL); if (th) CloseHandle((HANDLE)th); } }
+    g_par.fn = fn; g_par.ctx = ctx; g_par.n = n; atomic_store(&g_par.next, 0);   // next last: a helper still leaving the loop before sees either the old end or all of the new loop
+    g_par.gen++;
+    WakeAllConditionVariable(&g_par.cv);
+    ReleaseSRWLockExclusive(&g_par.lk);
+    par_work();
+    AcquireSRWLockExclusive(&g_par.lk);
+    while (g_par.active) SleepConditionVariableSRW(&g_par.done, &g_par.lk, INFINITE, 0);
+    ReleaseSRWLockExclusive(&g_par.lk);
+    ReleaseSRWLockExclusive(&g_par.one);
+}
 _Atomic uint64_t g_t_bind, g_n_bind;   // time in sparse binds, with vk_sparse.inc: they wait for the queue
 static int g_seen_on = 1;   // gamectl set use_seen 0: every use looks again (a same-run test of vkm_use)
 static _Atomic uint64_t s_up_bytes, s_up_pages, s_up_runs, s_up_ns, s_sync, s_st_bytes, s_st_ovf, s_st_waits, s_wb_bytes, s_uncommitted;
@@ -439,7 +483,9 @@ static uint64_t pool_sync(pool_t_ *p, uint64_t p0, uint64_t p1, VkCommandBuffer 
 // A range synced in this submission, with no page written since, needs no second look: the same few buffers are bound by thousands of draws (5,000 descriptor sets a frame), and looking took 11 ms a frame
 // Only the recording thread gets this far (vks_upload_cb is NULL elsewhere), so the table is that thread's alone. A hit also gives the buffer and offset, so a range
 // used again (thousands of descriptor sets bind the same few) skips the pool lookup and its lock: gamectl set use_fast 0 (NXRT_VK_USE_FAST=0) looks them up every time
-static struct { uint64_t addr, len, gen; uint32_t ep, pgen; VkBuffer buf; VkDeviceSize off; pool_t_ *pool; } g_seen[8192];   // pool: whose pages to look at when guest memory has changed since
+static struct { uint64_t addr, len, gen; uint32_t ep, pgen, host; VkBuffer buf; VkDeviceSize off; pool_t_ *pool; } g_seen[8192];   // pool: whose pages to look at when guest memory has changed since
+static uint32_t g_seen_host = 1;   // moves when the replay writes guest memory itself (vkm_host_wrote)
+void vkm_host_wrote(void) { g_seen_host++; }
 static int g_use_fast = -1;
 static uint64_t s_use_hit, s_use_calls, s_use_synced;   // the recording thread's vkm_use calls, fast-path hits, and those that ran pool_sync
 void vkm_use_counts(uint64_t *calls, uint64_t *hits, uint64_t *synced) { *calls = s_use_calls; *hits = s_use_hit; *synced = s_use_synced; }
@@ -447,6 +493,7 @@ uint32_t vkm_pool_gen(void) { return atomic_load(&g_pool_gen); }
 uint64_t vkm_up_ns(void) { return atomic_load(&s_up_ns); }
 static uint64_t s_use_cyc; static int g_use_ph = -1;   // NXRT_VK_PHASES: cycles inside vkm_use (the replay thread's only)
 uint64_t vkm_use_cycles(void) { return s_use_cyc; }
+static void gpu_pending_drain(void);
 static int vkm_use_(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
 int vkm_use(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (g_use_ph < 0) g_use_ph = vkc_int("phases", 0);
@@ -454,7 +501,7 @@ int vkm_use(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     uint64_t t0 = __builtin_ia32_rdtsc(); int r = vkm_use_(addr, len, buf, off); if (vks_owner() >= 0) s_use_cyc += __builtin_ia32_rdtsc() - t0; return r;
 }
 static int vkm_use_(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
-    if (g_use_fast < 0) g_use_fast = vkc_int("use_fast", 1);
+    if (g_use_fast < 0) g_use_fast = vkc_int("use_fast", 3);
     s_use_calls++;
     unsigned h = (unsigned)(((addr >> 4) * 0x9E3779B1u ^ len * 0x85EBCA6Bu) >> 7) & 8191;
     if (g_use_fast && g_seen_on && g_seen[h].addr == addr && g_seen[h].len == len && g_seen[h].pgen == atomic_load(&g_pool_gen) && g_seen[h].buf) {
@@ -462,7 +509,11 @@ static int vkm_use_(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *of
         // the same range synced before: still current if nothing was written anywhere since (in this submission), or if none of its own pages needs a copy: page_needs
         // looks at each page's own stamp, and a hot page needs one copy per submission. Game threads write all the time, and there are 6 submissions a frame: the
         // whole-memory test alone missed most uses. NXRT_VK_USE_FAST=2: only within a submission (as at first)
-        int ok = g_seen[h].ep == ep && g_seen[h].gen == now;
+        // A range used once in a submission stays as it was copied for the rest of that submission (use_fast 3, the default): the game may not write memory a submitted
+        // command buffer still reads, and what its threads write meanwhile is the next submission's (the console's GPU reads it whenever it gets there). Looking again
+        // at every use meant each page's stamp and pending count for 16,000 uses a frame in a Mario Kart World race, most of them cache misses: 0.8 ms of the 12.7 ms
+        // the translation thread takes per frame. gamectl set use_fast 1: every use looks at its pages again, as before
+        int ok = g_seen[h].ep == ep && (g_use_fast >= 3 ? g_seen[h].host == g_seen_host : g_seen[h].gen == now);
         if (!ok && g_seen[h].ep != ep && g_use_fast == 2) g_seen[h].pool = NULL;
         if (!ok && g_seen[h].pool) {   // what pool_sync would look at: each page against the stamp of its own copy (pgen above: the pool is still there)
             pool_t_ *p = g_seen[h].pool; uint64_t p0 = (addr - p->base) / PAGE, p1 = (addr + (len ? len : 1) - p->base + PAGE - 1) / PAGE;
@@ -470,7 +521,7 @@ static int vkm_use_(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *of
         }
         if (ok && vks_upload_cb()) {
             s_use_hit++;
-            g_seen[h].gen = now; g_seen[h].ep = ep;
+            g_seen[h].gen = now; g_seen[h].ep = ep; g_seen[h].host = g_seen_host;
             if (buf) *buf = g_seen[h].buf;
             if (off) *off = g_seen[h].off;
             return 1;
@@ -486,10 +537,11 @@ static int vkm_use_(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *of
     VkCommandBuffer cb = vks_upload_cb();
     if (!cb) return 1;
     uint32_t ep = atomic_load(&g_sub_epoch); uint64_t gen = nvn_dirty_now();
-    if (g_seen_on && g_seen[h].addr == addr && g_seen[h].len == len && g_seen[h].ep == ep && g_seen[h].gen == gen) { g_seen[h].pgen = pgen; g_seen[h].buf = *buf; g_seen[h].off = *off; g_seen[h].pool = p; return 1; }
+    if (g_seen_on && g_seen[h].addr == addr && g_seen[h].len == len && g_seen[h].ep == ep && g_seen[h].gen == gen && g_seen[h].host == g_seen_host) { g_seen[h].pgen = pgen; g_seen[h].buf = *buf; g_seen[h].off = *off; g_seen[h].pool = p; return 1; }
+    gpu_pending_drain();
     atomic_fetch_add(&s_sync, 1); s_use_synced++;
     pool_sync(p, (addr - p->base) / PAGE, (addr + (len ? len : 1) - p->base + PAGE - 1) / PAGE, cb, UINT64_MAX, NULL);
-    g_seen[h].addr = addr; g_seen[h].len = len; g_seen[h].ep = ep; g_seen[h].gen = nvn_dirty_now(); g_seen[h].pgen = pgen; g_seen[h].buf = *buf; g_seen[h].off = *off;
+    g_seen[h].addr = addr; g_seen[h].len = len; g_seen[h].ep = ep; g_seen[h].gen = nvn_dirty_now(); g_seen[h].pgen = pgen; g_seen[h].buf = *buf; g_seen[h].off = *off; g_seen[h].host = g_seen_host;
     g_seen[h].pool = p;
     return 1;
 }
@@ -519,18 +571,54 @@ uint64_t vkm_sync_all(void) {
 
 // GPU writes in flight over [a, a+len): +1 when recorded, -1 when their bytes have reached guest memory. The pages are copied again from guest memory after
 // that (the write back stamps them), which also brings in anything the CPU wrote beside the GPU's bytes
-static void gpu_pending(uint64_t a, uint64_t len, int d) {
+static uint64_t s_gp_calls, s_gp_pages, s_gp_first, s_gp_cyc;   // statistics (the translation thread's, unlocked)
+typedef struct { pool_t_ *p; const uint64_t *pg; } shadow_ctx;
+static void shadow_copy(void *c_, uint64_t lo, uint64_t hi) { shadow_ctx *c = c_; for (uint64_t k = lo; k < hi; k++) guest_copy(c->p->shadow[c->pg[k]], (const void *)(c->p->base + c->pg[k] * PAGE), PAGE); }
+static void gpu_pending_(uint64_t a, uint64_t len, int d) {
     AcquireSRWLockShared(&g_lk);
     pool_t_ *p = pool_find((uintptr_t)a, len);
-    if (p) for (uint64_t pg = (a - p->base) / PAGE; pg <= (a + len - 1 - p->base) / PAGE && pg < p->npages; pg++) {
-        if (d > 0 && !atomic_load(&p->gpu_pending[pg])) {   // the first one: the use that came before it has just made the device current
+    if (p) {
+        uint64_t p0 = (a - p->base) / PAGE, p1 = (a + len - 1 - p->base) / PAGE + 1; if (p1 > p->npages) p1 = p->npages;
+        s_gp_pages += p1 > p0 ? p1 - p0 : 0;
+        if (d > 0) {   // a page's first write in flight: the use that came before it has just made the device current, and guest memory as it is now is what the device has
+            static uint64_t list[2048];   // the translation thread's alone (with synchronous replay, whoever holds the graphics lock)
             if (!p->shadow) p->shadow = calloc(p->npages, sizeof *p->shadow);
-            if (p->shadow && !p->shadow[pg]) p->shadow[pg] = malloc(PAGE);
-            if (p->shadow && p->shadow[pg]) guest_copy(p->shadow[pg], (const void *)(p->base + pg * PAGE), PAGE);
+            for (uint64_t pg = p0; pg < p1 && p->shadow; ) {
+                uint64_t n = 0;
+                for (; pg < p1 && n < 2048; pg++) if (!atomic_load(&p->gpu_pending[pg])) { if (!p->shadow[pg]) p->shadow[pg] = malloc(PAGE); if (p->shadow[pg]) list[n++] = pg; }
+                s_gp_first += n;
+                if (n) { shadow_ctx c = {p, list}; par_for(n, shadow_copy, &c); }
+            }
         }
-        atomic_fetch_add(&p->gpu_pending[pg], (uint8_t)d);
+        for (uint64_t pg = p0; pg < p1; pg++) atomic_fetch_add(&p->gpu_pending[pg], (uint8_t)d);
     }
     ReleaseSRWLockShared(&g_lk);
+}
+static void gpu_pending(uint64_t a, uint64_t len, int d) { uint64_t t0 = __builtin_ia32_rdtsc(); gpu_pending_(a, len, d); s_gp_cyc += __builtin_ia32_rdtsc() - t0; s_gp_calls++; }
+
+// A write-back that has landed takes its pages' counts down again. That happens on the thread that completes submissions, while the translation thread counts up and
+// reads the same bytes at every use: the cache lines went back and forth between the two cores, and the one "lock add" in gpu_pending was 4.6 % of the translation
+// thread in a Mario Kart World race (3,600 pages a frame, 230 ns each). So the completion thread only queues the range, and the translation thread takes the counts
+// down itself, before it counts up or looks (gpu_pending_drain). A count stays up a moment longer: the device copy counts as the newer one until then, as it did.
+// NXRT_VK_PENDING_DIRECT=1: as before
+static struct { uint64_t a, len; } g_pdq[8192]; static _Atomic unsigned g_pdq_n; static SRWLOCK g_pdq_lk = SRWLOCK_INIT;
+static void gpu_pending_done(uint64_t a, uint64_t len) {
+    static int direct = -1; if (direct < 0) direct = vkc_int("pending_direct", 0);
+    if (!direct) {
+        AcquireSRWLockExclusive(&g_pdq_lk);
+        unsigned n = atomic_load_explicit(&g_pdq_n, memory_order_relaxed);
+        if (n < 8192) { g_pdq[n].a = a; g_pdq[n].len = len; atomic_store(&g_pdq_n, n + 1); ReleaseSRWLockExclusive(&g_pdq_lk); return; }
+        ReleaseSRWLockExclusive(&g_pdq_lk);   // full (the translation thread is far behind): directly
+    }
+    gpu_pending(a, len, -1);
+}
+static void gpu_pending_drain(void) {
+    if (!atomic_load_explicit(&g_pdq_n, memory_order_relaxed)) return;
+    static struct { uint64_t a, len; } loc[8192];   // the translation thread's alone (with synchronous replay, whoever holds the graphics lock)
+    AcquireSRWLockExclusive(&g_pdq_lk);
+    unsigned n = atomic_load_explicit(&g_pdq_n, memory_order_relaxed); memcpy(loc, g_pdq, n * sizeof *loc); atomic_store(&g_pdq_n, 0);
+    ReleaseSRWLockExclusive(&g_pdq_lk);
+    for (unsigned i = 0; i < n; i++) gpu_pending(loc[i].a, loc[i].len, -1);
 }
 
 // ---------- GPU writes back to guest memory ----------
@@ -578,23 +666,54 @@ static void wr_shadow(uint32_t **shadow, uint64_t off, const uint32_t *a, const 
     }
 }
 // The words that differ between base and after reach guest memory, page by page; a page the shader left alone is not touched (a touch sends it to the device again)
+typedef struct { const uint32_t *a, *b; uint32_t *g; uint64_t n, off; uint32_t **shadow; } land_ctx;
+static void wr_land_pages(void *c_, uint64_t k0, uint64_t k1) {   // guest pages k0..k1 of the range, counted from its first (w->addr is a multiple of 4 here)
+    land_ctx *c = c_; const uint32_t *a = c->a, *b = c->b; uint32_t *g = c->g; uintptr_t g0 = (uintptr_t)g; uint64_t changed = 0, kept = 0, newer = 0;
+    for (uint64_t k = k0; k < k1; k++) {
+        uintptr_t lo = ((g0 / PAGE) + k) * PAGE, hi = lo + PAGE;
+        uint64_t i = lo > g0 ? (lo - g0) / 4 : 0, e = (hi - g0) / 4; if (e > c->n) e = c->n;
+        if (i >= e || !memcmp(a + i, b + i, (size_t)(e - i) * 4)) continue;
+        dm_guest_write_prepare(g + i, (size_t)(e - i) * 4);
+        uint64_t at = c->off + 4 * i; uint32_t *sh = c->shadow ? c->shadow[at / PAGE] : NULL; if (sh) sh += (at % PAGE) / 4;   // the shadow: what the device has, for the words the shader changed
+        for (uint64_t x = i; x < e; x++) if (a[x] != b[x]) { if (g[x] != b[x] && g[x] != a[x]) newer++; g[x] = a[x]; changed++; if (sh) sh[x - i] = a[x]; } else if (g[x] != a[x]) kept++;
+    }
+    atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept); atomic_fetch_add(&s_wb_cpu_newer, newer);
+}
 static void wr_land(wb_t *w) {
     const uint32_t *b = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->base_at), *a = (const uint32_t *)((const uint8_t *)g_wr_mem.map + w->after_at);
     uint32_t *g = (uint32_t *)(uintptr_t)w->addr; uint64_t n = w->len / 4, changed = 0, kept = 0, newer = 0;
-    for (uint64_t i = 0; i < n; ) {
-        uint64_t e = ((((uintptr_t)(g + i)) | (PAGE - 1)) + 1 - (uintptr_t)g) / 4; if (e > n) e = n;   // to the end of the guest page
-        if (!memcmp(a + i, b + i, (size_t)(e - i) * 4)) { i = e; continue; }
-        dm_guest_write_prepare(g + i, (size_t)(e - i) * 4);
-        for (; i < e; i++) if (a[i] != b[i]) { if (g[i] != b[i] && g[i] != a[i]) newer++; g[i] = a[i]; changed++; } else if (g[i] != a[i]) kept++;
+    static int skip = -1; if (skip < 0) skip = vkc_int("wb_shadow_skip", 1);
+    if (skip && !(w->addr & 3) && n) {   // guest memory and the shadow in one pass per page, large ranges among the helper threads
+        AcquireSRWLockShared(&g_lk);
+        pool_t_ *p = pool_find((uintptr_t)w->addr, w->len);
+        land_ctx c = {a, b, g, n, p ? w->addr - p->base : 0, p ? p->shadow : NULL};
+        par_for((w->addr + 4 * n - 1) / PAGE - w->addr / PAGE + 1, wr_land_pages, &c);
+        ReleaseSRWLockShared(&g_lk);
+    } else {
+        for (uint64_t i = 0; i < n; ) {
+            uint64_t e = ((((uintptr_t)(g + i)) | (PAGE - 1)) + 1 - (uintptr_t)g) / 4; if (e > n) e = n;   // to the end of the guest page
+            if (!memcmp(a + i, b + i, (size_t)(e - i) * 4)) { i = e; continue; }
+            dm_guest_write_prepare(g + i, (size_t)(e - i) * 4);
+            for (; i < e; i++) if (a[i] != b[i]) { if (g[i] != b[i] && g[i] != a[i]) newer++; g[i] = a[i]; changed++; } else if (g[i] != a[i]) kept++;
+        }
+        atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept); atomic_fetch_add(&s_wb_cpu_newer, newer);
+        AcquireSRWLockShared(&g_lk);
+        { pool_t_ *p = pool_find((uintptr_t)w->addr, w->len);
+          if (p && p->shadow) wr_shadow(p->shadow, w->addr-p->base, a, b, n, skip); }
+        ReleaseSRWLockShared(&g_lk);
     }
-    atomic_fetch_add(&s_wb_words, changed); atomic_fetch_add(&s_wb_kept, kept); atomic_fetch_add(&s_wb_cpu_newer, newer);
-    AcquireSRWLockShared(&g_lk);
-    { pool_t_ *p = pool_find((uintptr_t)w->addr, w->len);
-      if (p && p->shadow) { static int skip = -1; if (skip < 0) skip = vkc_int("wb_shadow_skip", 1);
-          wr_shadow(p->shadow, w->addr-p->base, a, b, n, skip); } }
-    ReleaseSRWLockShared(&g_lk);
     atomic_store(&g_wr_tail, w->ring_end);
     if (w->len & 3) { uint8_t *d = (uint8_t *)(uintptr_t)w->addr; const uint8_t *ab = (const uint8_t *)a, *bb = (const uint8_t *)b; dm_guest_write_prepare(d + (w->len & ~3ull), 3); for (uint64_t i = w->len & ~3ull; i < w->len; i++) if (ab[i] != bb[i]) d[i] = ab[i]; }
+}
+// The whole range as the device has it (a draw's storage buffer): a page that came back unchanged is not written, so it is not sent to the device again
+typedef struct { const uint8_t *a; uint8_t *g; uint64_t len; } land4_ctx;
+static void land4_pages(void *c_, uint64_t k0, uint64_t k1) {
+    land4_ctx *c = c_; uintptr_t g0 = (uintptr_t)c->g;
+    for (uint64_t k = k0; k < k1; k++) {
+        uintptr_t lo = ((g0 / PAGE) + k) * PAGE, hi = lo + PAGE;
+        uint64_t i = lo > g0 ? lo - g0 : 0, e = hi - g0; if (e > c->len) e = c->len;
+        if (i < e && memcmp(c->a + i, c->g + i, (size_t)(e - i))) { dm_guest_write_prepare(c->g + i, (size_t)(e - i)); memcpy(c->g + i, c->a + i, (size_t)(e - i)); }
+    }
 }
 // NXRT_VK_WBLOG=<bytes>: every write-back of at least that many bytes in the log, when recorded (rec) and when it lands
 // (land: bytes of guest memory it changed, only when some changed; rec only with NXRT_VK_WBLOG_REC=1), up to 100000 lines. To see what the GPU's copies back put into guest memory
@@ -608,19 +727,17 @@ static void wb_land_(void *arg) {
     wb_t *w = arg;
     if (wblog_min() && w->kind != 3) { uint64_t ch = 0; const uint8_t *src = w->kind == 4 ? (const uint8_t *)g_wr_mem.map + w->after_at : w->kind == 0 ? (const uint8_t *)w->mem.map : w->kind == 1 ? (const uint8_t *)w->cpu : NULL;
         if (src) { const uint8_t *g = (const uint8_t *)(uintptr_t)w->addr; for (uint64_t i = 0; i < w->len; i++) ch += src[i] != g[i]; } wblog("land", w->addr, w->len, w->kind, ch); }
-    if (w->kind == 3) { wr_land(w); gpu_pending(w->addr, w->len, -1); atomic_fetch_add(&s_wb_bytes, w->len); free(w); return; }
+    if (w->kind == 3) { wr_land(w); gpu_pending_done(w->addr, w->len); atomic_fetch_add(&s_wb_bytes, w->len); free(w); return; }
     if (w->kind == 4) {   // the whole range, page by page: a page that came back unchanged is not written, so it is not sent to the device again
-        const uint8_t *a = (const uint8_t *)g_wr_mem.map + w->after_at; uint8_t *g = (uint8_t *)(uintptr_t)w->addr;
-        for (uint64_t i = 0; i < w->len; ) { uint64_t e = ((((uintptr_t)(g + i)) | (PAGE - 1)) + 1 - (uintptr_t)g); if (e > w->len) e = w->len;
-            if (memcmp(a + i, g + i, (size_t)(e - i))) { dm_guest_write_prepare(g + i, (size_t)(e - i)); memcpy(g + i, a + i, (size_t)(e - i)); }
-            i = e; }
-        atomic_store(&g_wr_tail, w->ring_end); gpu_pending(w->addr, w->len, -1); atomic_fetch_add(&s_wb_bytes, w->len); free(w); return; }
+        land4_ctx c = {(const uint8_t *)g_wr_mem.map + w->after_at, (uint8_t *)(uintptr_t)w->addr, w->len};
+        if (w->len) par_for((w->addr + w->len - 1) / PAGE - w->addr / PAGE + 1, land4_pages, &c);
+        atomic_store(&g_wr_tail, w->ring_end); gpu_pending_done(w->addr, w->len); atomic_fetch_add(&s_wb_bytes, w->len); free(w); return; }
     dm_guest_write_prepare((void *)(uintptr_t)w->addr, (size_t)w->len);
     uint8_t *d = (uint8_t *)(uintptr_t)w->addr;
     if (w->kind == 0) memcpy(d, w->mem.map, (size_t)w->len);
     else if (w->kind == 1) memcpy(d, w->cpu, (size_t)w->len);
     else for (uint64_t i = 0; i < w->len; i++) d[i] = (uint8_t)(w->fill >> 8 * (i & 3));
-    gpu_pending(w->addr, w->len, -1);
+    gpu_pending_done(w->addr, w->len);
     atomic_fetch_add(&s_wb_bytes, w->len);
     if (w->buf) { vkDestroyBuffer(g_vk.dev, w->buf, NULL); vk_free_mem(&w->mem); }
     free((void *)w->cpu); free(w);
@@ -645,7 +762,7 @@ void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
           vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
           VkBufferCopy c = {po, at, len}; vkCmdCopyBuffer(cb, pb, g_wr, 1, &c);
           vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-          gpu_pending(addr, len, 1); vks_post_fn(wb_land, r); return; } }
+          gpu_pending_drain(); gpu_pending(addr, len, 1); vks_post_fn(wb_land, r); return; } }
     wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, len, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     vkCreateBuffer(g_vk.dev, &bci, NULL, &w->buf);
@@ -657,7 +774,7 @@ void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
     VkBufferCopy c = {po, 0, len};
     vkCmdCopyBuffer(cb, pb, w->buf, 1, &c);
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-    gpu_pending(addr, len, 1);
+    gpu_pending_drain(); gpu_pending(addr, len, 1);
     vks_post_fn(wb_land, w);
 }
 // A dispatch's range before the shader runs: returns the ring offset + 1, 0 when it is not kept (vkm_gpu_wrote_base falls back to the whole range)
@@ -680,14 +797,14 @@ void vkm_gpu_wrote_base(uint64_t addr, uint64_t len, uint64_t base) {
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferCopy c = {po, at, len}; vkCmdCopyBuffer(cb, pb, g_wr, 1, &c);
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-    gpu_pending(addr, len, 1);
+    gpu_pending_drain(); gpu_pending(addr, len, 1);
     vks_post_fn(wb_land, w);
 }
 // Writes whose bytes the CPU knows (inline uniform updates, fills): the GPU writes the mirror in order, guest memory gets the same bytes at completion
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value) {
     wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->kind = fill ? 2 : 1; w->fill = value;
     if (!fill) { uint8_t *c = malloc((size_t)len); memcpy(c, data, (size_t)len); w->cpu = c; }
-    gpu_pending(addr, len, 1);
+    gpu_pending_drain(); gpu_pending(addr, len, 1);
     vks_post_fn(wb_land, w);
 }
 
@@ -706,6 +823,7 @@ void vkm_stats(vkm_stats_t *s) {
 
 void vkm_frame_tick(uint64_t frame) {
     static vkm_stats_t prev; static uint64_t prev_frame, t_prev;
+    gpu_pending_drain();
     g_frame = frame + 1; g_budget_used = 0; g_seen_on = vkc_int("use_seen", 1);
     if (frame % HOT_COOL_FRAMES == 0) {   // hot pages cool down: protected again at their next copy; written again, they come back within HOT_STREAK frames
         AcquireSRWLockShared(&g_lk);
@@ -723,6 +841,8 @@ void vkm_frame_tick(uint64_t frame) {
           (double)(s.faults - prev.faults) / df, (s.fault_ns - prev.fault_ns) / 1e6 / df, (double)(s.preps - prev.preps) / df,
           (s.writeback_bytes - prev.writeback_bytes) / 1024.0 / df, (double)(s.wb_words - prev.wb_words) / df, (double)(s.wb_kept - prev.wb_kept) / df, (double)(s.wb_stale - prev.wb_stale) / df, (double)(s.wb_merged - prev.wb_merged) / df, (s.uncommitted_pages - prev.uncommitted_pages) * 4096.0 / 1048576.0 / df, (unsigned long long)s.hot_pages, (unsigned long long)s.staging_overflow,
           (unsigned long long)s.staging_waits, usage / 1048576.0, budget / 1048576.0, secs > 0 ? "" : "");
+    if (g_use_ph > 0) { static uint64_t pc, pp, pf, pcy; VKLOG("pending counts up to frame %llu, per frame: %.1f calls, %.0f pages, %.0f first (a page copied for its shadow), %.0f kcycles", (unsigned long long)frame, (double)(s_gp_calls - pc) / df, (double)(s_gp_pages - pp) / df, (double)(s_gp_first - pf) / df, (double)(s_gp_cyc - pcy) / df / 1000.0);
+      pc = s_gp_calls; pp = s_gp_pages; pf = s_gp_first; pcy = s_gp_cyc; }
     prev = s; prev_frame = frame; t_prev = now;
     { pool_t_ *top[4] = {0}; AcquireSRWLockShared(&g_lk);
       for (int i = 0; i < g_npool; i++) { pool_t_ *q = g_pool[i]; for (int k = 0; k < 4; k++) if (!top[k] || q->up_b > top[k]->up_b) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = q; break; } }

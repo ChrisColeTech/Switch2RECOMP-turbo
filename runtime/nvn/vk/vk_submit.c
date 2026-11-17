@@ -97,10 +97,12 @@ static void post_run(post_t *p) {
     else if (p->kind == 3) p->fn(p->arg);
 }
 
+volatile DWORD g_host_focus_tid2;   // this thread, for the host profiler (nvn_host.c SWR_HOST_PROF)
 // The completion thread: waits for the oldest submitted value, applies its effects in order, frees its slot; flushes submissions held back too long
 static unsigned __stdcall completion_main(void *arg) {
     (void)arg;
     SetThreadDescription(GetCurrentThread(), L"vk completion");
+    g_host_focus_tid2 = GetCurrentThreadId();   // SWR_HOST_PROF_THREAD=completion
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     while (!atomic_load(&g_stop)) {
         AcquireSRWLockExclusive(&g_lk);

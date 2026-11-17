@@ -1100,10 +1100,12 @@ static int read_u32(uint64_t a, uint32_t *v) {   // guest memory, guarded
     memcpy(v, (const void *)(uintptr_t)a, 4); NVN_GUARD_END(); return 1;
 }
 // A draw's row in the flight recording: the program it would use and its arguments, whether or not it is made
+// A shader's key as a number, parsed once: the flight recorder's row took two strtoull a draw (1.3 % of the translation thread in a Mario Kart World race)
+static inline uint64_t sh_keyn(const vks_shader *s) { if (!s) return 0; if (!s->keyn) ((vks_shader *)s)->keyn = vkf_key(s->key); return s->keyn; }
 static vkf_row *fl_draw(const p_draw *dw, const p_draw_idx *di) {
     vkf_row *r = vkf_row_next(); if (!r) return NULL;
     const vks_shader *v = dw && dw->prim == DM_PRIM_MESH_TASKS && S->bst[4] ? prog_stage(S->bst[4], 4) : S->bst[0] ? prog_stage(S->bst[0], 0) : NULL, *f = S->bst[1] ? prog_stage(S->bst[1], 1) : NULL;
-    r->vs = vkf_key(v ? v->key : NULL); r->ps = vkf_key(f ? f->key : NULL); r->pass = (uint32_t)g_st.passes;
+    r->vs = sh_keyn(v); r->ps = sh_keyn(f); r->pass = (uint32_t)g_st.passes;
     uint64_t ind = dw ? dw->ind : di->ind;
     r->flags = (di ? FL_INDEXED : 0) | (ind ? FL_INDIRECT : 0) | ((dw ? dw->mdi_cnt : di->mdi_cnt) ? FL_MDI : 0) | (dw && dw->prim == DM_PRIM_MESH_TASKS ? FL_MESH : 0);
     r->mdi_i = (uint32_t)(dw ? dw->mdi_i : di->mdi_i);
@@ -1195,7 +1197,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!mesh) sh[0] = vin_shader(sh[0]);
     if (S->rast_discard) sh[1] = NULL;
     { static const volatile int *ng; if (sh[2]) { if (!ng) ng = vkc_ptr("no_gs", 0); if (*ng) sh[2] = NULL; } }
-    if (!mesh) app_draw(sh, ind, di != NULL);   // gamectl set no_gs 1: draws without their geometry shaders (diagnostic A/B)
+    if (!mesh) app_draw(sh, ind, di != NULL);
+    if (ind && !mesh) { uint32_t inst; if (read_u32(ind + 4, &inst) && !inst) VKC(VKC_IND_INST0); }   // metrics: an indirect draw whose record (as guest memory has it) draws no instance   // gamectl set no_gs 1: draws without their geometry shaders (diagnostic A/B)
     // the render pass, its scissor and viewport (nvn_mtl.m draw_: viewport flipped for the lower-left origin there; Vulkan's y axis runs the other way)
     // With every draw checkpointed: an indirect draw's arguments, as the GPU holds them, copied out first, outside the pass (the pass is ended and begun again). A GPU stuck inside the pass never gets to copies at its end
     if (ind && g_vk.has.checkpoints >= 2) { VkBuffer ab; VkDeviceSize ao; if (vkm_use(ind, dw ? 16 : 20, &ab, &ao)) { pass_end(); vk_ck_args(vks_cb(), vk_ck_next(), ab, ao, dw ? 16 : 20); } }
@@ -1502,7 +1505,7 @@ void vkr_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     VkCommandBuffer cb = vks_cb();
     if (!cb || !n || !vkm_use(src, n, &sb, &so) || !vkm_use(dst, n, &db, &dof)) {   // not two pool ranges: on the CPU, as the null backend does it
-        if (vkm_addr(src, n, NULL, NULL) && vkm_addr(dst, n, NULL, NULL)) { dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n); memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)n); }
+        if (vkm_addr(src, n, NULL, NULL) && vkm_addr(dst, n, NULL, NULL)) { dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n); memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)n); vkm_host_wrote(); }
         return;
     }
     pass_end(); barrier_all(cb);
@@ -1518,6 +1521,7 @@ void vkr_fill(uint64_t dst, uint64_t n, uint32_t value) {
         if (!vkm_addr(dst, n, NULL, NULL)) return;
         dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n);
         uint8_t *p = (uint8_t *)(uintptr_t)dst; for (uint64_t i = 0; i < n; i++) p[i] = (uint8_t)(value >> 8 * (i & 3));
+        vkm_host_wrote();
         return;
     }
     pass_end(); barrier_all(cb);
@@ -1529,7 +1533,7 @@ void vkr_update(uint64_t d, uint64_t n, const uint8_t *data) {
     VkBuffer db; VkDeviceSize dof; VkCommandBuffer cb = vks_cb();
     if (!n) return;
     if (!cb || !vkm_use(d, n, &db, &dof)) {
-        if (vkm_addr(d, n, NULL, NULL)) { dm_guest_write_prepare((void *)(uintptr_t)d, (size_t)n); memcpy((void *)(uintptr_t)d, data, (size_t)n); }
+        if (vkm_addr(d, n, NULL, NULL)) { dm_guest_write_prepare((void *)(uintptr_t)d, (size_t)n); memcpy((void *)(uintptr_t)d, data, (size_t)n); vkm_host_wrote(); }
         return;
     }
     pass_end(); barrier_all(cb);

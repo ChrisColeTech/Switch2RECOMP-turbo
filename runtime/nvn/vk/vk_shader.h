@@ -45,6 +45,7 @@ typedef struct vks_shader {
     uint32_t vin_mask; uint8_t vin_ct[32];                  // a vertex input variant: what made it (the pipeline manifest names variants by these)
     uint8_t ds_reuse;                                       // vk_replay.c set_reusable: 0 not looked at yet, 1 its set may serve the next draw, 2 never
     uint8_t app_look; uint16_t app_regs;                    // vk_replay.c app_regs: the storage buffer slots it writes (looked up once)
+    uint64_t keyn;                                          // vk_replay.c sh_keyn: the key as a number (0 until asked for)
 } vks_shader;
 
 int vksh_init(void);

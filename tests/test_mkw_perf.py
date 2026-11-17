@@ -36,8 +36,8 @@ class ShadowUpdate(unittest.TestCase):
             src = Path(d) / 'shadow.c'; dll = Path(d) / 'shadow.dll'
             src.write_text('#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\nenum { PAGE=4096 };\n' + fn +
                            '\n__declspec(dllexport) void run(uint32_t **s, uint64_t o, uint32_t *a, uint32_t *b, uint64_t n, int skip) { wr_shadow(s,o,a,b,n,skip); }\n')
-            env = dict(os.environ, PATH=str(ROOT/'gcc/Library/bin')+os.pathsep+os.environ['PATH'])
-            subprocess.run([str(ROOT/'gcc/Library/bin/x86_64-w64-mingw32-gcc.exe'), '-O2', '-shared', str(src), '-o', str(dll)], check=True, env=env)
+            import s2r_paths   # GCC where this checkout has it: gcc/ here, beside the checkout, or on the PATH (a worktree has none of its own)
+            subprocess.run([s2r_paths.gcc_tool('gcc'), '-O2', '-shared', str(src), '-o', str(dll)], check=True, env=s2r_paths.env_with_gcc())
             lib = C.CDLL(str(dll)); f = lib.run
             ptr = C.POINTER(C.c_uint32)
             f.argtypes = [C.POINTER(ptr), C.c_uint64, ptr, ptr, C.c_uint64, C.c_int]
