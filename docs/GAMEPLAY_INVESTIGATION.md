@@ -208,6 +208,80 @@ Tests: `python -m unittest discover -s tests -p "test_n*.py"` (17), `tests/test_
 `tests/test_mkw_runtime.py`, `tests/test_mkw_perf.py`: all pass. Linux: the NVN archive and the runtime build
 (`tools/build_nvn.py --linux`, `--build-runtime --target linux --backend x11`). Engine CI on `turbo`: green.
 
+## 5. Hand-off: done, remaining, next steps, quick wins, hunches
+
+### Done (on `turbo`, engine CI green; launcher release v0.2.0)
+
+- DKB: terrain shaded (append counters reset per frame, one instance), size-0 storage buffers addressable, tutorial
+  video plays. Verified in gameplay (walk, punch through the gold wall).
+- MKW: race 50.8 -> 57.3 FPS mean, 59 in steady stretches (range index in the dirty tracker, one look per range per
+  submission, pending counts on one thread, helper threads for the big copies and compares).
+- Ocarina of Time: loads its ZBIC executables (it never had); now stops later.
+- Tools: `SWR_HOST_PROF` + `tools/host_prof.py`, `SWR_NVN_CALLS`, new metrics, pass dumps with events and
+  transform feedback; tests repaired (`test_controllers.py`, `test_mkw_perf.py`).
+
+### Remaining
+
+1. **PLZA: the world is black in gameplay** (UI only). G-buffer is drawn; the lighting output is black; transform
+   feedback (skinned characters) is not implemented. This is the owner's "black screen past the title" for PLZA.
+2. **DKB: the console's own counter reset is not identified**; the fix is a rule keyed on the frame's structure. DKB
+   runs at 37-45 FPS in the tunnel.
+3. **GPU events across NVN queues** are not honoured (DKB's second queue runs at the wrong point of the frame).
+4. **Ocarina of Time**: svcBreak 1.6 s in, right after `SetHeapSize` 6316 MB.
+5. **MK8D**: the Mii renderer crash (unchanged).
+6. **MKW**: single long frames from texture streaming and first-use pipelines (p99 27 ms, a few over 100 ms).
+
+### Next steps, in order
+
+1. PLZA lighting: `gamectl texdump` + `passdump 1` in the station (`20261117-174922-plza-td` has one set). Hide the
+   lighting pass's inputs one at a time (`gamectl hide <shader key>`) and look at which sampled texture is zero: the
+   fourth G-buffer target (`R11G11B10F`, cleared to 0 and apparently never written) and the `RGBA16F` pair are all
+   zero today. Find the draws that should write them in the pass dump (pass with `c1..c4`, no `c0`).
+2. PLZA transform feedback: `OP_TF_BIND` / `OP_TF_STATE` are recorded and ignored (`vk_replay.c`). Needed: the
+   varyings of the vertex shader as XFB decorations in the translated SPIR-V (the control section or
+   `nvnProgramSetTransformFeedbackVaryings` names them), a pipeline variant, `vkCmdBindTransformFeedbackBuffersEXT` /
+   `Begin` / `End` around the draws, and a write-back of the captured ranges. The device and the pool buffers already
+   have the extension and the usage bits.
+3. Events across queues: run each submission's walk on a fiber (Windows fibers, `ucontext` on Linux); at a wait that
+   is not met, switch to the next queued submission of another queue; resume when the signal has been replayed.
+4. Ocarina: log=2 run, read the function that calls svcBreak (return address in the log's stack) in the generated C.
+
+### Quick wins
+
+- **PLZA cube views**: 8 `[RED] a cube view of a ... texture that is not a cube map: viewed as a 2D array`
+  (64x64 and 128x128: the environment maps). One attempt (create square 6-layer arrays cube compatible, in
+  `vk_tex.c` image creation) did not change the message, so those textures are made on another path or are not 6-layer
+  arrays: print target, layers and creation path in that RED line first. Cheap to settle and a direct lighting input.
+- **Completion thread sleep**: `vk_submit.c completion_main` sleeps 1 ms when nothing is submitted; a condition
+  variable woken at commit removes up to a millisecond from the fence the game waits on every frame.
+- **Write-back volume**: six MKW buffers (0.5-4.7 MB) are copied back every frame and 214 KB change. Remember per
+  range how often a write-back changed nothing and skip the snapshot copy for ranges the CPU never writes
+  (the pending-merge path is the only reader of the snapshot).
+- **Descriptor sets**: per (stage, shader) keep the gathered image and buffer infos and re-gather only the kinds
+  whose bind version moved; 5 ms of the translation thread in MKW and most of DKB's 12-14 ms.
+- **DKB perf**: the 630 per-frame resets go through `vkr_fill` one by one (a fill, a post and a pending count each);
+  one batch of `vkCmdFillBuffer` without the guest mirror would do.
+
+### Hunches
+
+1. **PLZA black world = one missing lighting input, not the whole renderer.** Albedo, normals and depth are right;
+   the sky and emissive lights survive. A deferred renderer that multiplies by an all-zero light or exposure target
+   looks exactly like this. The zero `R11G11B10F` G-buffer target and the cube views are the first suspects; the
+   transform feedback gap explains missing characters, not the darkness.
+2. **DKB's reset lives in NVN2 driver behaviour for draw-stage storage buffers or indirect draws**, not in the game:
+   the CPU provably never touches the records, the stream has no write to them, and the engine's own layout calls the
+   record an indirect-arguments struct while leaving the instance count 0. A test on a console (read the record back
+   after a frame) would settle it in minutes; without one, the rule in place reproduces the visible result.
+3. **The same "raw address" assumption is behind more dropped work.** The size-0 storage buffer was bound to nothing
+   although an NVN shader only ever holds the address. Anything else the replay bounds by a size the console does not
+   enforce (storage buffer ranges, texture buffer views, index counts read from guest memory before the GPU wrote
+   them) is a candidate for black gaps in other games; `ind_draw_no_instances` and `sbuf_size0` in the metrics count
+   two of them.
+4. **Frame rate is now bounded by two serial stages per frame, not by raw speed**: translation thread, then the
+   landing of write-backs before the game's fence. Anything that takes work off either (fewer bytes written back,
+   descriptor reuse) moves MKW from 57 to a flat 60 and helps DKB the same way; the GPU has two thirds of its time
+   free in both.
+
 ## Instrumentation and switches added in this round
 
 | switch | what |
