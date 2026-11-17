@@ -32,7 +32,8 @@ import nxloader, codegen
 RT = os.path.join(HERE, 'runtime')
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'svc_ns2', 'sm86', 'gpu', 'gpu_engines',
                'gpu_3d', 'loader', 'main', 'nup', 'nsp', 'nvn_hook', 'nvn_glue']
-ABI = 1
+# 2: the exclusive monitor (cpu.h RtAPI.excl_mon, CPU.excl_seq). keep it equal to SWR_CODE_ABI in runtime/main.c
+ABI = 2
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
 CC_DIRS = [os.path.join(HERE, *d) for d in (('tcc',), ('tools', 'tcc'), ('gcc', 'bin'), ('gcc', 'Library', 'bin'),
                                              ('w64devkit', 'bin'))]
@@ -269,6 +270,33 @@ def elf_stack_not_exec(path):
 def runtime_path(target_win, backend):
     return os.path.join(HERE, 'bin', 'runtime_%s_%s%s' % ('win64' if target_win else 'linux', backend,
                                                            '.exe' if target_win else ''))
+
+
+def runtime_runs_abi(path):
+    """a runtime runs this engine's code only if it was built from the same RtAPI/CPU layout (runtime/main.c
+    g_runtime_abi). bin/ is not in git, so a checkout that moved to a newer engine keeps its old runtime"""
+    try:
+        with open(path, 'rb') as f: return (b'SwitchRecomp runtime ABI %d\0' % ABI) in f.read()
+    except OSError:
+        return False
+
+
+def place_runtime(cc, exe, target_win, backend, say, given=None):
+    """copy the runtime next to the game: the one passed with --runtime, else bin/'s prebuilt one, rebuilding bin/'s
+    when it is missing or older than this engine's code ABI (an old runtime crashes the new code on its first LDXR)"""
+    pre = runtime_path(target_win, backend)
+    src = given or pre
+    if not given and not os.path.exists(pre):
+        say('Compiling the runtime (%s)...' % backend)
+        build_runtime(cc, exe, target_win, backend, say)
+        return
+    if not runtime_runs_abi(src):
+        if os.path.normcase(os.path.abspath(src)) != os.path.normcase(os.path.abspath(pre)):
+            raise SystemExit('%s does not run this engine\'s code (ABI %d): rebuild it with --build-runtime.' % (src, ABI))
+        say('The prebuilt runtime is older than this engine (code ABI %d), rebuilding it...' % ABI)
+        check_writable(pre)
+        build_runtime(cc, pre, target_win, backend, say)
+    shutil.copyfile(src, exe)
 
 
 def build_runtime(cc, out, target_win, backend, say, opt='2'):
@@ -581,15 +609,7 @@ def main():
     objs = compile_all(files, cc, a.O, build, target_win, a.jobs, say, extra)
     say('Linking %s ...' % os.path.basename(modout))
     link_module(objs, cc, modout, target_win, say)
-    if a.runtime:
-        shutil.copyfile(a.runtime, exe)
-    else:
-        pre = runtime_path(target_win, backend)
-        if os.path.exists(pre):
-            shutil.copyfile(pre, exe)
-        else:
-            say('Compiling the runtime (%s)...' % backend)
-            build_runtime(cc, exe, target_win, backend, say)
+    place_runtime(cc, exe, target_win, backend, say, a.runtime)
     if not target_win: os.chmod(exe, 0o755)
     say('Done: %s' % exe)
 

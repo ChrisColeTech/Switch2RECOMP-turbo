@@ -10,6 +10,12 @@
 #define SWR_RUNTIME_VERSION "0.4.1"
 #endif
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
+/* the newest recompiled-code ABI this runtime runs (switchrecomp.py ABI). 2 = RtAPI.excl_mon + CPU.excl_seq: code
+   from ABI 2 reads c->rt->excl_mon on every LDXR, and an ABI 1 runtime's RtAPI ends before it, so that pairing
+   crashed on the first lock (MK8D in nnosInitialize). switchrecomp.py looks for this string in a prebuilt runtime
+   before copying it next to a game, and rebuilds it when it is missing */
+#define SWR_CODE_ABI 2
+const char g_runtime_abi[]="SwitchRecomp runtime ABI 2";
 #include "rt.h"
 #include "audio.h"
 #include <sys/stat.h>
@@ -442,7 +448,8 @@ int swr_main(int argc, char** argv){
   g_t0=plat_ns();
   LOG("SwitchRecomp - %s (runtime %s, built %s)\n",g_exename,SWR_RUNTIME_VERSION,__DATE__);
   if(load_code()) fatal("Could not load the game's recompiled code.");
-  if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
+  /* ABI 1 code never touches the fields ABI 2 appended, so it still runs */
+  if(g_mod->abi<1 || g_mod->abi>SWR_CODE_ABI) fatal("The recompiled code is from another SwitchRecomp version (code ABI %u, %s).",g_mod->abi,g_runtime_abi);
   g_title_id=g_mod->title_id;
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");

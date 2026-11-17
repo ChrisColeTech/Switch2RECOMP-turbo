@@ -68,7 +68,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Runtime links VP9, NVN telemetry and Sony HID
         run: |
-          python -c "import sys; d = open('bin/runtime_win64_win32.exe', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:', b'hid.dll', b'setupapi.dll') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
+          python -c "import sys; d = open('bin/runtime_win64_win32.exe', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:', b'hid.dll', b'setupapi.dll', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -105,4 +105,4 @@ jobs:
           python switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
       - name: Runtime links VP9 and NVN telemetry
         run: |
-          python -c "import sys; d = open('bin/runtime_linux_x11', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
+          python -c "import sys; d = open('bin/runtime_linux_x11', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'frame telemetry:', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
