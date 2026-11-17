@@ -280,6 +280,30 @@ def load_nso_data(d, path='<memory>', name=None):
                   (segs[2][1], segs[2][2]), bss, d[0x40:0x60].rstrip(b'\0'))
 
 
+def nso_for_runtime(d, path='<memory>'):
+    """An NSO as the runtime's loader can read it. The loader (runtime/loader.c) unpacks LZ4 segments only; an NSO whose
+    segments are ZBIC frames (Ocarina of Time: flags 0xff) made it stop with "LZ4 failed in main" although the code was
+    recompiled from the same file. Such an NSO is written into the build with its three segments stored unpacked: the same
+    header (build id, memory layout, hashes), the compression flags cleared, the file offsets and sizes of the stored
+    bytes. Anything else comes back unchanged."""
+    if d[:4] != b'NSO0' or len(d) < 0x100: return d
+    import zbic
+    flags = struct.unpack_from('<I', d, 0xC)[0]
+    segs = [struct.unpack_from('<III', d, 0x10 + i * 0x10) for i in range(3)]
+    fsz = struct.unpack_from('<III', d, 0x60)
+    packed = [bool(flags & (1 << i)) for i in range(3)]
+    if not (flags & NSO_ZBIC or any(packed[i] and zbic.is_zbic(d[segs[i][0]:segs[i][0] + fsz[i]]) for i in range(3))): return d
+    head = bytearray(d[:0x100]); body = bytearray(); at = 0x100
+    for i, (foff, moff, sz) in enumerate(segs):
+        raw = d[foff:foff + fsz[i]]
+        if packed[i]: raw = unpack_segment(raw, sz, flags, path, i)
+        if len(raw) < sz: raise ValueError('%s: segment %d is truncated (damaged file?)' % (path, i))
+        struct.pack_into('<I', head, 0x10 + i * 0x10, at); struct.pack_into('<I', head, 0x60 + i * 4, sz)
+        body += raw[:sz]; at += sz
+    struct.pack_into('<I', head, 0xC, flags & ~(7 | NSO_ZBIC))
+    return bytes(head) + bytes(body)
+
+
 def load_nso(path, name=None):
     return load_nso_data(open(path, 'rb').read(), path, name)
 

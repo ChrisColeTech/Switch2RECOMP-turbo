@@ -437,7 +437,7 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
                     or name in ('.', '..') or base in reserved):
                 raise ValueError('unsafe ExeFS name in %s: %r' % (romfs.path, name))
             dst = os.path.join(ex, name)
-            data = reader()
+            data = nxloader.nso_for_runtime(reader(), name)   # ZBIC segments unpacked: the runtime's loader reads LZ4 only
             current = None
             if os.path.isfile(dst):
                 with open(dst, 'rb') as fileobj: current = fileobj.read()
@@ -456,7 +456,7 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
             if (not name or name != name.rstrip(' .') or any(ch in name for ch in '/\\:')
                     or name in ('.', '..') or base in reserved):
                 raise ValueError('unsafe ExeFS name in %s: %r' % (romfs.path, name))
-            dst = os.path.join(ex, name); data = reader()
+            dst = os.path.join(ex, name); data = nxloader.nso_for_runtime(reader(), name)
             current = open(dst, 'rb').read() if os.path.isfile(dst) else None
             if current != data:
                 with open(dst, 'wb') as fileobj: fileobj.write(data)

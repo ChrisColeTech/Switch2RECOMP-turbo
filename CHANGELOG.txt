@@ -10,6 +10,9 @@ Switch2Recomp 0.4.1 - MZ Labs
 - Mario Kart World races run at 57 FPS instead of 51 (present interval p50 18.5 -> 16.7 ms): the dirty-page tracker
   finds a range by address instead of scanning all 5,200 pools for every page a GPU write-back changes, a range used
   once in a submission is not looked at again, and the large write-back copies and compares use helper threads.
+- Ocarina of Time gets past "LZ4 failed in main": an NSO with ZBIC-compressed segments is written into the build
+  with its segments unpacked, since the runtime's loader reads LZ4 only (the recompiler already read ZBIC). The game
+  then stops in its start-up (svcBreak after SetHeapSize): still open.
 - SWR_HOST_PROF=<start s>,<seconds> samples the NVN translation thread (SWR_HOST_PROF_THREAD=completion: the
   completion thread); tools/host_prof.py prints the table by function. SWR_NVN_CALLS=1 lists the NVN entries a game
   calls. Pass dumps show GPU event waits and signals and transform feedback.
