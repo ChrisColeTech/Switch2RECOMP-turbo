@@ -1096,10 +1096,10 @@ static SvcObj* new_irs(void){ return svcobj_new("irs",irs_disp,0); }
 
 /* CharInfo (0x58 bytes) of the console's default mii ("no name"). an all-zero CharInfo isn't a valid mii,
    tomodachi life builds its first mii with BuildDefault and the loader never finishes with zeros */
-static void mii_default(IpcCtx* c){
-  u8 ci[0x58]; memset(ci,0,sizeof ci);
+static void mii_charinfo(u8 ci[0x58], u32 index){
+  memset(ci,0,0x58);
   static const u8 id[16]={0x5b,0x3e,0x11,0x9a,0x2c,0x47,0x4d,0x0e,0x9f,0x31,0x6a,0x52,0x8e,0x07,0xc4,0x21};   /* any v4 uuid */
-  memcpy(ci,id,16);
+  memcpy(ci,id,16); ci[15]^=(u8)index;                  /* each default mii its own create id */
   const char* nm="no name"; for(int i=0;nm[i];i++) ci[0x10+i*2]=(u8)nm[i];
   static const u8 f[50]={
     0, 0, 0, 64, 64, 0, 0,          /* font region, favorite color, gender, height, build, type, region move */
@@ -1115,11 +1115,29 @@ static void mii_default(IpcCtx* c){
     0, 4, 2, 20,                    /* mole type, scale, x, y */
     0 };
   memcpy(ci+0x26,f,sizeof f);
-  outbytes(c,ci,sizeof ci); }
+  ci[0x26+2]=(u8)(index>=3); }                          /* gender: three of each, as the console's six */
+
+static void mii_default(IpcCtx* c){ u8 ci[0x58]; mii_charinfo(ci,0); outbytes(c,ci,sizeof ci); }
+
+/* GetCount / Get / Get1 with SourceFlag Default (bit 1): the console's six default miis are always there (yuzu
+   mii_manager.cpp BuildDefault), the database itself stays empty. Mario Kart 8 Deluxe asks Get for them and uses the
+   first; when Get answered 0 it validated an all-zero CharInfo, never created its mii renderer and a worker thread
+   crashed on that NULL (+0x489c) as the title screen loaded */
+enum { MII_DEFAULTS=6 };
+static void mii_get(IpcCtx* c, u32 elem){
+  u32 flag=in32(c,0), n=0; u64 a=0, bs=0;
+  if(flag&2) buf_out(c,0,&a,&bs);
+  if(a && bs){ u8* d=GP(a);
+    for(; n<MII_DEFAULTS && (n+1)*(u64)elem<=bs; n++){ u8 ci[0x58]; mii_charinfo(ci,n); memcpy(d+n*elem,ci,0x58);
+      if(elem>0x58){ u32 src=1; memcpy(d+n*elem+0x58,&src,4); } } }   /* CharInfoElement.source = Default */
+  out32(c,n); }
 
 static int mii_db(SvcObj* o, IpcCtx* c){ (void)o; static u32 seen[4]; u32 b=c->cmd&127;
-  if(!(seen[b>>5]&(1u<<(b&31)))){ seen[b>>5]|=1u<<(b&31); LOG("mii: IDatabaseService cmd %u\n",c->cmd); }
-  if(c->cmd==0||c->cmd==2||c->cmd==3) out32(c,0);
+  if(!(seen[b>>5]&(1u<<(b&31)))){ seen[b>>5]|=1u<<(b&31); LOG("mii: IDatabaseService cmd %u (source flag %u)\n",c->cmd,in32(c,0)); }
+  if(c->cmd==2) out32(c,(in32(c,0)&2)? MII_DEFAULTS : 0);   /* GetCount */
+  else if(c->cmd==3) mii_get(c,0x5C);                   /* Get: CharInfoElement[] */
+  else if(c->cmd==4) mii_get(c,0x58);                   /* Get1: CharInfo[] */
+  else if(c->cmd==0) out32(c,0);
   else if(c->cmd==1) out8(c,0);                         /* IsFullDatabase */
   else if(c->cmd==6 || c->cmd==7) mii_default(c);       /* BuildRandom / BuildDefault -> CharInfo */
   return 0; }
