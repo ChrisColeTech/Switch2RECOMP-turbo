@@ -87,6 +87,7 @@ zero-filled reads through NULL pointers; this changes a system-wide protection. 
 - [Code layout, diagnostics and developer guide](DEVELOPER_GUIDE.md)
 - [Changelog](CHANGELOG.txt) and [regression checks](REGRESSION.md)
 - [Direct NUP](docs/NUP_IN_PLACE.md) and [direct NSP](docs/NSP_IN_PLACE.md)
+- [Add-on content (DLC)](docs/DLC.md): `--install-dlc` for NSP, NSZ, XCI, XCZ and NCA packages
 
 ## Credits and license
 
