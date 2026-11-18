@@ -143,18 +143,20 @@ static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y
 static void stats(uint64_t now) {
     if (g_p.last_t) { if (!g_p.st_n) g_p.st_t0 = g_p.last_t; g_p.st_iv[g_p.st_n++] = (now - g_p.last_t) / 1e6; }
     g_p.last_t = now;
-    if (g_p.st_n < STAT_N) return;
+    // a full window of STAT_N intervals, or, for a game slower than that, what 5 s held: a slow game (Ocarina of Time at 2 FPS) never filled a window and logged no rate
+    if (g_p.st_n < STAT_N && (!g_p.st_n || now - g_p.st_t0 < 5000000000ull)) return;
+    const int n = g_p.st_n;
     double secs = (now - g_p.st_t0) / 1e9, *v = g_p.st_iv;
     unsigned miss=0, s33=0, s50=0, s100=0;
-    for (int i=0; i<STAT_N; i++) { miss += v[i] > 1000.0/60; s33 += v[i] > 33; s50 += v[i] > 50; s100 += v[i] > 100; }
-    qsort(v, STAT_N, sizeof *v, dcmp);
+    for (int i=0; i<n; i++) { miss += v[i] > 1000.0/60; s33 += v[i] > 33; s50 += v[i] > 50; s100 += v[i] > 100; }
+    qsort(v, n, sizeof *v, dcmp);
     VKLOG("present: %llu shown (%llu dropped), %.2f per s; interval p50 %.2f / p95 %.2f / p99 %.2f / max %.2f ms; acquire %.2f ms per frame; window %ux%u; "
-          "%llu game frames, %llu test pattern", (unsigned long long)atomic_load(&g_p.count), (unsigned long long)atomic_load(&g_p.dropped), STAT_N / secs,
-          v[STAT_N / 2], v[STAT_N * 95 / 100], v[STAT_N * 99 / 100], v[STAT_N - 1], g_p.acq_ns / 1e6 / STAT_N, g_p.ext.width, g_p.ext.height,
+          "%llu game frames, %llu test pattern", (unsigned long long)atomic_load(&g_p.count), (unsigned long long)atomic_load(&g_p.dropped), n / secs,
+          v[n / 2], v[n * 95 / 100], v[n * 99 / 100], v[n - 1], g_p.acq_ns / 1e6 / n, g_p.ext.width, g_p.ext.height,
            (unsigned long long)g_p.src_frames, (unsigned long long)g_p.pattern_frames);
     AcquireSRWLockExclusive(&g_p.lk);
-    snprintf(g_p.pacing, sizeof g_p.pacing, "%.2f FPS | p95 %.2f p99 %.2f max %.2f ms | >16.67 %u >33/50/100 %u/%u/%u", STAT_N/secs, v[STAT_N*95/100], v[STAT_N*99/100], v[STAT_N-1], miss,s33,s50,s100);
-    VKLOG("pacing: %s (last %d intervals)", g_p.pacing, STAT_N);
+    snprintf(g_p.pacing, sizeof g_p.pacing, "%.2f FPS | p95 %.2f p99 %.2f max %.2f ms | >16.67 %u >33/50/100 %u/%u/%u", n/secs, v[n*95/100], v[n*99/100], v[n-1], miss,s33,s50,s100);
+    VKLOG("pacing: %s (last %d intervals)", g_p.pacing, n);
     ReleaseSRWLockExclusive(&g_p.lk);
     g_p.st_n = 0; g_p.acq_ns = 0;
 }
