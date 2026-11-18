@@ -30,6 +30,14 @@ for every 300 frames shown), Vulkan renderer, runtime 0.4.1, Windows, 60 Hz disp
 | Pokémon Legends: Z-A | 30.0 | 30.0 | 34 ms | 42–240 ms | Held at exactly 30; whether 60 is possible is still being investigated |
 | The Legend of Zelda: Ocarina of Time | none | none | none | none | Stalls at the opening before 300 frames are shown, so no line was logged |
 
+Screenshots from the same test runs (Vulkan, Windows, 2026-11-18):
+
+| | |
+| --- | --- |
+| ![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>Donkey Kong Bananza | ![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>Mario Kart World |
+| ![Mario Kart 8 Deluxe at Paris Promenade (Booster Course Pass)](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>Mario Kart 8 Deluxe (Booster Course Pass DLC) | ![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>Pokémon Legends: Z-A |
+| ![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>The Legend of Zelda: Ocarina of Time (opening cutscene) | |
+
 Stable minimum 60 FPS has not been achieved in every game. Each launch overwrites the game's `.log`, so read it right
 after closing the game.
 
