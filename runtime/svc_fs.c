@@ -128,10 +128,13 @@ static int romfs_build_nup(void){
 void romfs_init(void){
   pm_init(&g_romlock);
   char p[1200];
+  /* the version of the build's control data (a package's own, the update's when it came with one) */
+  { snprintf(p,sizeof p,"%scontrol.nacp",g_datadir); FILE* f=fopen(p,"rb"); char v[16]={0};
+    if(f){ if(!fseek(f,0x3060,SEEK_SET) && fread(v,1,15,f)==15 && v[0]>='0' && v[0]<='9') LOG("title: version %s (control.nacp)\n",v); fclose(f); } }
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
   snprintf(p,sizeof p,"%sromfs.nsp",g_datadir); const char* nsp_override=getenv("SWR_ROMFS_NSP");
   rnsp=nsp_open_marker(nsp_override&&nsp_override[0]?nsp_override:p);
-  if(rnsp){ rtotal=nsp_size(rnsp); LOG("RomFS: NSP %s (read in place, %.1f MB)\n",nsp_path(rnsp),(double)rtotal/1048576.0); return; }
+  if(rnsp){ rtotal=nsp_size(rnsp); LOG("RomFS: NSP %s (read in place, %.1f MB%s)\n",nsp_path(rnsp),(double)rtotal/1048576.0,nsp_kind(rnsp)); return; }
   char nup_path[2048]={0}; const char* override=getenv("SWR_ROMFS_NUP");
   if(override && override[0]){ strncpy(nup_path,override,sizeof nup_path-1); }
   else { snprintf(p,sizeof p,"%sromfs.nup",g_datadir); FILE* marker=fopen(p,"rb");

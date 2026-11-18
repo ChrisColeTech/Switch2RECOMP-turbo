@@ -1052,6 +1052,19 @@ static int csrng_disp(SvcObj* o, IpcCtx* c){ (void)o; if(c->cmd==0){ u64 a,s; bu
 
 static SvcObj* new_csrng(void){ return svcobj_new("csrng",csrng_disp,0); }
 
+/* Bluetooth low energy (btm:u). There is no adapter here, but a game that opens it at start (pokemon violet 4.0.0,
+   for the Pokemon GO Plus +) aborts when command 0 hands out no interface. IBtmUserCore: the four Acquire...Event
+   commands (scan, connection, service discovery, MTU) answer "valid" with an event that never fires; the rest succeed
+   and find nothing */
+static int btm_core_disp(SvcObj* o, IpcCtx* c){ (void)o;
+  switch(c->cmd){ case 0: case 17: case 26: case 33: out8(c,1); out_copy_h(c,ev_handle(kevent_new("ble ev",0))); return 0; }
+  return 0; }
+static int btm_disp(SvcObj* o, IpcCtx* c){ (void)o;
+  if(c->cmd==0){ static int said; if(!said){ said=1; LOG("btm:u: Bluetooth LE interface handed out (no adapter: scans find nothing)\n"); }
+    out_obj(c,svcobj_new("IBtmUserCore",btm_core_disp,0)); }
+  return 0; }
+static SvcObj* new_btm(void){ return svcobj_new("btm:u",btm_disp,0); }
+
 static int mm_disp(SvcObj* o, IpcCtx* c){ (void)o; if(c->cmd==4||c->cmd==6) out32(c,1); return 0; }
 
 static SvcObj* new_mm(void){ return svcobj_new("mm:u",mm_disp,0); }
@@ -1273,7 +1286,7 @@ void svc_core_init(void){
   svc_register("aud:u",new_aud_u); svc_register("audren:u",new_audren); svc_register("audout:u",new_audout); svc_register("audin:u",new_audout); svc_register("hwopus",new_hwopus);
   svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl);
   svc_register("prepo:u",new_prepo); svc_register("prepo:a",new_prepo); svc_register("prepo:a2",new_prepo); svc_register("psm",new_psm);
-  svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("mm:u",new_mm);
+  svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("btm:u",new_btm); svc_register("mm:u",new_mm);
   svc_register("nfp:user",new_nfp); svc_register("nfc:user",new_nfp); svc_register("caps:u",new_caps); svc_register("caps:a",new_caps); svc_register("caps:su",new_caps); svc_register("caps:ss",new_caps);
   svc_register("bcat:u",new_bcat); svc_register("bcat:a",new_bcat); svc_register("aoc:u",new_aoc); svc_register("irs",new_irs);
   svc_register("mii:e",new_mii); svc_register("mii:u",new_mii); svc_register("ldn:u",new_ldn); svc_register("ectx:aw",new_ectx); svc_register("spl:",new_spl); svc_register("spl:mig",new_spl); svc_register("ngc:u",new_ngc);

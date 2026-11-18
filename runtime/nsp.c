@@ -280,6 +280,7 @@ void nsp_close(Nsp* n){ if(!n) return; if(n->file) fclose(n->file); free(n->rel)
   memset(&n->base.aes,0,sizeof(Aes)); memset(&n->patch.aes,0,sizeof(Aes)); free(n); }
 u64 nsp_size(Nsp* n){ return n?n->size:0; }
 const char* nsp_path(Nsp* n){ return n?n->path:""; }
+const char* nsp_kind(Nsp* n){ return !n||!n->v2? "" : n->patch.present? ", the update applied over the game, decrypted with prod.keys" : ", decrypted with prod.keys"; }
 int nsp_pread(Nsp* n,void* dst,u64 size,u64 off){
   if(!n||off>n->size||size>n->size-off) return -1;
   if(!n->v2) return raw_read(n,dst,size,n->offset+off);
