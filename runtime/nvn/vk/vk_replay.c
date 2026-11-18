@@ -69,7 +69,7 @@ static rchunk *g_free_chunks; static rdpool *g_free_pools; static SRWLOCK g_free
 // - the time the GPU sat idle between the parts of one NVN submission, waiting for the host to translate the next part (vks_split), is left out of the reports after
 //   it: a console runs a submission's commands back to back, and a dynamic resolution that counted the host's translation as GPU time stepped down for nothing;
 // - a Switch 2 program's NVN2 holds nanoseconds in the report, a Switch program's NVN 614.4 MHz ticks (dm_sdk_ounce).
-// On with game_dynamic_resolution=1 (g_opt_drs); with 0 the reports stay as they were (vk_submit.c post_run: a clock 256 times slower, the game always at full size).
+// On with game_dynamic_resolution=auto or 1 (g_opt_drs; the default with this renderer); with 0 the reports stay as they were (vk_submit.c post_run: a clock 256 times slower, the game always at full size).
 enum { RQ_PER = 16 };   // stamped reports per part; the ones past that get the part's end
 static VkQueryPool g_rqp; static int g_rq_used; static uint32_t g_rep_sub;
 typedef struct { uint64_t addr; uint32_t type, sub; int tq, rq; } rep_post;

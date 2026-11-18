@@ -28,7 +28,7 @@ char g_datadir[1024], g_exename[256], g_exedir[1024];
 volatile int g_quit;
 int g_frames;
 int g_opt_diag=0;
-int g_opt_docked=1, g_opt_lang=1, g_opt_res=1, g_opt_fps=1, g_opt_vsync=0, g_opt_drs=0;
+int g_opt_docked=1, g_opt_lang=1, g_opt_res=1, g_opt_fps=1, g_opt_vsync=0, g_opt_drs=-1;   /* g_opt_drs: -1 auto (on with the Vulkan renderer, off with OpenGL), 0 off, 1 on */
 float g_opt_resf=1.0f; int g_opt_shadows=1; int g_opt_cmp_low=1; int g_opt_shader_thread=1; int g_opt_drv_excl=-1; int g_opt_shader_proc=-1; u32 g_loop_limit=16384; int g_opt_resdyn=0; int g_opt_prof=0; float g_opt_resmin=0.6f;
 static char g_hints_path[1200];
 
@@ -199,7 +199,7 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"dynamic_resolution")) g_opt_resdyn=atoi(v);
     else if(!strcmp(k,"dynamic_resolution_min")){ g_opt_resmin=(float)atof(v); if(g_opt_resmin<0.25f) g_opt_resmin=0.25f; if(g_opt_resmin>1) g_opt_resmin=1; }
     else if(!strcmp(k,"forced_vsync")) g_opt_vsync=atoi(v);
-    else if(!strcmp(k,"game_dynamic_resolution")) g_opt_drs=atoi(v);   /* 1 = let the game's own DRS work */
+    else if(!strcmp(k,"game_dynamic_resolution")) g_opt_drs= !strcmp(v,"auto")? -1 : atoi(v)!=0;   /* 1 = let the game's own DRS work */
     else if(!strcmp(k,"shader_thread")){ extern int g_opt_shader_thread; g_opt_shader_thread=atoi(v); }
     else if(!strcmp(k,"driver_exclusive")){ g_opt_drv_excl= !strcmp(v,"auto")? -1 : atoi(v); }
     else if(!strcmp(k,"show_game_rt")){ extern int g_opt_show_rt; g_opt_show_rt=atoi(v); }
@@ -253,7 +253,7 @@ static const IniOpt INI_GRAPHICS[]={
   {"resolution","1","Internal 3D resolution: 1 = native, 2 = double, 0.75 / 0.5 = faster (applies live)"},
   {"dynamic_resolution","0","1 = lower the resolution automatically when the GPU can't keep up (down to dynamic_resolution_min)"},
   {"dynamic_resolution_min","0.6","Lowest internal resolution allowed by dynamic_resolution"},
-  {"game_dynamic_resolution","0","1 = let the game lower its own resolution like on the console (0 = always full resolution)"},
+  {"game_dynamic_resolution","auto","The game's own dynamic resolution and frame pacing, as on the console: auto = on with the Vulkan renderer (the game\n;   is told the GPU's real times), off with OpenGL; 1 = on; 0 = off (the game is told the GPU takes no time: always its\n;   largest size, e.g. Donkey Kong Bananza's scene at 2880x1620 instead of 2095x1179: for a fast graphics card)"},
   {"shadows","1","0 = disable shadow maps (more FPS)"},
   {NULL,NULL,NULL}};
 
@@ -327,9 +327,10 @@ void ini_set(const char* k, const char* v){ ini_store(k,v); g_ini_dirty=1; }
 
 /* settings_version: what an ini written by an older runtime gets changed once. Before 2 the ini held docked=0 as the
    written-out default (handheld: every game drew for the console's small screen and looked soft on a monitor): TV mode
-   is the default now, and an ini from before is moved to it once. Setting docked=0 afterwards stays */
+   is the default now, and an ini from before is moved to it once. Setting docked=0 afterwards stays. The same for
+   game_dynamic_resolution=0, the old written-out default: auto now (the counter reports carry the GPU's real times) */
 void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path);
-  if(atoi(ini_get("settings_version","0"))<2){ ini_store("docked","1"); g_opt_docked=1; ini_store("settings_version","2"); }
+  if(atoi(ini_get("settings_version","0"))<2){ ini_store("docked","1"); g_opt_docked=1; ini_store("game_dynamic_resolution","auto"); g_opt_drs=-1; ini_store("settings_version","2"); }
   ini_write(); }
 
 /* ini edited while running: reload and apply what we can live */

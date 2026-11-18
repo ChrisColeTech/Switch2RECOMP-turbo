@@ -352,7 +352,7 @@ volatile u64 g_gpu_sub_ns;
 
 u64 gpu_ticks(void){
   extern int g_opt_drs; extern u64 guest_ns(void); static u64 last;
-  u64 n= g_opt_drs? guest_ns() : (g_gpu_sub_ns? g_gpu_sub_ns : guest_ns())/256;
+  u64 n= g_opt_drs>0? guest_ns() : (g_gpu_sub_ns? g_gpu_sub_ns : guest_ns())/256;
   if(n<=last) n=last+16; last=n;   /* monotonic, nudged by 1ns within a frame */
   return n*384/625; }
 

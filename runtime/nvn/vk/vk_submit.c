@@ -91,7 +91,7 @@ void vks_flush(void) { AcquireSRWLockExclusive(&g_lk); flush_locked(); ReleaseSR
 static void post_run(post_t *p) {
     if (p->kind == 1) { if (p->mode == 1) *p->val += p->v; else *p->val = p->v; }
     else if (p->kind == 2) {   // NVN's counter record: the counter (a timestamp's own value for the timestamp counters, 0 for the rest until the replay has queries), then the time
-        extern int g_opt_drs; uint64_t t = nvn_timestamp_from_ns(g_opt_drs ? guest_ns() : guest_ns() / 256), rec[2] = {(p->type == 0 || p->type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t};   // a timestamp's counter field is 0: conditional clears compare it (vk_replay.c rc_note)
+        extern int g_opt_drs; int dm_sdk_ounce(void); uint64_t ns_ = g_opt_drs ? guest_ns() : guest_ns() / 256, t = g_opt_drs && dm_sdk_ounce() ? ns_ : nvn_timestamp_from_ns(ns_), rec[2] = {(p->type == 0 || p->type == 0x10) && !DM_GAME_RENDER_COND ? t : 0, t};   // a timestamp's counter field is 0: conditional clears compare it (vk_replay.c rc_note)
         void dm_guest_write_prepare(void *addr, size_t len);
         dm_guest_write_prepare((void *)(uintptr_t)p->addr, sizeof rec);
         memcpy((void *)(uintptr_t)p->addr, rec, sizeof rec);
@@ -274,6 +274,10 @@ int vks_wait(uint64_t fence, uint64_t timeout_ns) {
         DWORD ms = timeout_ns == UINT64_MAX ? 100 : (DWORD)((timeout_ns - el) / 1000000 + 1);
         SleepConditionVariableSRW(&g_cv, &g_lk, ms < 100 ? ms : 100, 0);
     }
+    if (atomic_load(&g_vk.tl_done) < fence && now_ns() - t0 > 100000000ull) {   // a wait of 100 ms or more that ran out: what it waited for, at most once a second
+        static uint64_t said; if (now_ns() - said > 1000000000ull) { said = now_ns(); int pend = 0, subm = 0; for (int k = 0; k < g_norder; k++) { pend += g_slot[g_order[k]].state == S_PENDING; subm += g_slot[g_order[k]].state == S_SUBMITTED; }
+            VKLOG("a wait for fence %llu ran out after %.0f ms: done %llu, submitted %llu, assigned %llu, recording slot %d, %d committed not yet handed over, %d on the GPU", (unsigned long long)fence, (now_ns() - t0) / 1e6,
+                  (unsigned long long)atomic_load(&g_vk.tl_done), (unsigned long long)atomic_load(&g_vk.tl_submitted), (unsigned long long)atomic_load(&g_vk.tl_assigned), g_cur, pend, subm); } }
     ReleaseSRWLockExclusive(&g_lk);
     { uint64_t w = now_ns() - t0; atomic_fetch_add(&g_t_gpuwait, w); if (w > 200000) wait_note(w); }
     return atomic_load(&g_vk.tl_done) >= fence;
