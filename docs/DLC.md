@@ -95,9 +95,11 @@ the game's own `romfs/` folder.
   manifest. List writes the add-on indexes (title id & 0x7ff) in title id order and honors offset and count; an
   offset past the list is an error. 5 `GetAddOnContentBaseId` already answered the game's base + 0x1000; 7
   `PrepareAddOnContent` succeeds.
-- fsp-srv 202 `OpenDataStorageByDataId` for a title in the manifest opens, in this order, `romfs.nsp`, `romfs.bin`,
-  `romfs/`. A title without any of them, or one marked `stub`, gets an empty RomFS and a warning. Other ids go on to
-  the system archives as before.
+- A title in the manifest whose data is not there when the game starts (the package a marker points to was moved
+  or its drive is offline, the image was deleted) is not offered to the game, with a warning in the log. The game
+  then runs without that DLC instead of hanging on DLC it cannot read (section 5).
+- fsp-srv 202 `OpenDataStorageByDataId` for an offered title opens, in this order, `romfs.nsp`, `romfs.bin`,
+  `romfs/`. A title marked `stub` gets an empty RomFS. Other ids go on to the system archives as before.
 - Log lines: `dlc: 1 add-on content title in ...dlc.manifest`, `aoc: ListAddOnContent offset 0 count 16 -> 1`,
   `aoc: PrepareAddOnContent 1`, `fs: add-on content 0100152000023001 (image, 4.6 KB)`, then the first 24 reads of
   each storage (`dlc: 0100152000023001 read 1200 +5`).

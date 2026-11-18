@@ -11,7 +11,9 @@
      romfs.nsp   a marker (the SWRNSP1 format of the game's own romfs.nsp): a plaintext RomFS read in place
      romfs.bin   a RomFS image (decrypted, or unpacked from an NSZ / XCZ, when the package was installed)
      romfs/      a folder of files
-   A title with none of them (stub: its content key wasn't usable) is still installed: it gets an empty RomFS.
+   A title listed without any of them is not offered to the game (its package was moved, or a drive is offline): a
+   game that is told about DLC it then cannot read can hang (Mario Kart 8 Deluxe does, on the loading screen).
+   A line marked stub is the exception, for diagnostics: that title is listed and gets an empty RomFS.
    No manifest means no DLC, as before. */
 #include "rt.h"
 #include <ctype.h>
@@ -21,6 +23,20 @@
 typedef struct { u64 id; u32 version; int stub; char source[1024]; } DlcEnt;
 
 static DlcEnt g_dlc[DLC_MAX]; static int g_ndlc, g_dlc_loaded;
+
+static int image_ok(FILE* f, u64 size);
+
+/* does <folder of the manifest>/dlc/<title id>/ hold a RomFS the runtime can serve? */
+static int dlc_has_data(const char* manifest, u64 id){
+  char dir[1200], p[1400]; snprintf(dir,sizeof dir,"%s",manifest);
+  char* cut=dir+strlen(dir); while(cut>dir && cut[-1]!='/' && cut[-1]!='\\') cut--;
+  *cut=0;
+  snprintf(p,sizeof p,"%sdlc/%016llx/romfs.nsp",dir,(unsigned long long)id);
+  Nsp* n=nsp_open_marker(p); if(n){ nsp_close(n); return 1; }
+  snprintf(p,sizeof p,"%sdlc/%016llx/romfs.bin",dir,(unsigned long long)id);
+  FILE* f=fopen(p,"rb"); if(f){ int ok=image_ok(f,plat_file_size(p)); fclose(f); if(ok) return 1; }
+  snprintf(p,sizeof p,"%sdlc/%016llx/romfs",dir,(unsigned long long)id);
+  return plat_is_dir(p); }
 
 /* 0100152000022000 owns 0100152000023000..37ff: bit 12 set, the low 11 bits are the add-on content index */
 static int dlc_owned(u64 id, u64 app){ return (id&~0x1FFFull)==(app&~0x1FFFull) && (id&0x1000); }
@@ -46,6 +62,9 @@ int dlc_load(const char* manifest){
     while(*p==' '||*p=='\t') p++;
     int dup=0; for(int i=0;i<g_ndlc;i++) if(g_dlc[i].id==id) dup=1;
     if(dup || g_ndlc==DLC_MAX) continue;
+    if(!stub && !dlc_has_data(manifest,id)){
+      WARN("dlc: %016llx is installed but its data is missing (%s): not offered to the game. Install it again.\n",(unsigned long long)id,p);
+      continue; }
     DlcEnt* e=&g_dlc[g_ndlc++]; e->id=id; e->version=(u32)version; e->stub=stub; snprintf(e->source,sizeof e->source,"%s",p); }
   fclose(f);
   /* by title id, so a game always indexes its add-on content in the same order */
@@ -163,7 +182,7 @@ DlcStore* dlc_store_open(const char* datadir, u64 id){
       WARN("dlc: %s is not a RomFS image\n",p); fclose(s->image); s->image=NULL; }
     snprintf(p,sizeof p,"%sdlc/%016llx/romfs",datadir,(unsigned long long)id);
     if(plat_is_dir(p)){ t_dir(s,"",0); t_scan(s,p,0); t_emit(s); s->kind="folder"; return s; }
-    WARN("dlc: %016llx has no data in %sdlc/ (install the package again): an empty one is provided\n",(unsigned long long)id,datadir); }
+    WARN("dlc: the data of %016llx in %sdlc/ went missing while the game runs: an empty one is provided\n",(unsigned long long)id,datadir); }
   t_empty(s); s->kind="empty"; return s; }
 
 const char* dlc_store_kind(DlcStore* s){ return s->kind; }

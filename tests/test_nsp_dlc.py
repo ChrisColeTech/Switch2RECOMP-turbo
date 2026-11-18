@@ -432,6 +432,12 @@ class DlcRuntimeTest(unittest.TestCase):
                 b'01001520000237ff 1 data d.nsp\n'
                 b'0100152000023001 1 data duplicate.nsp\n'
                 b'0100aaaa00003005 2 data e.nsp\n')
+            # a second data folder where every title's data is unusable: a marker to a missing package, a broken image
+            lost = data / 'lost' / 'dlc'
+            (lost / '0100152000023001').mkdir(parents=True); (lost / '0100152000023002').mkdir()
+            (lost / '0100152000023001' / 'romfs.nsp').write_bytes(('SWRNSP1\n%s\n4\n10\n' % (root / 'gone.nsp')).encode())
+            (lost / '0100152000023002' / 'romfs.bin').write_bytes(b'not a RomFS image' * 8)
+            (data / 'lost' / 'dlc.manifest').write_bytes(b'0100152000023001 1 data gone.nsp\n0100152000023002 1 data b.nsp\n')
             exe = root / ('test_dlc' + ('.exe' if target_win else ''))
             command = [cc, '-O1', '-g', '-w', '-I', str(ROOT / 'runtime'), str(ROOT / 'tests' / 'test_dlc_runtime.c'),
                        str(ROOT / 'runtime' / 'dlc.c'), str(ROOT / 'runtime' / 'nsp.c'), '-o', str(exe)]

@@ -62,13 +62,15 @@ int main(int argc, char** argv){
   CHECK(!dlc_store_open(g_datadir,0x0100152000023001ull));
 
   char m[1200]; snprintf(m,sizeof m,"%sdlc.manifest",g_datadir);
-  CHECK(dlc_load(m)==5);                      /* five titles; the comment, the bad line and the duplicate are dropped */
-  CHECK(dlc_count(app)==4); CHECK(dlc_count(other)==1); CHECK(dlc_count(0x0100BBBB00004000ull)==0);
+  /* four titles: the comment, the bad line and the duplicate are dropped, and so is the title whose data is gone */
+  CHECK(dlc_load(m)==4);
+  CHECK(dlc_count(app)==4); CHECK(dlc_count(other)==0); CHECK(dlc_count(0x0100BBBB00004000ull)==0);
   /* aoc:u ListAddOnContent: indexes in title id order, offset and count honored */
   CHECK(dlc_list(app,0,8,ids)==4); CHECK(ids[0]==1 && ids[1]==2 && ids[2]==3 && ids[3]==0x7FF);
   CHECK(dlc_list(app,1,2,ids)==2); CHECK(ids[0]==2 && ids[1]==3);
   CHECK(dlc_list(app,4,8,ids)==0); CHECK(dlc_list(app,5,8,ids)==-1);
-  CHECK(dlc_list(other,0,8,ids)==1 && ids[0]==5);
+  CHECK(dlc_list(other,0,8,ids)==0);          /* listed in the manifest, no data folder: the game is not told about it */
+  CHECK(!dlc_find(0x0100AAAA00003005ull,NULL,NULL)); CHECK(!dlc_store_open(g_datadir,0x0100AAAA00003005ull));
   u32 version=0; int stub=-1;
   CHECK(dlc_find(0x0100152000023001ull,&version,&stub) && version==65536 && stub==0);
   CHECK(dlc_find(0x0100152000023003ull,&version,&stub) && version==7 && stub==1);
@@ -90,6 +92,8 @@ int main(int argc, char** argv){
   /* 37ff: a marker, read in place from a package */
   s=dlc_store_open(g_datadir,0x01001520000237FFull); CHECK(s); CHECK(!strcmp(dlc_store_kind(s),"package, read in place"));
   CHECK(file_is(s,NULL,"file.bin","test")); dlc_store_close(s);
-  /* the other game's title has no data folder at all: empty, with a warning */
-  s=dlc_store_open(g_datadir,0x0100AAAA00003005ull); CHECK(s); CHECK(!strcmp(dlc_store_kind(s),"empty")); dlc_store_close(s);
+  /* a marker whose package is gone and an image that is not a RomFS are not data either */
+  char lost[1200]; snprintf(lost,sizeof lost,"%slost/dlc.manifest",g_datadir);
+  CHECK(dlc_load(lost)==0); CHECK(dlc_count(app)==0);
+  CHECK(dlc_load(m)==4);
   puts("PASS add-on content runtime (manifest, list, storages)"); return 0; }
