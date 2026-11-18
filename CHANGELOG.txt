@@ -1,5 +1,13 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Combined and encrypted NSPs build directly. A package that holds the game and its update (1G+1U), or the game, its
+  update and its DLC (1G+1U+1D), is built like any NSP: the code, the title and the version are the update's, and the
+  RomFS is read from the package in place with the update's BKTR patch composed over the base per read and both
+  decrypted with the user's prod.keys. Nothing is extracted. A Switch 1 package with an encrypted Program NCA and no
+  update works the same way. The marker (romfs.nsp, SWRNSP2) names the content keys and keeps them wrapped; the
+  runtime unwraps them with prod.keys at start (AES-NI when the CPU has it). GetDisplayVersion answers from the
+  package's control.nacp instead of 1.0.0. Update-only packages, personalized tickets and sparse or compressed
+  Program NCAs are refused with the reason. docs/COMBINED_NSP.md, docs/NSP_IN_PLACE.md.
 - Add-on content (DLC). switchrecomp.py --install-dlc PACKAGE --datadir <game>_data installs the DLC of an NSP, NSZ,
   XCI, XCZ or bare NCA (also of an NSP that holds the game and its update too) into a built game; --remove-dlc,
   --sync-dlc and --list-dlc manage it. The runtime answers aoc:u Count/List from <data>/dlc.manifest and serves each

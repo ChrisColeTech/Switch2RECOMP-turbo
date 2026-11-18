@@ -86,7 +86,8 @@ zero-filled reads through NULL pointers; this changes a system-wide protection. 
 - [Player manual and INI options](README.txt)
 - [Code layout, diagnostics and developer guide](DEVELOPER_GUIDE.md)
 - [Changelog](CHANGELOG.txt) and [regression checks](REGRESSION.md)
-- [Direct NUP](docs/NUP_IN_PLACE.md) and [direct NSP](docs/NSP_IN_PLACE.md)
+- [Direct NUP](docs/NUP_IN_PLACE.md) and [direct NSP](docs/NSP_IN_PLACE.md), including
+  [an NSP that holds the game with its update and DLC](docs/COMBINED_NSP.md) (1G+1U, 1G+1U+1D)
 - [Add-on content (DLC)](docs/DLC.md): `--install-dlc` for NSP, NSZ, XCI, XCZ and NCA packages
 
 ## Credits and license

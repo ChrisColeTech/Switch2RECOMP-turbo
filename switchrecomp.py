@@ -467,7 +467,21 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
                 with open(dst, 'wb') as fileobj: fileobj.write(data)
         with open(nsp_marker, 'w', encoding='utf-8', newline='\n') as fileobj:
             fileobj.write(romfs.nsp.marker())
+        # a package read with the keys also has the control data: title, version and icon
+        control = getattr(romfs.nsp, 'control', None) or {}
+        icons = sorted(name for name in control if name.startswith('icon_'))
+        for name, blob in (('control.nacp', control.get('control.nacp')),
+                           ('icon_AmericanEnglish.dat', control.get('icon_AmericanEnglish.dat')
+                            or (control[icons[0]] if icons else None))):
+            if blob:
+                with open(os.path.join(datadir, name), 'wb') as fileobj: fileobj.write(blob)
+        if getattr(romfs.nsp, 'update', None):
+            say('Package: game with its update %s (v%d), applied in place' % (
+                romfs.nsp.display_version or '', romfs.nsp.version))
         say('RomFS: using %s in place' % romfs.path)
+        if getattr(romfs.nsp, 'addons', None):
+            say('DLC: this package also holds add-on content %s; install it with --install-dlc (the launcher does)'
+                % ' '.join('%016x' % title for title in romfs.nsp.addons))
         return
     if os.path.exists(nup_marker): os.remove(nup_marker)
     if os.path.exists(nsp_marker): os.remove(nsp_marker)

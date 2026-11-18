@@ -31,9 +31,11 @@ notice) that the recompiler and every recompiled game show when they start.
         hactool -k prod.keys --basenca=base.nca --exefsdir=exefs --romfsdir=romfs  update.nca
      You end up with a folder that has exefs\ and romfs\ inside.
 
-     Switch 2 indexed NUP and supported application NSP dumps can instead be used
-     directly. RomFS stays in the package; see docs\NUP_IN_PLACE.md and
-     docs\NSP_IN_PLACE.md. Install prod.keys from the Qt launcher's Keys menu.
+     Switch 2 indexed NUP and application NSP dumps can instead be used directly,
+     also an NSP that holds the game together with its update (1G+1U) and its DLC
+     (1G+1U+1D). RomFS stays in the package; see docs\NUP_IN_PLACE.md,
+     docs\NSP_IN_PLACE.md and docs\COMBINED_NSP.md. Install prod.keys from the Qt
+     launcher's Keys menu.
         scripts\build-from-nup.bat "D:\Games\Game.nup" --outdir "D:\Games\Game-build"
 
   b) Open SwitchRecomp.exe. It looks like the Switch HOME menu and works with

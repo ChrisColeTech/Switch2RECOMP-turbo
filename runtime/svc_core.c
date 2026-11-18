@@ -146,7 +146,11 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
     case 110: out32(c,0); return 0;
     case 22: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: case 66: case 67: case 68: case 90: case 100: case 101: case 120: case 124: return 0;
     case 151: return RC(128,2);                                      /* TryPopFromNotificationStorageChannel: nothing queued */
-    case 23: { char v[16]="1.0.0"; outbytes(c,v,16); return 0; }         /* GetDisplayVersion */
+    case 23: { char v[16]="1.0.0",p[1200]; snprintf(p,sizeof p,"%scontrol.nacp",g_datadir);   /* GetDisplayVersion: the */
+      FILE* f=fopen(p,"rb"); char d[16]={0};                              /* package's control data when the build has it */
+      if(f){ if(!fseek(f,0x3060,SEEK_SET) && fread(d,1,15,f)==15 && d[0]>='0' && d[0]<='9') memcpy(v,d,16); fclose(f); }
+      static int said; if(!said){ said=1; LOG("am: display version %s\n",v); }
+      outbytes(c,v,16); return 0; }
     case 40: out8(c,0); return 0;                                      /* NotifyRunning */
     case 50: out64(c,0x1111222233334444ull); out64(c,0x5555666677778888ull); return 0;
     case 60: case 61: return 0;
