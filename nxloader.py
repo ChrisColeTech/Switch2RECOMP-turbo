@@ -55,6 +55,13 @@ def align(x, a=PAGE):
 BUILTIN_PATCHES = [
     ('main', 'E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348', 0x805BD0, 0x360041E8, 0x1400020F,
      'Ocarina of Time: full resolution (tbz w8, #0 -> b)'),
+    # Pokemon Legends Z-A (0100F43008C44000, update 2.0.2): 60 frames a second. Once a frame main+0x1B29660 reads the frame rate the game runs at from its
+    # frame-rate settings (the byte at +0x20 of the object at +0x40: 0 FPS60, 1 FPS30, 2 FPS20, 3 FPS15, 4 FPS12, the enum of trinity_config's baseFrameRate) and
+    # hands it to the window (present interval = value + 1, main+0x17FB5E0). The package's trinity_config.trowc does not set it and the program's own value is FPS30;
+    # nothing the program asks the system (services, GetInfo, the add-on list) was seen to change it. With FPS60 read there the game steps by measured time as before
+    # (it falls back to 30, 20... by its own rule when frames take longer) and holds 58 to 60 here. SWR_NO_BUILTIN_PATCHES=1 at build time keeps the game's 30
+    ('main', 'B1F12FD919EAE86AB8A978317677E64BCE443D1F', 0x1B296D8, 0x39C08134, 0x2A1F03F4,
+     'Pokemon Legends Z-A: base frame rate 60 instead of 30 (ldrsb w20, [x9, #0x20] -> mov w20, wzr)'),
 ]
 
 
