@@ -69,4 +69,10 @@ Vulkan-Utility-Libraries (Apache-2.0), xbyak (BSD-3-Clause, with a small mingw p
 lz4 (BSD-2-Clause) and zstd (BSD-3-Clause), each with its own licence file. runtime/edenvk/externals has FidelityFX-FSR
 (MIT), bc_decoder (MPL-2.0) and stb (MIT/public domain).
 
+AV1 movies (the Switch 2 video decoder service): runtime/av1 holds dav1d (https://code.videolan.org/videolan/dav1d,
+BSD-2-Clause, (c) 2018-2025 VideoLAN and dav1d authors) as static libraries built from its unmodified 1.5.5 release;
+its licence is runtime/av1/LICENSE-dav1d.txt and runtime/av1/README.md has the source and the build. The way
+runtime/av1video.inc drives it (frame threads, each unit's time riding with its data, the drain, the NV12 conversion)
+is ported from nxnative's dm/host/hle_movie_av1.c (MIT, (c) seedds; licence in runtime/nvn/third_party).
+
 Thanks to all of these projects.

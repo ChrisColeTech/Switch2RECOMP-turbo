@@ -341,6 +341,9 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     # VP9 WebM movies: indexed from RomFS and decoded with libvpx (BSD), linked when runtime/vp9/<os>/libvpx.a exists
     vp = os.path.join(RT, 'vp9', 'win' if target_win else 'lin')
     vp9 = os.path.isfile(os.path.join(vp, 'libvpx.a')) and backend in ('win32', 'x11', 'headless')
+    # AV1 movies (the Switch 2 video decoder service): dav1d (BSD), linked when runtime/av1/<os>/libdav1d.a exists
+    av = os.path.join(RT, 'av1', 'win' if target_win else 'lin')
+    av1 = os.path.isfile(os.path.join(av, 'libdav1d.a')) and backend in ('win32', 'x11', 'headless')
     cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S',
         '-DZSTD_DISABLE_ASM=1', '-DXXH_NAMESPACE=ZSTD_', '-I', RT, '-I', zstd, '-I', os.path.join(RT, 'bcn'),
         '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
@@ -348,6 +351,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if not h264: cmd += ['-DSWR_NO_H264']
     if not opus: cmd += ['-DSWR_NO_OPUS']
     if vp9: cmd += ['-DSWR_HAVE_VP9', '-I', os.path.join(RT, 'vp9', 'include')]
+    if av1: cmd += ['-DSWR_HAVE_AV1', '-I', os.path.join(RT, 'av1', 'include')]
     if spvc: cmd += [spvc]
     # renderer=vulkan: the NVN layer (runtime/nvn, built by tools/build_nvn.py into build/nvn/libnvn.a), Windows only
     nvn_lib = os.path.join(HERE, 'build', 'nvn', 'libnvn.a')
@@ -358,6 +362,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if h264: cmd += h264_libs
     if opus: cmd += [os.path.join(op, 'libopus.a')]
     if vp9: cmd += [os.path.join(vp, 'libvpx.a')]
+    if av1: cmd += [os.path.join(av, 'libdav1d.a')]
     if edenvk: cmd += evk_libs + (['-luuid', '-lole32', '-lshell32', '-lntdll'] if target_win else [])
     if spvc or h264 or edenvk or nvn:
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro
