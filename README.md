@@ -19,9 +19,18 @@ included; USB DualSense rumble confirmed by hand, Bluetooth and DualShock 4 unte
 stereo audio with smooth slowdown; some Switch 2 audio/video paths remain incomplete. The SwitchRECOMP startup splash
 is broken and disabled in this fork (build with `-DSWR_STARTUP_SPLASH` to re-enable it).
 
-**60 FPS is a target, not a guarantee.** The documented integrated Mario Kart World race measured **58.4 FPS
-(presentations/s), with stutters**. Stable minimum 60 FPS has not been achieved.
-[Measurements and remaining bottlenecks](docs/MKW_PERFORMANCE_INVESTIGATION.md).
+**60 FPS is a target, not a guarantee.** Measured frame rates, from the runtime's `[vk] pacing:` log lines (one line
+for every 300 frames shown), Vulkan renderer, runtime 0.4.1, Windows, 60 Hz display, 2026-11-18:
+
+| Game | FPS while loading | FPS after loading | p95 frame time | Worst frame | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Mario Kart World | 22–45 | 57–59 | 17–21 ms | 230–810 ms | Hitches remain, mostly texture transcodes ([details](docs/MKW_PERFORMANCE_INVESTIGATION.md)) |
+| Mario Kart 8 Deluxe | 56 | 60.0 | 17.1 ms | 31 ms | 22-second run, through to a race |
+| Pokémon Legends: Z-A | 30.0 | 30.0 | 34 ms | 42–240 ms | Held at exactly 30; whether 60 is possible is still being investigated |
+| The Legend of Zelda: Ocarina of Time | none | none | none | none | Stalls at the opening before 300 frames are shown, so no line was logged |
+
+Stable minimum 60 FPS has not been achieved in every game. Each launch overwrites the game's `.log`, so read it right
+after closing the game.
 
 ## Build from source
 
