@@ -39,6 +39,19 @@ Packages with encrypted filesystem sections or BKTR update-only data fail before
 message. An update-only NSP needs a matching base NSP and virtual BKTR composition; it is not silently treated as a
 standalone game.
 
+A PFS0 header is 16 bytes (magic, entry count, string table size, reserved) and the 24-byte entries follow it at
+0x10. Reading the header as 24 bytes shifts the table by 8, so each entry's size lands in its offset field and a
+valid package looks corrupt: that happened in two throwaway parsers while Mario Kart 8 Deluxe's packages were
+examined. Both of those packages are valid end to end (every entry starts where the previous one ends and the last
+one ends at the end of the file). `nsp.py` and `dlc.py` read the table at 0x10; `tests/test_nsp_dlc.py` holds the
+regression case.
+
+## Add-on content
+
+DLC packages (NSP, NSZ, XCI, XCZ, a bare NCA, and an NSP that holds the game, its update and its DLC together) are
+installed into a built game with `switchrecomp.py --install-dlc`: see [DLC.md](DLC.md). Building the game itself
+from such a combined NSP is not supported: its update is a BKTR patch, which needs virtual composition with the base.
+
 ## Verification
 
 `python tests/test_nsp.py` covers bounded PFS0/NCA metadata, ExeFS, RomFS traversal, and BKTR rejection using synthetic

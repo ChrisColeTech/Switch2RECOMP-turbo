@@ -339,6 +339,17 @@ void nsp_close(Nsp* nsp);
 u64 nsp_size(Nsp* nsp);
 const char* nsp_path(Nsp* nsp);
 int nsp_pread(Nsp* nsp, void* dst, u64 size, u64 off);
+/* add-on content (dlc.c): <data>/dlc.manifest and each title's RomFS under <data>/dlc/<title id>/ */
+typedef struct DlcStore DlcStore;
+int dlc_load(const char* manifest);
+int dlc_count(u64 app);
+int dlc_list(u64 app, u32 offset, u32 max, u32* out);
+int dlc_find(u64 id, u32* version, int* stub);
+DlcStore* dlc_store_open(const char* datadir, u64 id);
+const char* dlc_store_kind(DlcStore* store);
+u64 dlc_store_size(DlcStore* store);
+int dlc_store_read(DlcStore* store, u64 off, void* dst, u64 size);
+void dlc_store_close(DlcStore* store);
 void romfs_init(void);
 u64  romfs_size(void);
 int  romfs_read(u64 off, void* dst, u64 size);

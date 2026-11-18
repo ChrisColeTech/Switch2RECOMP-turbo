@@ -31,7 +31,7 @@ import nxloader, codegen
 
 RT = os.path.join(HERE, 'runtime')
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'svc_ns2', 'sm86', 'gpu', 'gpu_engines',
-               'gpu_3d', 'loader', 'main', 'nup', 'nsp', 'nvn_hook', 'nvn_glue']
+               'gpu_3d', 'loader', 'main', 'nup', 'nsp', 'dlc', 'nvn_hook', 'nvn_glue']
 # 2: the exclusive monitor (cpu.h RtAPI.excl_mon, CPU.excl_seq). keep it equal to SWR_CODE_ABI in runtime/main.c
 ABI = 2
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
@@ -542,6 +542,15 @@ def main():
     ap.add_argument('--interp-only', action='store_true', help='(diagnostics) no recompilation, everything interpreted')
     ap.add_argument('--runtime', help='use an already built runtime (.exe) instead of building it')
     ap.add_argument('--build-runtime', action='store_true', help='build bin/runtime_<target>_<backend> with GCC and exit')
+    ap.add_argument('--install-dlc', nargs='+', metavar='PACKAGE',
+                    help='install add-on content (.nsp .nsz .xci .xcz .nca) for the built game in --datadir and exit')
+    ap.add_argument('--sync-dlc', nargs='*', metavar='PACKAGE',
+                    help='make the add-on content of the built game in --datadir exactly that of these packages and exit')
+    ap.add_argument('--remove-dlc', nargs='+', metavar='TITLE_OR_PACKAGE',
+                    help='remove installed add-on content by title id or by its package and exit')
+    ap.add_argument('--list-dlc', action='store_true', help='list the add-on content installed in --datadir and exit')
+    ap.add_argument('--datadir', help="the built game's data folder (<outdir>/<name>_data), for the DLC options")
+    ap.add_argument('--dlc-stub', action='store_true', help=argparse.SUPPRESS)   # diagnostics: license without data
     ap.add_argument('-q', '--quiet', action='store_true')
     a = ap.parse_args()
     say = (lambda m: None) if a.quiet else (lambda m: print(m, flush=True))
@@ -556,6 +565,21 @@ def main():
         say('Compiling the runtime (%s) with %s...' % (backend, os.path.basename(cc)))
         build_runtime(cc, out, target_win, backend, say, a.O)
         say('Done: %s' % out)
+        return
+    if a.install_dlc or a.sync_dlc is not None or a.remove_dlc or a.list_dlc:
+        import dlc
+        datadir = a.datadir or (os.path.join(os.path.abspath(a.outdir), a.out + '_data') if a.outdir and a.out else None)
+        if not datadir: ap.error('the DLC options need --datadir (or --outdir with -o)')
+        errors = []
+        try:
+            for what in a.remove_dlc or []:
+                if not dlc.remove(datadir, what, say): errors.append('%s is not installed' % what); say('DLC error: ' + errors[-1])
+            if a.sync_dlc is not None: errors += dlc.sync(a.sync_dlc, datadir, say)[1]
+            if a.install_dlc: errors += dlc.install(a.install_dlc, datadir, say, allow_stub=a.dlc_stub)[1]
+            if a.list_dlc: dlc.describe(datadir, print)
+        except (dlc.Error, OSError) as e:
+            raise SystemExit('DLC error: %s' % e)
+        if errors: raise SystemExit(1)
         return
     if not a.input: ap.error('the game folder, .nup/.nsp package or .nro file is required')
     # check the compiler first, not after minutes of translation

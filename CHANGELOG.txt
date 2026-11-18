@@ -1,5 +1,13 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Add-on content (DLC). switchrecomp.py --install-dlc PACKAGE --datadir <game>_data installs the DLC of an NSP, NSZ,
+  XCI, XCZ or bare NCA (also of an NSP that holds the game and its update too) into a built game; --remove-dlc,
+  --sync-dlc and --list-dlc manage it. The runtime answers aoc:u Count/List from <data>/dlc.manifest and serves each
+  title's RomFS through OpenDataStorageByDataId (a plaintext one is read in place from the package, an encrypted or
+  compressed one is unpacked once into <data>/dlc/<title id>/romfs.bin). Mario Kart 8 Deluxe's Booster Course Pass
+  works: its 12 cups start (Paris Promenade races) instead of showing the purchase notice. A package whose content
+  key cannot be read (a ticket bound to one console, keys without the generation) is refused with the reason.
+  docs/DLC.md.
 - Donkey Kong Bananza: the terrain is shaded instead of black. Its depth pre-pass appends each chunk's visible
   triangles with a geometry shader and the shading pass draws that list with DrawElementsIndirect from the same
   64-byte record; the record's count grew without end and had 0 instances. Such counts now start each frame at 0 and

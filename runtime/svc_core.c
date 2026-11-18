@@ -1133,9 +1133,20 @@ static int aoc_purchase(SvcObj* o, IpcCtx* c){ (void)o; if(c->cmd==2){ out_copy_
 
 static int aoc_disp(SvcObj* o, IpcCtx* c){ (void)o;
   switch(c->cmd){
-    case 0: case 1: case 2: case 3: out32(c,0); return 0;                     /* Count/List: no dlc */
-    case 5: case 6: out64(c,(g_title_id&~0xFFFull)+0x1000); return 0;         /* GetAddOnContentBaseId */
-    case 7: case 9: case 11: case 12: case 13: case 50: return 0;
+    /* Count / List: the titles of <data>/dlc.manifest (dlc.c) that belong to the game; none without a manifest.
+       0 and 1 are the ByApplicationId forms (a u64 application id where 2 and 3 have the process id) */
+    case 0: case 2: { u64 app= c->cmd==0 && in64(c,0)? in64(c,0) : g_title_id; u32 n=(u32)dlc_count(app);
+      static int said; if(!said){ said=1; LOG("aoc: CountAddOnContent -> %u\n",n); }
+      out32(c,n); return 0; }
+    case 1: case 3: { u32 offset=in32(c,0), count=in32(c,4); u64 app= c->cmd==1 && in64(c,8)? in64(c,8) : g_title_id, a=0, bs=0;
+      buf_out(c,0,&a,&bs); if(count>bs/4) count=(u32)(bs/4);
+      int n= a? dlc_list(app,offset,count,(u32*)GP(a)) : (dlc_count(app)>=(int)offset? 0 : -1);
+      static int said; if(!said){ said=1; LOG("aoc: ListAddOnContent offset %u count %u -> %d\n",offset,count,n); }
+      if(n<0) return RC(128,150);                                              /* the offset is past the list */
+      out32(c,(u32)n); return 0; }
+    case 4: case 5: case 6: out64(c,(g_title_id&~0xFFFull)+0x1000); return 0;  /* GetAddOnContentBaseId */
+    case 7: { static int said; if(!said){ said=1; LOG("aoc: PrepareAddOnContent %u\n",in32(c,0)); } return 0; }
+    case 9: case 11: case 12: case 13: case 50: return 0;
     case 8: case 10: out_copy_h(c,ev_handle(kevent_new("aoc",0))); return 0;   /* GetAddOnContentListChangedEvent */
     case 100: case 101: out_obj(c,svcobj_new("IPurchaseEventManager",aoc_purchase,0)); return 0; }
   return 0; }
