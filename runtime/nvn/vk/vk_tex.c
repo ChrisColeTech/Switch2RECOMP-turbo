@@ -827,7 +827,7 @@ void vkt_tex_release(const tex_t *t) { InterlockedIncrement(&g_vkt_reg_gen);   /
 // before the game uses it, so more of them start that way
 int vkt_to_gpu(const tex_t *t) {
     if (!t || !t->serial || t->has_layout) return 0;
-    { static int on = -1; if (on < 0) on = vkc_int("to_gpu", 1); if (!on) return 0; }   // NXRT_VK_TO_GPU=0: as before, the draws are lost
+    { static int on = -1; if (on < 0) on = vkc_int("to_gpu", 0); if (!on) return 0; }   // NXRT_VK_TO_GPU=1: on. Off by default: with Ocarina of Time's two sky tables drawn its scenes come out white (docs/GAMEPLAY_INVESTIGATION.md section 9); off, the draws are lost as before
     const vkf_info *fi = vkf_get(t->d.format); if (!fi || (fi->flags & VKF_COMPRESSED)) return 0;
     AcquireSRWLockExclusive(&g_lk);
     int was = vk_hm_get(&g_cpu, &t->serial) != NULL;

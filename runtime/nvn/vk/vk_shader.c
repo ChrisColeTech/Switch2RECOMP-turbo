@@ -644,8 +644,13 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
     // the new types go right before the first retyped variable; the existing types they name must be defined before that
     size_t first_var = 0;
     for (int l = 0; l < 8; l++) if (var_of[l] && (!first_var || def[var_of[l]] < first_var)) first_var = def[var_of[l]];
-    for (int k = 0; k < 2; k++) if (iscal[k] && def[iscal[k]] > first_var) { free(def); return NULL; }
-    for (int k = 0; k < 2; k++) for (int c = 2; c <= 4; c++) if (ivec[k][c] && def[ivec[k][c]] > first_var) { free(def); return NULL; }
+    // An integer type the module declares after the first output is moved to before it (a type may stand anywhere before its first use, and a second declaration
+    // of a scalar or vector type is invalid): the scalar first, then its vectors. Ocarina of Time's shader that writes the blocks of a compressed volume
+    size_t hoist[16]; int nhoist = 0;
+    for (int k = 0; k < 2; k++) if (iscal[k] && def[iscal[k]] > first_var) hoist[nhoist++] = def[iscal[k]];
+    for (int k = 0; k < 2; k++) for (int c = 2; c <= 4; c++) if (ivec[k][c] && def[ivec[k][c]] > first_var) hoist[nhoist++] = def[ivec[k][c]];
+    for (int k = 0; k < 2; k++) if (isp[k] && def[isp[k]] > first_var) hoist[nhoist++] = def[isp[k]];   // and the Output pointers to them
+    for (int k = 0; k < 2; k++) for (int c = 2; c <= 4; c++) if (ivp[k][c] && def[ivp[k][c]] > first_var) hoist[nhoist++] = def[ivp[k][c]];
     wbuf types = {0};
     #define NEWT(...) do { uint32_t t_[] = {__VA_ARGS__}; wput(&types, t_, sizeof t_ / 4); } while (0)
     for (int l = 0; l < 8; l++) {
@@ -667,7 +672,8 @@ uint32_t *vkspv_int_outputs(const uint32_t *w, size_t n, const int kinds[8], siz
     for (size_t i = 5; i < n && !bad; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
         if (!wc || i + wc > n) { bad = 1; break; }
-        if (i == first_var && types.n) wput(&o, types.w, types.n);
+        if (i == first_var) { for (int h = 0; h < nhoist; h++) wput(&o, w + hoist[h], w[hoist[h]] >> 16); if (types.n) wput(&o, types.w, types.n); }
+        { int moved = 0; for (int h = 0; h < nhoist; h++) moved |= hoist[h] == i; if (moved) { i += wc; continue; } }
         if (wc > 64) { wput(&o, w + i, wc); i += wc; continue; }
         uint32_t x[64] = {0}; memcpy(x, w + i, wc * 4);
         if (op == OP_VARIABLE && wc >= 4) {
