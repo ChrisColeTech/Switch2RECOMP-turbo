@@ -14,9 +14,9 @@ It is a recompiler, not an emulator: the game's code is translated once, ahead o
 
 | | |
 | --- | --- |
-| ![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>**Mario Kart World**<br>Plays at about 58–59 FPS, with occasional stutters | ![Mario Kart 8 Deluxe at Paris Promenade](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>**Mario Kart 8 Deluxe**<br>Plays at 60 FPS, including Booster Course Pass DLC |
-| ![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>**Donkey Kong Bananza**<br>Plays at 52–60 FPS, with some slowdowns and stutters | ![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>**Pokémon Legends: Z-A**<br>Plays, but held at 30 FPS |
-| ![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>**The Legend of Zelda: Ocarina of Time**<br>Title screen and opening movie work; gameplay doesn't yet | |
+| **Mario Kart World**<br>![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>Plays at about 58–59 FPS, with occasional stutters | **Mario Kart 8 Deluxe**<br>![Mario Kart 8 Deluxe at Paris Promenade](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>Plays at 60 FPS, including Booster Course Pass DLC |
+| **Donkey Kong Bananza**<br>![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>Plays at 52–60 FPS, with some slowdowns and stutters | **Pokémon Legends: Z-A**<br>![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>Plays, but held at 30 FPS |
+| **The Legend of Zelda: Ocarina of Time**<br>![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>Title screen and opening movie work; gameplay doesn't yet | |
 
 60 FPS is the goal, not yet a guarantee. Measured numbers are in the [technical details](docs/TECHNICAL.md#measured-performance).
 
