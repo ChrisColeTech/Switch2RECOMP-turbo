@@ -821,23 +821,28 @@ void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint3
 // A pool is listed once its buffer has memory (sparse: always; the unbacked parts read undefined and drop writes, as Vulkan defines). The table is written anew when
 // a pool comes, goes or gets memory, into the next of GM_TABLES buffers, so that work already submitted keeps the table it was recorded with.
 // The write log (DMSH_GMEM_LOG_*): word 0 set when the set was full, then a hash set of 1024 guest page numbers a store or atomic went to. One log for all draws,
-// read and cleared once a frame (vkm_gmem_log_take): the replay learns from it which pages such shaders write and has them copied back to guest memory.
+// taken and cleared once a frame: the replay learns from it which pages such shaders write and has them copied back to guest memory (vk_replay.c gm_frame).
+// Both buffers are in device memory: a shader looks the table up at every access and logs every store (Ocarina of Time's movie shaders: 384 loads and 384 stores
+// each, over whole pictures). Kept in host memory first, those accesses went across the bus and one dispatch ran into the GPU's time limit (device lost). So the
+// table is written through the staging ring in the submission's upload command buffer, and the log is copied to a small host buffer and cleared there once a frame,
+// before the frame's first use of it; the copy is read when its submission completes (gm_log_land).
 enum { GM_TABLES = 4, GM_BYTES = DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY, GM_LOG_WORDS = 1 + (1 << DMSH_GMEM_LOG_LOG2) };
-static struct { VkBuffer buf[GM_TABLES], log; vk_alloc mem[GM_TABLES], logmem; int state, cur; uint32_t pgen, bgen, entries; } g_gm;   // state: 0 not tried, 1 ready, 2 unavailable
-static int gm_buffer(VkDeviceSize n, VkBuffer *b, vk_alloc *m, const char *name) {
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+static struct { VkBuffer buf[GM_TABLES], log, log_rb; vk_alloc mem[GM_TABLES], logmem, rbmem; int state, cur, log_used; uint32_t pgen, bgen, entries; uint64_t log_frame; } g_gm;   // state: 0 not tried, 1 ready, 2 unavailable
+static SRWLOCK g_gm_lk = SRWLOCK_INIT; static uint32_t g_gm_pend[GM_LOG_WORDS]; static int g_gm_npend, g_gm_full;   // logged pages landed, not taken yet
+static int gm_buffer(VkDeviceSize n, VkBuffer *b, vk_alloc *m, const char *name, int host) {
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (vkCreateBuffer(g_vk.dev, &bci, NULL, b) != VK_SUCCESS) return -1;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, *b, &mr);
-    if (vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, m) || !m->map) return -1;
-    vkBindBufferMemory(g_vk.dev, *b, m->mem, m->off); memset(m->map, 0, (size_t)n); vk_name((uint64_t)*b, VK_OBJECT_TYPE_BUFFER, name);
+    if (host ? (vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, m) || !m->map) : vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, m)) return -1;
+    vkBindBufferMemory(g_vk.dev, *b, m->mem, m->off); if (host) memset(m->map, 0, (size_t)n); vk_name((uint64_t)*b, VK_OBJECT_TYPE_BUFFER, name);
     return 0;
 }
 static int gm_ready(void) {
     if (g_gm.state) return g_gm.state == 1;
     g_gm.state = 2;
     if (!g_vk.f12.bufferDeviceAddress) { VKRED("raw global memory: the device has no buffer device addresses; shaders that read or write through loaded pointers get an empty table"); return 0; }
-    for (int i = 0; i < GM_TABLES; i++) if (gm_buffer(GM_BYTES, &g_gm.buf[i], &g_gm.mem[i], "raw global memory: pool table")) { VKRED("raw global memory: no memory for the pool table"); return 0; }
-    if (gm_buffer(GM_LOG_WORDS * 4, &g_gm.log, &g_gm.logmem, "raw global memory: write log")) { VKRED("raw global memory: no memory for the write log"); return 0; }
+    for (int i = 0; i < GM_TABLES; i++) if (gm_buffer(GM_BYTES, &g_gm.buf[i], &g_gm.mem[i], "raw global memory: pool table", 0)) { VKRED("raw global memory: no memory for the pool table"); return 0; }
+    if (gm_buffer(GM_LOG_WORDS * 4, &g_gm.log, &g_gm.logmem, "raw global memory: write log", 0) || gm_buffer(GM_LOG_WORDS * 4, &g_gm.log_rb, &g_gm.rbmem, "raw global memory: write log copy", 1)) { VKRED("raw global memory: no memory for the write log"); return 0; }
     g_gm.state = 1; g_gm.cur = -1;
     return 1;
 }
@@ -847,7 +852,10 @@ VkBuffer vkm_gmem_table(VkDeviceSize *size) {
     if (!gm_ready()) return VK_NULL_HANDLE;
     uint32_t pg = atomic_load(&g_pool_gen), bg = atomic_load(&g_bind_gen);
     if (g_gm.cur >= 0 && pg == g_gm.pgen && bg == g_gm.bgen) return g_gm.buf[g_gm.cur];
-    int nx = (g_gm.cur + 1) % GM_TABLES; uint64_t *t = g_gm.mem[nx].map; uint32_t n = 1, left = 0; uint64_t last_end = 0;
+    VkCommandBuffer up = vks_upload_cb(); VkBuffer sb; VkDeviceSize so;
+    uint64_t *t = up ? vkm_staging(GM_BYTES, 16, &sb, &so) : NULL;
+    if (!t) return g_gm.cur >= 0 ? g_gm.buf[g_gm.cur] : VK_NULL_HANDLE;   // outside a submission: the table as it was
+    int nx = (g_gm.cur + 1) % GM_TABLES; uint32_t n = 1, left = 0; uint64_t last_end = 0;
     t[0] = t[1] = t[2] = t[3] = 0;
     AcquireSRWLockShared(&g_lk);
     for (int i = 0; i < g_npool; i++) { pool_t_ *p = g_pool[i];
@@ -863,18 +871,39 @@ VkBuffer vkm_gmem_table(VkDeviceSize *size) {
     }
     ReleaseSRWLockShared(&g_lk);
     for (uint32_t i = n; i < DMSH_GMEM_MAP_ENTRIES; i++) { t[4 * i] = ~0ull; t[4 * i + 1] = 0; t[4 * i + 2] = 0; t[4 * i + 3] = 0; }
+    VkBufferCopy c = {so, 0, GM_BYTES}; vkCmdCopyBuffer(up, sb, g_gm.buf[nx], 1, &c);
     if (left) { static int said; if (!said++) VKRED("raw global memory: %u more memory pools than the table's %d entries; reads through loaded pointers into them give 0 (missing geometry)", left, DMSH_GMEM_MAP_ENTRIES); }
     { static int said; if (!said++) VKLOG("raw global memory: a shader reads or writes through pointers it loaded from memory; the memory pool table has %u ranges (written again when pools change)", n - 1); }
     g_gm.cur = nx; g_gm.pgen = pg; g_gm.bgen = bg; g_gm.entries = n - 1;
     return g_gm.buf[nx];
 }
-VkBuffer vkm_gmem_log(VkDeviceSize *size) { *size = GM_LOG_WORDS * 4; return gm_ready() ? g_gm.log : VK_NULL_HANDLE; }
-// The guest pages logged since the last call (at most max), and the log cleared. *full: the set overflowed, some pages are not in it
+static void gm_log_land(void *arg) {   // the submission that copied the log out has completed: its pages wait for vkm_gmem_log_take
+    (void)arg; const uint32_t *w = g_gm.rbmem.map;
+    AcquireSRWLockExclusive(&g_gm_lk);
+    if (w[0]) g_gm_full = 1;
+    for (int i = 1; i < GM_LOG_WORDS; i++) if (w[i]) { int k = 0; while (k < g_gm_npend && g_gm_pend[k] != w[i]) k++; if (k == g_gm_npend && g_gm_npend < GM_LOG_WORDS) g_gm_pend[g_gm_npend++] = w[i]; }
+    ReleaseSRWLockExclusive(&g_gm_lk);
+}
+VkBuffer vkm_gmem_log(VkDeviceSize *size) {
+    *size = GM_LOG_WORDS * 4;
+    if (!gm_ready()) return VK_NULL_HANDLE;
+    VkCommandBuffer up = vks_upload_cb();
+    if (up && g_gm.log_frame != g_frame) {   // once a frame, ahead of the frame's first use: last frame's entries out, the log empty
+        g_gm.log_frame = g_frame;
+        vk_mem_barrier(up, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        if (g_gm.log_used) { VkBufferCopy c = {0, 0, GM_LOG_WORDS * 4}; vkCmdCopyBuffer(up, g_gm.log, g_gm.log_rb, 1, &c); vks_post_fn(gm_log_land, NULL); }
+        vkCmdFillBuffer(up, g_gm.log, 0, GM_LOG_WORDS * 4, 0);
+        g_gm.log_used = 1;
+    }
+    return g_gm.log_used ? g_gm.log : VK_NULL_HANDLE;
+}
+// The guest pages logged and landed since the last call (at most max). *full: a log overflowed, some pages are not in it
 int vkm_gmem_log_take(uint64_t *pages, int max, int *full) {
     *full = 0; if (g_gm.state != 1) return 0;
-    uint32_t *w = g_gm.logmem.map; int n = 0;
-    if (w[0]) { *full = 1; w[0] = 0; }
-    for (int i = 1; i < GM_LOG_WORDS; i++) if (w[i]) { if (n < max) pages[n++] = w[i]; w[i] = 0; }
+    AcquireSRWLockExclusive(&g_gm_lk);
+    int n = g_gm_npend < max ? g_gm_npend : max; for (int i = 0; i < n; i++) pages[i] = g_gm_pend[i];
+    g_gm_npend = 0; *full = g_gm_full; g_gm_full = 0;
+    ReleaseSRWLockExclusive(&g_gm_lk);
     return n;
 }
 

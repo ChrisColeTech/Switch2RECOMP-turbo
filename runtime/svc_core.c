@@ -490,10 +490,13 @@ static void time_shm_update(void){
     for(int k=0;k<2;k++){ u8* e=q+8+k*0x20; i64 tp=0; memcpy(e,&off,8); memcpy(e+8,&tp,8); memcpy(e+16,g_clock_id,16); } }
   /* auto correction {u32 counter; bool[2]} at 0xC8 */
   memcpy(p+0xC8,&cnt,4); p[0xCC]=1; p[0xCD]=1;
-  /* ContinuousAdjustmentTimePoint (17.0+) {u32 counter; pad; 2 x {rtc_offset, diff_scale, shift+pad, lower{t,id},
-     upper{t,id}}} at 0xD0 */
+  /* ContinuousAdjustmentTimePoint {u32 counter; pad; 2 x {i64 clock_offset, i64 multiplier, i64 divisor_log2, SystemClockContext {i64 offset, i64 time_point,
+     u8 id[16]}}} at 0xD0: entries of 0x38 bytes, the clock source ID at +0x28. Read from SDK 22's SharedMemoryClient::CalculateSystemClockCurrentTimespec (Ocarina
+     of Time, sdk 0xd57ce40: the entry is picked with counter & 1 times 56, and the 16 bytes at +40 are compared with the system clock context's ID; a mismatch is
+     result 52340 and clock_gettime(CLOCK_REALTIME) fails: std::chrono::system_clock::now() threw on the game's network thread). The entries were laid out as 0x48
+     bytes with two time points before, so the ID was 8 bytes off. A multiplier of 0 adds nothing: the time is the steady clock plus the context's offset */
   memcpy(p+0xD0,&cnt,4);
-  for(int k=0;k<2;k++){ u8* e=p+0xD8+k*0x48; memset(e,0,0x48); memcpy(e+0x18+8,g_clock_id,16); memcpy(e+0x30+8,g_clock_id,16); }
+  for(int k=0;k<2;k++){ u8* e=p+0xD8+k*0x38; memset(e,0,0x38); memcpy(e+0x28,g_clock_id,16); }
 }
 
 static int time_disp(SvcObj* o, IpcCtx* c){
