@@ -50,7 +50,7 @@ static VkPipeline g_last_pipe;   // the graphics pipeline bound last in this sub
 // ---------- Resources that live with a submission: arena chunks, descriptor pools, buffer views (returned at completion) ----------
 typedef struct rchunk { VkBuffer buf; vk_alloc mem; VkDeviceSize size, used; struct rchunk *next; } rchunk;
 typedef struct rdpool { VkDescriptorPool pool; struct rdpool *next; } rdpool;
-typedef struct { rchunk *chunks; rdpool *pools; VkBufferView *views; int nviews, cviews; int tq; } subres;   // tq: timestamp pair + 1
+typedef struct { rchunk *chunks; rdpool *pools; VkBufferView *views; int nviews, cviews; int tq; uint32_t rsub; } subres;   // tq: timestamp pair + 1; rsub: the NVN submission it is a part of
 static subres g_sub;
 // GPU time: a timestamp before and after each submission's replay, read at its completion
 enum { NTQ = 256 };
@@ -59,11 +59,57 @@ static VkQueryPool g_tqp; static uint32_t g_tq_next; static _Atomic uint64_t g_g
 static uint64_t g_perf_cpu;
 static rchunk *g_free_chunks; static rdpool *g_free_pools; static SRWLOCK g_free_lk = SRWLOCK_INIT;
 
+// ---------- Counter reports: the GPU's own time ----------
+// NVN's timestamp reports (TIMESTAMP, TIMESTAMP_TOP) are how a game times its GPU work: the difference of two reports feeds its dynamic resolution and its frame-rate
+// controller. Every report of a submission used to get one time, the guest clock when the submission completed, so such a difference read as nothing (or, across
+// submissions, as the host's translation time). nxnative's design (docs/reference/frame-rate.md "GPU timestamps per submission segment", "NVN2 timestamps are
+// nanoseconds"; MIT, (c) seedds), on Vulkan timestamp queries:
+// - each report is stamped where it was recorded: vkCmdWriteTimestamp2 at the top of the pipeline for TIMESTAMP_TOP (the GPU's start), after all commands for the rest;
+// - the GPU's clock is brought to the guest clock by the smallest difference seen between a part's end stamp and the guest clock at its completion;
+// - the time the GPU sat idle between the parts of one NVN submission, waiting for the host to translate the next part (vks_split), is left out of the reports after
+//   it: a console runs a submission's commands back to back, and a dynamic resolution that counted the host's translation as GPU time stepped down for nothing;
+// - a Switch 2 program's NVN2 holds nanoseconds in the report, a Switch program's NVN 614.4 MHz ticks (dm_sdk_ounce).
+// On with game_dynamic_resolution=1 (g_opt_drs); with 0 the reports stay as they were (vk_submit.c post_run: a clock 256 times slower, the game always at full size).
+enum { RQ_PER = 16 };   // stamped reports per part; the ones past that get the part's end
+static VkQueryPool g_rqp; static int g_rq_used; static uint32_t g_rep_sub;
+typedef struct { uint64_t addr; uint32_t type, sub; int tq, rq; } rep_post;
+static struct { uint32_t sub; int tq, have; uint64_t idle, prev_end, last; int64_t off; } g_rc;   // the completion thread's
+uint64_t guest_ns(void); int dm_sdk_ounce(void);
+static int tq_times(int tq, uint64_t *t0, uint64_t *t1) {
+    uint64_t t[2];
+    if (!tq || vkGetQueryPoolResults(g_vk.dev, g_tqp, 2 * (uint32_t)(tq - 1), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] < t[0]) return 0;
+    *t0 = (uint64_t)((double)t[0] * g_vk.props.limits.timestampPeriod); *t1 = (uint64_t)((double)t[1] * g_vk.props.limits.timestampPeriod);
+    return 1;
+}
+static void rep_part(uint32_t sub, int tq, uint64_t t0, uint64_t t1) {   // a part [t0, t1] of NVN submission sub has completed (GPU clock, ns); once per part
+    if (g_rc.have && g_rc.sub == sub && g_rc.tq == tq) return;
+    if (!g_rc.have || g_rc.sub != sub) g_rc.idle = 0; else if (t0 > g_rc.prev_end) g_rc.idle += t0 - g_rc.prev_end;
+    int64_t cand = (int64_t)guest_ns() - (int64_t)t1;   // what a GPU stamp lacks to the guest clock, plus this completion's delay: the smallest is the closest
+    g_rc.off = !g_rc.have || cand < g_rc.off + 2000 ? cand : g_rc.off + 2000;   // rises 2 us a part, to follow the two clocks drifting apart
+    g_rc.have = 1; g_rc.sub = sub; g_rc.tq = tq; g_rc.prev_end = t1;
+}
+static void rep_land(void *arg) {
+    rep_post *r = arg; uint64_t t0, t1, ns;
+    if (tq_times(r->tq, &t0, &t1)) {
+        rep_part(r->sub, r->tq, t0, t1);
+        uint64_t ts = t1, v;
+        if (r->rq >= 0 && vkGetQueryPoolResults(g_vk.dev, g_rqp, (uint32_t)r->rq, 1, sizeof v, &v, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            ts = (uint64_t)((double)v * g_vk.props.limits.timestampPeriod); if (ts < t0) ts = t0; if (ts > t1) ts = t1; }
+        int64_t x = (int64_t)ts + g_rc.off - (int64_t)g_rc.idle; ns = x > 0 ? (uint64_t)x : 0;
+    } else ns = guest_ns();
+    if (ns < g_rc.last) ns = g_rc.last;
+    g_rc.last = ns;
+    uint64_t t = dm_sdk_ounce() ? ns : nvn_timestamp_from_ns(ns), rec[2] = {!DM_GAME_RENDER_COND ? t : 0, t};   // as vk_submit.c post_run writes a timestamp's record
+    dm_guest_write_prepare((void *)(uintptr_t)r->addr, sizeof rec);
+    memcpy((void *)(uintptr_t)r->addr, rec, sizeof rec);
+    free(r);
+}
 static void subres_done(void *arg) {
     subres *r = arg;
     uint64_t t[2];
     if (r->tq && vkGetQueryPoolResults(g_vk.dev, g_tqp, 2 * (uint32_t)(r->tq - 1), 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] >= t[0]) {
         atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod)); atomic_fetch_add(&g_gpu_subs, 1);
+        rep_part(r->rsub, r->tq, (uint64_t)((double)t[0] * g_vk.props.limits.timestampPeriod), (uint64_t)((double)t[1] * g_vk.props.limits.timestampPeriod));
     }
     AcquireSRWLockExclusive(&g_free_lk);
     while (r->chunks) { rchunk *c = r->chunks; r->chunks = c->next; c->next = g_free_chunks; g_free_chunks = c; }
@@ -404,6 +450,26 @@ static void pass_targets(void) {
     P.valid = 1;
 }
 // Opens the pass over the current targets (loading what they hold). An attachment-less pass covers the viewport (nvn_mtl.m bare_dims)
+// The sizes the game renders at: passes by target size, in the log every 600 frames (which resolution a game really draws its scene at: docked or handheld,
+// its dynamic resolution's step, docs/GAMEPLAY_INVESTIGATION.md section 7)
+static struct { uint32_t w, h; uint64_t n, nd; } g_rsz[24]; static int g_nrsz;
+static void rsz_note(uint32_t w, uint32_t h, int depth) {
+    int k = 0; while (k < g_nrsz && (g_rsz[k].w != w || g_rsz[k].h != h)) k++;
+    if (k == g_nrsz) { if (g_nrsz == 24) return; g_rsz[k].w = w; g_rsz[k].h = h; g_rsz[k].n = g_rsz[k].nd = 0; g_nrsz++; }
+    g_rsz[k].n++; g_rsz[k].nd += depth;
+}
+static void rsz_log(uint64_t frame, uint64_t frames) {
+    char b[700]; int o = 0;
+    for (int shown = 0; shown < 8; shown++) {   // the most used sizes first
+        int best = -1; for (int k = 0; k < g_nrsz; k++) if (g_rsz[k].n && (best < 0 || g_rsz[k].n > g_rsz[best].n)) best = k;
+        if (best < 0) break;
+        o += snprintf(b + o, sizeof b - o, "%s%ux%u x%.1f (%.1f with depth)", shown ? ", " : "", g_rsz[best].w, g_rsz[best].h, (double)g_rsz[best].n / frames, (double)g_rsz[best].nd / frames);
+        g_rsz[best].n = 0;
+    }
+    uint32_t mw = 0, mh = 0; for (int k = 0; k < g_nrsz; k++) if (g_rsz[k].nd && (uint64_t)g_rsz[k].w * g_rsz[k].h > (uint64_t)mw * mh) { mw = g_rsz[k].w; mh = g_rsz[k].h; }
+    if (o) VKLOG("render sizes up to frame %llu, passes per frame: %s; largest with depth %ux%u", (unsigned long long)frame, b, mw, mh);
+    g_nrsz = 0;
+}
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!P.valid) pass_targets();
@@ -432,7 +498,7 @@ static int pass_begin(void) {
     if (!nlay || !g_vk.f12.shaderOutputLayer) nlay = 1;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, nlay, 0, (uint32_t)P.ncolor, ca, P.hd ? &da : NULL, P.hs ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
-    P.open = 1; g_st.passes++;
+    P.open = 1; g_st.passes++; rsz_note(w, h, P.dv != VK_NULL_HANDLE);
     if (g_gt_on) { g_gt_w = w; g_gt_h = h; g_gt_d0 = g_st.draws; snprintf(g_gt_fmt, sizeof g_gt_fmt, "%s", P.ncolor && P.ci[0] ? P.ci[0]->fi->name : P.di ? P.di->fi->name : "-"); }
     if (g_pd) {
         char b[600]; int o = 0;
@@ -1902,6 +1968,12 @@ static void report_counter(uint64_t type, uint64_t addr) {
         if (P.query >= 0) { vkCmdEndQuery(vks_cb(), R0.qp, (uint32_t)P.query); q_post(0, (uint32_t)P.query, 0); P.query = -1; }
         q_post(2, 0, addr); return;
     }
+    { extern int g_opt_drs;   // the GPU's own time for timestamps (above)
+      if (g_opt_drs && g_rqp && g_sub.tq && (type == NVN_COUNTER_TYPE_TIMESTAMP || type == NVN_COUNTER_TYPE_TIMESTAMP_TOP)) {
+          rep_post *r = malloc(sizeof *r); r->addr = addr; r->type = (uint32_t)type; r->sub = g_rep_sub; r->tq = g_sub.tq; r->rq = -1;
+          if (g_rq_used < RQ_PER) { r->rq = (g_sub.tq - 1) * RQ_PER + g_rq_used++;
+              vkCmdWriteTimestamp2(vks_cb(), type == NVN_COUNTER_TYPE_TIMESTAMP_TOP ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g_rqp, (uint32_t)r->rq); }
+          vks_post_fn(rep_land, r); return; } }
     if (type != NVN_COUNTER_TYPE_TIMESTAMP && type != NVN_COUNTER_TYPE_TIMESTAMP_TOP) { static uint32_t seen; if (!(seen >> (type & 31) & 1)) { seen |= 1u << (type & 31); VKRED("counter type %llu is reported as 0 (only timestamps and samples passed are counted)", (unsigned long long)type); } }
     vks_post_counter(addr, (uint32_t)type);
 }
@@ -2135,7 +2207,9 @@ static void ballast_touch(VkCommandBuffer cb) {
 static void sub_open_rest(void) {
     ballast_touch(vks_cb());
     gt_mark(vks_cb(), 's', 0, 0, 0, "start");
-    if (g_tqp) { uint32_t q = g_tq_next++ % NTQ; vkCmdResetQueryPool(vks_cb(), g_tqp, 2 * q, 2); vkCmdWriteTimestamp2(vks_cb(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g_tqp, 2 * q); g_sub.tq = (int)q + 1; }
+    if (g_tqp) { uint32_t q = g_tq_next++ % NTQ; vkCmdResetQueryPool(vks_cb(), g_tqp, 2 * q, 2); vkCmdWriteTimestamp2(vks_cb(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g_tqp, 2 * q); g_sub.tq = (int)q + 1;
+        if (g_rqp) vkCmdResetQueryPool(vks_cb(), g_rqp, RQ_PER * q, RQ_PER); }
+    g_rq_used = 0; g_sub.rsub = g_rep_sub;
 }
 static void split_now(void);
 static void maybe_split(void) {
@@ -2157,7 +2231,7 @@ static void split_now_(void) {   // what is recorded so far goes to the GPU, rec
 }
 void vkr_sub_begin(void) {
     g_split_t = now_ns(); g_split_ms = vkc_int("split_ms", 8);
-    memset(&g_sub, 0, sizeof g_sub); g_memo_sub++;   // the texture / sampler memo starts again with each submission
+    memset(&g_sub, 0, sizeof g_sub); g_memo_sub++; g_rep_sub++;   // the texture / sampler memo starts again with each submission
     P.valid = 0; P.open = 0; P.query = -1; g_last_pipe = VK_NULL_HANDLE; g_nwb = 0; g_nrtrb = 0; ds_forget();
     if (!S) S = rs_get(0);
     { extern int nvn_sub_resuming; g_rc_npend = 0; if (!nvn_sub_resuming) S->render_skip = 0; }   // the rest of a parked submission keeps its queue's render condition
@@ -2278,6 +2352,7 @@ void vkr_frame(uint64_t frame) {
     if (gs > pgs) VKLOG("GPU time up to frame %llu: %.2f ms per frame (%.2f ms per submission, %.1f submissions per frame; timestamps around each submission's replay)",
                         (unsigned long long)frame, (gn - pgn) / 1e6 / (double)(frame - pf), (gn - pgn) / 1e6 / (double)(gs - pgs), (double)(gs - pgs) / (double)(frame - pf));
     pgn = gn; pgs = gs;
+    { static uint64_t rf; if (frame - rf >= 600) { rsz_log(frame, frame - rf); rf = frame; } }
     vkr_stats_t s = g_st; uint64_t df = frame - pf; vkp_stats_t ps; vkp_stats(&ps); uint64_t shl, shf; vksh_stats(&shl, &shf);
     VKLOG("replay up to frame %llu, per frame: %.1f draws (%.1f skipped: no shader %llu, no pipeline %llu, no target %llu in all), %.1f passes, %.1f dispatches, %.1f clears, "
           "%.1f texture copies, %.1f buffer copies / updates / fills, %.1f descriptor sets, %.1f write-backs; %llu graphics + %llu compute pipelines (%.1f ms creating, worst %.1f ms), %llu shaders (%llu unusable)",
@@ -2331,6 +2406,8 @@ int vkr_init(void) {
     vkResetQueryPool(g_vk.dev, R0.qp, 0, NQ);
     VkQueryPoolCreateInfo tci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * NTQ, 0};
     if (g_vk.props.limits.timestampComputeAndGraphics && vkCreateQueryPool(g_vk.dev, &tci, NULL, &g_tqp) == VK_SUCCESS) vkResetQueryPool(g_vk.dev, g_tqp, 0, 2 * NTQ);
+    { VkQueryPoolCreateInfo rci = tci; rci.queryCount = RQ_PER * NTQ;   // the counter reports' stamps
+      if (g_tqp && vkCreateQueryPool(g_vk.dev, &rci, NULL, &g_rqp) == VK_SUCCESS) vkResetQueryPool(g_vk.dev, g_rqp, 0, RQ_PER * NTQ); else g_rqp = VK_NULL_HANDLE; }
     S = rs_get(0);
     const char *e = getenv("NXRT_VK_PASSDUMP"); if (e) { char *end; g_pd_frame = strtoull(e, &end, 0); g_pd_last = *end == '-' ? strtoull(end + 1, NULL, 0) : g_pd_frame; }
     if ((e = getenv("NXRT_VK_TEXDUMP"))) g_td_frame = strtoull(e, NULL, 0);

@@ -1315,7 +1315,7 @@ static int aq_busy(void) { return aq_on() && atomic_load(&g_aq_done) < g_aq_tail
 // (docs/reference/nvn-objects.md "GPU event waits order work across queues"; MIT, (c) seedds), each submission is translated on a fiber of the translation thread: at a
 // wait no recorded signal meets, what is recorded so far is committed and the fiber is left (nvn_aq_park, called by the replay); the thread goes on with the next
 // queued submission of another queue and comes back when a signal that meets the wait has been recorded, or after the wait's time limit. A submission of the same
-// queue, or a present, never overtakes a parked one: the parked one is resumed first. Windows only (fibers); NXRT_AQ_PARK=0: waits are waited out in place, as before
+// queue, or a present, never overtakes a parked one: the parked one is resumed first. Fibers on Windows, ucontext on Linux (host/linux/windows.h); NXRT_AQ_PARK=0: waits are waited out in place, as before
 #if defined(_WIN32) && defined(NXRT_GFX_VK)
 #define AQ_PARK 1
 int vkr_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t v);
@@ -2011,7 +2011,8 @@ NVN(nvnDeviceGetTextureHandle, NVNtextureHandle, const NVNdevice *d, int tex, in
 // Handle for texel fetches only (Monster Hunter Rise): a fetch reads the texture descriptor and no sampler, so the handle is the texture ID with sampler ID 0
 NVN(nvnDeviceGetTexelFetchHandle, NVNtextureHandle, const NVNdevice *d, int tex) { (void)d; return (NVNtextureHandle)(uint64_t)(uint32_t)tex; }
 // Convert the raw 614.4 MHz report to ns on the same guest clock as GetCurrentTimestampInNanoseconds.
-NVN(nvnDeviceGetTimestampInNanoseconds, uint64_t, const NVNdevice *d, const NVNcounterData *c) { (void)d; return nvn_timestamp_to_ns(c->timestamp); }
+// NVN2's report holds nanoseconds, NVN's 614.4 MHz ticks (nxnative, frame-rate.md "NVN2 timestamps are nanoseconds"); with game_dynamic_resolution=0 the reports keep their old form (vk_replay.c)
+NVN(nvnDeviceGetTimestampInNanoseconds, uint64_t, const NVNdevice *d, const NVNcounterData *c) { extern int g_opt_drs; (void)d; return g_opt_drs && dm_sdk_ounce() ? c->timestamp : nvn_timestamp_to_ns(c->timestamp); }
 // Current GPU time (ns): the same clock as the counter timestamps -- the guest clock (guest_ns, nvn_mtl.m gpu_ticks)
 NVN(nvnDeviceGetCurrentTimestampInNanoseconds, uint64_t, const NVNdevice *d) { (void)d; return guest_ns(); }
 NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
