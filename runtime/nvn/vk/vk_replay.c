@@ -223,6 +223,15 @@ static void barrier_all(VkCommandBuffer cb) {
 
 // ---------- GPU writes into pools: copied back to guest memory at completion (vkm_gpu_wrote; transfers cannot be recorded inside a pass) ----------
 static struct { uint64_t a, n, base; } g_wb[256]; static int g_nwb;
+// A range to copy back: one already listed that covers it, or that it follows or precedes without a gap, takes it (Donkey Kong Bananza's 630 terrain chunks a frame
+// each write a 64-byte record and a list, laid one after the other in their pools: a copy, two barriers and a landing each)
+static void wb_add(uint64_t a, uint64_t n) {
+    for (int k = g_nwb - 1; k >= 0; k--) { if (g_wb[k].base) continue;
+        if (a >= g_wb[k].a && a + n <= g_wb[k].a + g_wb[k].n) return;
+        if (a == g_wb[k].a + g_wb[k].n && vkm_room(g_wb[k].a) >= g_wb[k].n + n) { g_wb[k].n += n; g_st.wb_joined++; return; }
+        if (a + n == g_wb[k].a && vkm_room(a) >= g_wb[k].n + n) { g_wb[k].a = a; g_wb[k].n += n; g_st.wb_joined++; return; } }
+    if (g_nwb < 256) { g_wb[g_nwb].a = a; g_wb[g_nwb].n = n; g_wb[g_nwb].base = 0; g_nwb++; }
+}
 static void wb_flush(void) { for (int i = 0; i < g_nwb; i++) { if (g_wb[i].base) vkm_gpu_wrote_base(g_wb[i].a, g_wb[i].n, g_wb[i].base); else vkm_gpu_wrote(g_wb[i].a, g_wb[i].n); g_st.writebacks++; } g_nwb = 0; }
 
 // ---------- Occlusion queries: samples counted from a reset to each report, summed on the CPU when the GPU is done (in submission order) ----------
@@ -882,8 +891,7 @@ static int gmp_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t
 static void gm_writes(int *swrites) {
     g_gm_used = g_gm_frame;
     if (!swrites) return;
-    for (int i = 0; i < g_ngmr; i++) { int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == g_gmr[i].a && g_wb[k].n == g_gmr[i].n;
-        if (!dup && g_nwb < 256) { g_wb[g_nwb].a = g_gmr[i].a; g_wb[g_nwb].n = g_gmr[i].n; g_wb[g_nwb].base = 0; g_nwb++; *swrites = 1; } }
+    for (int i = 0; i < g_ngmr; i++) { wb_add(g_gmr[i].a, g_gmr[i].n); *swrites = 1; }
 }
 static void gm_frame(uint64_t frame) {
     g_gm_frame = frame + 1;
@@ -980,8 +988,7 @@ static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites) {
                     vkCmdCopyBuffer(cb, bb, R0.bounce, 1, &c);   // dispatch's barrier_all orders it before the shader
                     *o = (VkDescriptorBufferInfo){R0.bounce, bo, usz};
                     if (b->rw) { g_bnc[g_nbnc].pool = bb; g_bnc[g_nbnc].poff = oo; g_bnc[g_nbnc].boff = bo; g_bnc[g_nbnc].n = usz; g_nbnc++;
-                        if (swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == usz;
-                                       if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = usz; g_wb[g_nwb].base = 0; g_nwb++; } } }
+                        if (swrites) { *swrites = 1; wb_add(u->addr, usz); } }
                     RED_ONCE(45, "a storage buffer at an address Vulkan cannot bind (%#llx, %#llx bytes, %s; shader %s binding %u): bound through a copy (later ones are not logged)",
                              (unsigned long long)u->addr, (unsigned long long)u->size, b->rw ? "written" : "read only", sh->key, b->binding);
                 }
@@ -989,8 +996,7 @@ static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites) {
                                                                                    (unsigned long long)u->addr, (unsigned long long)u->size, b->rw ? "written" : "read only", sh->key, b->binding);
                 else {
                     *o = (VkDescriptorBufferInfo){bb, oo, usz};
-                    if (b->rw && swrites) { *swrites = 1; int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == u->addr && g_wb[k].n == usz;
-                        if (!dup && g_nwb < 256) { g_wb[g_nwb].a = u->addr; g_wb[g_nwb].n = usz; g_wb[g_nwb].base = 0; g_nwb++; } }
+                    if (b->rw && swrites) { *swrites = 1; wb_add(u->addr, usz); }
                 }
             }
             x->pBufferInfo = o; break; }
@@ -1261,7 +1267,7 @@ static int tf_begin(VkCommandBuffer cb, const vks_xfb *L, uint64_t verts) {
         if (at >= S->tfb[i].size) continue;
         if (len > S->tfb[i].size - at) len = S->tfb[i].size - at;
         g_tf.off[i] = at + len;
-        if (len && g_nwb < 256) { g_wb[g_nwb].a = S->tfb[i].addr + at; g_wb[g_nwb].n = len; g_wb[g_nwb].base = 0; g_nwb++; }
+        if (len) wb_add(S->tfb[i].addr + at, len);
     }
     VKC(VKC_TF_CAPTURE);
     return 1;

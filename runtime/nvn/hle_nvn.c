@@ -1336,6 +1336,7 @@ int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) {
 }
 static uint8_t g_aq_fin[AQ_N];
 #else
+int nvn_sub_resuming;
 int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) { (void)val; (void)mode; (void)v; (void)max_ms; return 0; }
 #endif
 static void aq_op_done(uint64_t seq, int kind) {   // ops are published done in order: one that finished while an earlier one was parked waits for it

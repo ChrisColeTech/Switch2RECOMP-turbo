@@ -282,6 +282,165 @@ Tests: `python -m unittest discover -s tests -p "test_n*.py"` (17), `tests/test_
    descriptor reuse) moves MKW from 57 to a flat 60 and helps DKB the same way; the GPU has two thirds of its time
    free in both.
 
+## 6. Second round (2026-11-17, evening): nxnative as the reference
+
+nxnative (MIT, `D:\Projects\nxnative`) plays the same games on Apple hardware. Its per-game notes and reference documents
+were read against this engine; the comparison is `docs/NXNATIVE_GAP_ANALYSIS.md`. The causes below were all in it.
+
+### Donkey Kong Bananza: what resets the terrain's records
+
+The open question of section 1 ("what the console does so that each frame's list starts at 0 and is drawn once") has its
+answer in nxnative's DKB notes: **gsys's vertex shader `c9a56f796ea4a4cd` (96 points a frame) loads each record's 64-bit
+address from its storage buffer 0 and stores {0, 1, 0, 0, 0} there**: count 0, one instance, before the culling geometry
+shader appends. NVN2's indirect draw draws nothing for instance count 0 and never resets a record (their decoding of the
+driver's macro 40).
+
+Why section 1 did not find it: the store goes through a pointer the shader loaded from memory, so no draw *binds* the
+records for it, and the pass dump listed the shader with one storage buffer. The translator had translated the stores (its
+notes say "traced to no storage buffer: it goes through the memory pool table"), but the reflection named the pool table
+and the write log as storage buffers kept in uniform slot 252, and the replay bound nothing for them: five stores per
+point went nowhere.
+
+Fix (`78ece7b`, `vk_mem.c` "The memory pool table: raw global memory", `vk_replay.c` "Raw global memory: where the stores
+went"; nxnative's design, `docs/reference/shaders.md` "Global memory at an address loaded from memory"):
+
+- the table: every pool mirror that has memory, sorted by guest address, with the mirror's device address minus the guest
+  address as its delta; written again when a pool comes, goes or gets memory;
+- the write log: the guest pages such stores went to, copied out and cleared once a frame; pages seen there are learned
+  and copied back to guest memory with each such draw (77 pages in 6 ranges in the mining tunnel);
+- both buffers are in device memory (in host memory, an Ocarina of Time dispatch with 384 raw loads and stores ran into
+  the GPU's time limit: device lost);
+- `append_reset` (the rule of section 1) is off by default; `gamectl set append_reset 1` brings it back.
+
+Limits: a raw *load* reads the pool mirror, which is current only where the replay has used the pool (nxnative's memory is
+the game's own). The translator here is older than nxnative's chain: no pointer sites, a table of 4,096 ranges.
+
+### Donkey Kong Bananza: the two queues
+
+`hle_nvn.c` "Submissions parked at a GPU event wait" (`362b172`): every submission is translated on a fiber of the
+translation thread. At an event wait no recorded signal meets, what is recorded so far is committed and the fiber is left;
+the thread goes on with the next queued submission of another queue and comes back when a signal that meets the wait has
+been recorded. A present, or the same queue's next submission, never overtakes a parked one. In the tunnel: 11,348 waits met
+by the other queue's commands in 155 s, none unmet, none forced; the "not met in 250 ms" line is gone. The second queue's
+depth-sampling dispatch now runs between the main queue's pre-pass and its shading. Windows only (fibers); `NXRT_AQ_PARK=0`.
+
+### Donkey Kong Bananza: frame rate
+
+Same scripted run (title, Continue, walk, punch, walk), window 100-150 s, console session at 60 Hz:
+
+| | before (`-180124-final-dkb`) | now (`{DKBRUN}`) |
+|---|---|---|
+| FPS mean | 36.9 (39.6 with nothing beside it) | {DKBFPS} |
+| present interval p50 / p95 / p99 | 25.1 / 32.9 / 89.7 ms | {DKBINT} |
+| terrain: black cells of 64 in the five gameplay screenshots | 1, 0, 0 | {DKBCELLS} |
+| `append_counter_reset` a second | about 25,000 | 0 |
+
+Where the frame goes now (`-201836-dkb-park`, `SWR_HOST_PROF=100,25`): the translation thread is busy 67 % of the time
+(15.5 ms a frame) and waits for work the rest; the game's threads use 1.2 cores in all (busiest 29 %) and spend 12 ms a frame
+in `SyncWait`. The frame is serial: the game's frame, its translation, the GPU, the landing of the write-backs, then the
+fence the game waits for. Of the translation thread's busy time the Vulkan driver is 29 % (descriptor sets, barriers,
+copies), and what the 630 terrain chunks' write-backs cost is about a quarter: each chunk's 64-byte record and 15,000-byte
+list are copied back to guest memory every frame (two barriers and a copy each, a page copy aside when the write is
+recorded, a compare when it lands, and the page sent to the device again after it landed), although the CPU never reads
+them. nxnative has no such copies (its memory is the game's). `wb_add` now joins ranges that follow each other, which
+takes most of the per-range cost; the per-page cost stays.
+
+**Open, and the next step for 60 FPS**: write-back on demand. A draw-stage storage buffer the CPU has not touched for some
+frames stops being copied back; its guest pages are made inaccessible, and the first CPU access brings the device's bytes
+in (drain, read back, back to eager copies for that page). That removes about 10 MB a frame of copies in each direction
+from both threads.
+
+### Pokemon Legends Z-A: the black world
+
+The lighting was not the cause. The frame's last passes (pass dump of `-174922-plza-td`): pass 69313 draws
+`vs=b29f08619f379a83 inst=32` into a 32x32 target, and pass 69314 tone-maps the lit frame through a 32x32x32 texture. That
+is the colour grading table: one instance per plane, the vertex shader writing the layer (built-in 9 in its reflection).
+`pass_begin` began every pass with `layerCount` 1, so plane 0 was written and 31 planes stayed black: the tone mapping
+multiplied the world by black, and the UI, drawn after it, was fine. nxnative's Z-A notes have the same finding ("a black
+world once the opening reached Lumiose"). Fix: a pass has as many layers as every attachment's view holds (`78ece7b`).
+
+Also for Z-A, in the same commit:
+
+- **Transform feedback**: `vksh_xfb_layout` reads what the program captures from its control section (strides at +0x6dc,
+  per-buffer output counts at +0x6e8, buffer count at +0x6ec, locations at +0xdc + 0x80 b, component counts at
+  +0x4dc + 0x80 b: nxnative's `tf_layout`); `vksh_xfb_variant` gives each captured output a variable of its own with as
+  many components as the layout names (the translator's outputs are vec4s; Z-A captures xyz of location 0 and x of
+  locations 1 and 2, strides 12/4/4) and stores it at each return; `tf_begin` / `tf_end` bind the feedback buffers and
+  wrap each draw in `vkCmdBegin/EndTransformFeedbackEXT`; the captured bytes are copied back like any GPU write. 116 captures
+  a frame in the station; the characters are there. `gamectl set xfb 0` turns it off.
+- **Cube views of 2D arrays**: square arrays of six layers or more are created cube compatible, and a cube view of one
+  is a cube view (the 64x64x6 and 128x128x6 environment maps). 32x32 placeholders with fewer layers are still viewed as
+  arrays (eight `[RED]` lines; nxnative binds a zero cube there).
+
+Result (`-193450-plza-layer`): title, A, the station with its people, lit; near-black 1.0 %, 0 black cells of 64 in all
+five gameplay screenshots (98 % near-black before, `-174600-plza-play2`); 30.0 FPS, the game's own interval 2
+(present interval p50 33.3 / p95 34.0 / p99 34.3 ms); 23,900 draws and 3,480 captures a second, none skipped.
+
+### Ocarina of Time: from svcBreak at 1.6 s to the title screen
+
+Seven stops, each found from the log's stack and fixed; the first two and the fifth are in nxnative's notes:
+
+| at | stop | cause | fix |
+|---|---|---|---|
+| 1.6 s | abort in `pthread_mutex_lock` under the SDK allocator's first lock | SDK 22's `InternalCriticalSection` compares a mutex's owner with the thread ID at ThreadLocalRegion+0x110; 0 there equals an unlocked mutex's owner | `kernel.c` `kthread_create` writes the ID (nxnative, threads.md) |
+| 5.4 s | abort in `nn::os::WaitForAddress(const void*, long long)` (InvalidEnumValue) | `WaitForAddress` type 3, WaitIfEqual64 | `kernel.c` `svc_wait_addr` |
+| 5.3 s | abort with a socket result | `bsd` command 36 (a registration newer SDKs make first) answered "-1, errno" | `svc_core.c` `bsd_disp`: success |
+| 5.3 s | `abort()` in gRPC's start-up (the game links `nn::npln`) | `EventFd` failed: no wake-up descriptor | `svc_core.c` `bsd_evfd`: event descriptors with Write, Read, Poll, Close (nxnative, services.md) |
+| 5.3 s / 10.3 s | `std::chrono::system_clock::now()` throws | `clock_gettime(CLOCK_REALTIME)` reads the time service's shared page; the ContinuousAdjustmentTimePoint entries there are 0x38 bytes with the clock source ID at +0x28 (read from the SDK's code), not 0x48 | `svc_core.c` `time_shm_update` |
+| 7.7 s | abort in `InitializeAv1DecoderByTransferMemory` | the title movie is AV1; the video service refused it | `svc_ns2.c`: AV1 is accepted and every packet gives a black picture (`vdec_blank`). **There is no AV1 decoder yet** |
+| 13.5 s | device lost in a dispatch of `d15370a382630d4e` (384 raw loads, 384 raw stores) | the pool table and the write log were in host memory | device memory (above) |
+
+Result (`-201542-zelda-vram`): the title screen with its logo and menu ("New Game", "Options"), 2,700 frames in 108 s
+with no abort, crash or device loss. The picture behind the logo is black (the AV1 movie). Open: an AV1 decoder; 26.7 FPS
+at the title; what nxnative lists for the game itself (task and mesh shader culling through raw loads, 4,170 pool ranges
+against the table's 4,096, texture rewrites: turned on for this title, not yet seen working).
+
+### Other changes of this round
+
+- **The system tick of a Switch 2 program is 31.25 MHz** (`main.c`; nxnative, frame-rate.md). Every span a Switch 2 game
+  measured in ticks was 0.6144 of its length before.
+- The completion thread is woken by a submission instead of sleeping a millisecond (`vk_submit.c`).
+- `game_profile.h`: `tex_flush_upload` / `tex_dirty_upload` by title (Ocarina of Time, Tears of the Kingdom).
+
+### Mario Kart World
+
+Compared with nxnative's notes (frame-rate.md, the game's README): its remaining long frames are the same two kinds as
+here, pipelines compiled at first use and texture streaming, and its answers are Metal's (pipeline archives, placement
+sparse textures); this engine already has a pipeline manifest with prewarm and sparse textures with shared tiles. Nothing
+of this round was aimed at them. What changed for the game is the system tick (31.25 MHz) and the completion thread's
+wake-up. Same scripted run as section 2, window 150-185 s:
+
+| | section 2 (`-173453-mkw-perf3`) | now (`-202635-mkw-nx`) |
+|---|---|---|
+| FPS mean (metrics) | 57.3 | 58.6 |
+| seconds at 58 FPS or more | 25 of 35 | 32 of 36 |
+| present interval p50 / p95 / p99 | 16.68 / 18.05 / 27.31 ms | 16.67 / 17.66 / 25.98 ms |
+| intervals over 20 ms / over 33 ms | 41 / 12 | 33 / 18 |
+
+The race is at the same point after the same script (lap 1 of 3, 24th, 8 coins against 7), so the game's speed did not
+change with the tick. No black areas (near-black 0.0-3.7 % in the twelve screenshots, 0 black cells). **Open, unchanged**:
+single long frames (the longest in the window 168 ms) from streaming and first-use pipelines. The window's one cluster
+(frames 8866-8875: 64, 119, 154, 168, 159 ms) is texture streaming, not pipelines: `frames.csv`'s cumulative `texture`
+and `astc` columns move by 50-90 ms in each of those frames and `pipeline` not at all, with the translation thread's CPU
+time at 150-250 ms a frame. A burst of new ASTC textures is transcoded and uploaded on the translation thread at first
+use; a per-frame budget for that work (drawing a frame or two with what is already there) is the next step.
+
+### Regression checks of this round
+
+{REG}
+
+### Switches added
+
+| switch | what |
+|---|---|
+| `gamectl set append_reset 1` (`NXRT_VK_APPEND_RESET=1`) | section 1's rule again (off now) |
+| `gamectl set xfb 0` (`NXRT_VK_XFB=0`) | no transform feedback captures |
+| `NXRT_AQ_PARK=0` | event waits waited out in place, submissions replayed whole |
+| `NXRT_VK_COMPLETION_SLEEP=1` | the completion thread's 1 ms sleep |
+| `SWR_TICK_HZ=<Hz>` | the system tick's rate |
+| `NXRT_TEX_REWRITE=0/1` | textures the CPU rewrites after creating them, read again or not |
+| metrics columns `gmem_pages_learned`, `tf_captures` | pages learned from the raw global memory log; transform feedback captures |
+
 ## Instrumentation and switches added in this round
 
 | switch | what |
