@@ -962,6 +962,8 @@ static SvcObj* hwopus_open(u32 rate, u32 ch, const u8* ms, int ex){
   else { static int said; if(said<2){ said++; LOG("audio: opus decoder %uHz, %u channels%s\n",h->rate,h->ch,ms? " (multistream)" : ""); } }
 #else
   (void)ex;
+  { static int said; if(!said){ said=1; LOG("audio: this runtime was built without libopus (runtime/opus/<win|lin>/libopus.a): Opus sound (movies, streamed music) is silent
+"); } }
 #endif
   return o; }
 

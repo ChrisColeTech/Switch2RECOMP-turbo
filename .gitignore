@@ -7,6 +7,8 @@ build/
 !runtime/vp9/lin/libvpx.a
 !runtime/av1/win/libdav1d.a
 !runtime/av1/lin/libdav1d.a
+!runtime/opus/win/libopus.a
+!runtime/opus/lin/libopus.a
 *.exe
 *.dll
 *.so
