@@ -328,9 +328,12 @@ void ini_set(const char* k, const char* v){ ini_store(k,v); g_ini_dirty=1; }
 /* settings_version: what an ini written by an older runtime gets changed once. Before 2 the ini held docked=0 as the
    written-out default (handheld: every game drew for the console's small screen and looked soft on a monitor): TV mode
    is the default now, and an ini from before is moved to it once. Setting docked=0 afterwards stays. The same for
-   game_dynamic_resolution=0, the old written-out default: auto now (the counter reports carry the GPU's real times) */
+   game_dynamic_resolution=0, the old written-out default, before 3: auto now (the counter reports carry the GPU's real
+   times). The launcher's screen mode choice writes version 2 into an ini that has none: docked is then the player's */
 void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path);
-  if(atoi(ini_get("settings_version","0"))<2){ ini_store("docked","1"); g_opt_docked=1; ini_store("game_dynamic_resolution","auto"); g_opt_drs=-1; ini_store("settings_version","2"); }
+  { int v=atoi(ini_get("settings_version","0"));
+    if(v<2){ ini_store("docked","1"); g_opt_docked=1; }
+    if(v<3){ ini_store("game_dynamic_resolution","auto"); g_opt_drs=-1; ini_store("settings_version","3"); } }
   ini_write(); }
 
 /* ini edited while running: reload and apply what we can live */
