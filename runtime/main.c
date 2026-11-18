@@ -450,7 +450,7 @@ int swr_main(int argc, char** argv){
   split_path(argv[0]);
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename); ini_open(ini);
-  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
+  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; ini_apply(ini_norm(k),e+1); } }   /* --key=value: any ini option for this run only, the ini is not written */
   { extern int plat_identity_early(void); plat_identity_early(); }   /* before anything can land in the game's address range */
   snprintf(g_datadir,sizeof g_datadir,"%s%s_data/",g_exedir,g_exename);
   snprintf(g_hints_path,sizeof g_hints_path,"%s%s.hints",g_exedir,g_exename);
