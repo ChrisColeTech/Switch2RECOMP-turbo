@@ -122,14 +122,15 @@ dlc: 0100152000023001 read 1200 +5        version.txt
 dlc: 0100152000023001 read 200 +1000      contents.dat
 ```
 
-| Data folder | Result |
-|---|---|
-| no manifest | as before: 12 cups, no Booster Course Pass |
-| title listed, empty RomFS (`stub`) | the title screen comes up, then L+R leads to the loading screen and stays there (probed for 60 s). The game reads the tables, finds neither file, and never finishes entering the menu. A license without its data is worse than no DLC. |
-| title listed, real RomFS | the main menu's shop icon carries a check mark, cup select has the second page with the 12 Booster Course Pass cups, and Golden Dash Cup starts Paris Promenade (`Course/Cnsw_11`), which loads, renders and drives |
+| Data folder | Result | Run |
+|---|---|---|
+| no manifest | as before (`ListAddOnContent ... -> 0`). The game lists the 12 Booster Course Pass cups on the second cup page for everyone, but choosing one shows "You can play the new cups by purchasing the Booster Course Pass..." and returns to cup select. The main menu's shop icon has no check mark. | `20261118-010020-mk8d-no-dlc` (`0004`, `0012`, `0013`) |
+| title listed, empty RomFS (`stub`) | the title screen comes up, then L+R leads to the loading screen and stays there (a minute, until the run was stopped). The game reads the tables, finds neither file, and never finishes entering the menu. A license without its data is worse than no DLC. | `20261118-002506-mk8d-dlc-stub` |
+| title listed, real RomFS | the main menu's shop icon carries a check mark, Golden Dash Cup asks "Start Grand Prix?" and starts Paris Promenade (`Course/Cnsw_11`), which loads, renders and drives (56 FPS over the run, 3rd place under the Eiffel Tower) | `20261118-010258-mk8d-dlc-bcp` (`0002`, `0010`, `0011`, `0014`, `0015`) |
 
-Runs with the harness (`tools/plza_probe.py`), real build folder: `20261118-002506-mk8d-dlc-stub` and
-`20261118-002837-mk8d-dlc-folder`; the final ones are listed in RecompLauncher's `docs/DLC_IN_PLACE.md`.
+The runs are harness runs (`tools/plza_probe.py`) on the real build folder, rebuilt through the CLI first; the last
+one has the DLC installed by the launcher from the standalone package. The first probe with real data
+(`20261118-002837-mk8d-dlc-folder`) used a hand-filled `romfs/` folder. Evidence: `build/evidence/dlc/`.
 
 ## 6. Tests
 
