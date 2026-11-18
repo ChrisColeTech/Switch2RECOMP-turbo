@@ -888,10 +888,10 @@ static void prefetch_add(const tex_t *t) {
     ReleaseSRWLockExclusive(&g_pf_lk); WakeConditionVariable(&g_pf_cv);
 }
 // 1: the texture's storage is new to the set, so its next resolve makes an image with storage use (the registrations' generation moves: memoized views go)
-// Off unless NXRT_VK_IMAGE_NOFLAG=1 (gamectl set image_noflag 1): the network's kernels do not compute its picture yet (its first image holds zeros, its last one noise;
-// its tensors go through raw global memory), and noise behind the title is worse than the black the lost writes leave. To be turned on with the network (docs/AV1_DECODER.md)
+// On (NXRT_VK_IMAGE_NOFLAG=0, or gamectl set image_noflag 0, turns it off: such writes are lost again). It was off while Ocarina of Time's movie network gave noise; the
+// cause was the push constants (vk_replay.c: c[24] as a driver bank) and the network's last kernels, which the host now runs itself (vk_replay.c ndve_host)
 int vkt_want_image(const tex_t *t) {
-    { static int on = -1; if (on < 0) on = vkc_int("image_noflag", 0); if (!on) return 0; }
+    { static int on = -1; if (on < 0) on = vkc_int("image_noflag", 1); if (!on) return 0; }
     if (!t || !t->mem || (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) || t->d.target == NVN_TEXTURE_TARGET_BUFFER || vkf_is_compressed(t->d.format)) return 0;
     const vkf_info *fi = vkf_get(t->d.format); if (!fi || (fi->flags & (VKF_DEPTH | VKF_STENCIL)) || storage_format(fi) == VK_FORMAT_UNDEFINED) return 0;
     uint64_t k = (uint64_t)(uintptr_t)t->mem;

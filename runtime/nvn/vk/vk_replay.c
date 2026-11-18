@@ -1046,7 +1046,10 @@ static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites) {
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
             VkDescriptorBufferInfo *o = &bi[nw]; *o = (VkDescriptorBufferInfo){R0.zero, 0, ZERO_SIZE};
             if (b->kind == VKB_SUPPORT) *o = (VkDescriptorBufferInfo){R0.support, 0, SUPPORT_SIZE};
-            else if (b->kind == VKB_CBUF && b->reg == DMSH_PUSH_BANK - 3) {
+            // c[24], the NVN2 push constants. The reflection names the bank two ways: a constant buffer in slot 21, or (compute shaders whose own c0 layout starts with
+            // the pushed bytes: nn::ndve's colour conversion and resampler) a driver bank 24. The second was bound to zeros: Ocarina of Time's movie pictures
+            // were converted with a zero matrix, black with alpha 1 (nxnative, nvn_refl.m: NVN_RB_PUSH)
+            else if ((b->kind == VKB_CBUF && b->reg == DMSH_PUSH_BANK - 3) || (b->kind == VKB_DRV && b->bank == DMSH_PUSH_BANK)) {
                 VkBuffer ab; VkDeviceSize ao; uint8_t *d = arena(DMSH_PUSH_SIZE, g_vk.props.limits.minUniformBufferOffsetAlignment, &ab, &ao);
                 if (d) { memcpy(d, S->push[st == 5], DMSH_PUSH_SIZE); *o = (VkDescriptorBufferInfo){ab, ao, DMSH_PUSH_SIZE}; }
             }
@@ -1683,10 +1686,58 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (g_nwb >= 240) pass_end();   // the write-back list is nearly full: record the copies now
 }
 
+// ---------- nn::ndve's movie network by the host ----------
+// A Switch 2 movie (Ocarina of Time's title and opening, AV1 1920x1080) goes from the decoder's planes to the screen through nn::ndve's model
+// (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat), 14 compute dispatches a frame: the colour conversion (49dff010) into an RGBA8 picture, a U-Net of eleven convolutions on tensors of
+// 960x540x16 half floats (ba079f68 packs the picture, 5a7d69b0 adds the last convolution to it, into an RGB10A2 picture), and a 4/3 resampler (4f41ccf2) into the
+// 2560x1440 texture the game draws. nxnative runs the network as kernels of its own (docs/reference/shaders.md "The NDVE movie network by the host", MIT, (c) seedds);
+// the recognition by the model's shader keys is from there. Here the translated convolutions write their tensors through raw global memory (52 MB a frame copied back to
+// guest memory and uploaded again: the title ran at 27 FPS, so its 60-picture movie at half speed) and the translated resampler gives garbage (its warp shuffles over
+// shared memory need the newer translator). So the host takes the model's place with what it surely computes: the convolutions are skipped, the picture is copied where
+// the last one would have added its correction, and the resampler is a linear blit. What is lost is the network's correction (a learned sharpening of the decoded
+// picture), not the picture. NXRT_VK_NDVE=0 (gamectl set ndve 0) runs the game's dispatches as they are.
+static VkImageLayout xfer_in(VkCommandBuffer cb, vkt_image *im, int dst);
+static void xfer_out(VkCommandBuffer cb, vkt_image *im, VkImageLayout l);
+static int ndve_kind(const char *key) {   // 1: a convolution (skipped), 2: the picture + correction (a copy), 3: the resampler (a linear blit)
+    static const char *conv[] = {"ba079f68ae288dba", "a8b4fb48fee0ccf8", "e2eebd7ba18fe35f", "e6be82d835fbe4d3", "9442573ee4ace011", "0a56002cdc7e1fce", "d15370a382630d4e", "7f7ff0f36b54d90f"};
+    if (key[0] == '5' && !strcmp(key, "5a7d69b067a7f011")) return 2;
+    if (key[0] == '4' && !strcmp(key, "4f41ccf24f163e0d")) return 3;
+    for (unsigned i = 0; i < sizeof conv / sizeof *conv; i++) if (!strcmp(key, conv[i])) return 1;
+    return 0;
+}
+static vkt_image *ndve_image(const vks_shader *cs, int kind) {   // the first texture (kind VKB_TEX) or image (VKB_IMG) the kernel binds
+    for (int i = 0; i < cs->nb; i++) { const vks_bind *b = &cs->b[i]; if (b->kind != kind || b->reg < 0 || b->reg >= 32) continue;
+        uint64_t h = kind == VKB_IMG ? S->img[5][b->reg] : tex_slot_h(5, (unsigned)b->reg); vkt_reg r; int tid = (int)(h & 0xfffff);
+        if (tid <= 0 || !vkt_reg_copy(tid, &r) || r.gone) return NULL;
+        vkt_image *im = vkt_resolve(&r.t);
+        if (im && kind == VKB_IMG) { { void nvn_pool_gpu_written(const void *pool); nvn_pool_gpu_written(r.t.pool); }
+            if (!(im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && vkt_want_image(&r.t)) im = vkt_resolve(&r.t); }   // as img_view: the image the game's kernel would have written (an sRGB texture in its UNORM twin)
+        return im; }
+    return NULL;
+}
+static int ndve_host(const vks_shader *cs) {   // 1: the dispatch is done (or dropped) here
+    int kind = ndve_kind(cs->key); if (!kind || !vkc_int("ndve", 1)) return 0;
+    static int said; if (!said) { said = 1; VKLOG("movie network (nn::ndve): the host converts and scales the pictures itself, the model's convolutions are skipped (NXRT_VK_NDVE=0: the game's dispatches)"); }
+    g_st.ndve++;
+    if (kind == 1) { PD("dispatch cs=%s: nn::ndve convolution, skipped (the host's movie path)", cs->key); return 1; }
+    vkt_image *s = ndve_image(cs, VKB_TEX), *d = ndve_image(cs, VKB_IMG);
+    if (!s || !d || s == d || s->samples != 1 || d->samples != 1) { RED_ONCE(96, "movie network: the picture or its destination of kernel %s is not there: the game's dispatch runs", cs->key); return 0; }
+    pass_end();
+    VkCommandBuffer cb = vks_cb(); barrier_all(cb);
+    VkImageLayout ls = xfer_in(cb, s, 0), ld = xfer_in(cb, d, 1);
+    VkImageBlit r = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)s->w, (int32_t)s->h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)d->w, (int32_t)d->h, 1}}};
+    vkCmdBlitImage(cb, s->img, ls, d->img, ld, 1, &r, s->w == d->w && s->h == d->h ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    xfer_out(cb, d, ld); xfer_out(cb, s, ls);
+    d->content = 1; td_note(d);
+    PD("dispatch cs=%s: nn::ndve %s by the host, ser%llu %ux%u -> ser%llu %ux%u", cs->key, kind == 2 ? "picture" : "resampler", (unsigned long long)s->serial, s->w, s->h, (unsigned long long)d->serial, d->w, d->h);
+    return 1;
+}
+
 // ---------- Compute (nvn_mtl.m dispatch) ----------
 static void dispatch(const p_dispatch *dp) {
     const vks_shader *cs = S->cprog ? prog_stage(S->cprog, VKS_CS) : NULL;
     if (!cs) { g_st.skip_no_shader++; skip_why(S->cprog, VKS_CS, "a dispatch"); return; }
+    if (ndve_host(cs)) return;
     VkPipelineLayout layout; VkPipeline pipe = vkp_compute(cs, &layout);
     if (!pipe) return;
     pass_end();

@@ -177,7 +177,7 @@ def native_stacks(pid, out):
     atomic(out, '\n'.join(lines) + '\n')
 
 
-def ctl(command):
+def ctl(command, pid):
     """one command on the runtime's control pipe (runtime/nvn/vk/vk_ctl.c), its reply; errors come back as text"""
     k = ctypes.WinDLL('kernel32', use_last_error=True)
     k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
@@ -186,7 +186,7 @@ def ctl(command):
     k.CloseHandle.argtypes = [wintypes.HANDLE]
     end = time.monotonic() + 5
     while True:
-        h = k.CreateFileW(r'\\.\pipe\swr_ctl', 0xC0000000, 0, None, 3, 0, None)   # GENERIC_READ|WRITE, OPEN_EXISTING
+        h = k.CreateFileW(rf'\\.\pipe\swr_ctl_{pid}', 0xC0000000, 0, None, 3, 0, None)   # GENERIC_READ|WRITE, OPEN_EXISTING
         if h and h != wintypes.HANDLE(-1).value: break
         if time.monotonic() > end: return f'control pipe not available (error {ctypes.get_last_error()})'
         time.sleep(.2)
@@ -197,6 +197,30 @@ def ctl(command):
         while k.ReadFile(h, buf, len(buf), ctypes.byref(n), None) and n.value: out += buf.raw[:n.value]
         return out.decode(errors='replace')
     finally: k.CloseHandle(h)
+
+
+def launcher_env(env):
+    """the environment RecompLauncher gives a game (library.cpp Toolchain::environment), from its library.json"""
+    lib = Path(os.environ.get('LOCALAPPDATA', '')) / 'RecompLauncher/RecompLauncher/library.json'
+    root = Path(json.loads(lib.read_text(encoding='utf-8')).get('toolRoot', '')) if lib.is_file() else ROOT
+    roots = [root, root.parent, root.parent.parent]
+    def tool(names):
+        for r in roots:
+            for n in names:
+                if (r / n).is_file(): return r / n
+        return None
+    python = tool(['.venv/Scripts/python.exe', 'venv/Scripts/python.exe', 'python/python.exe']) or Path(sys.executable)
+    gcc = tool(['gcc/Library/bin/x86_64-w64-mingw32-gcc.exe', 'third_party/gcc/Library/bin/x86_64-w64-mingw32-gcc.exe', 'gcc/bin/gcc.exe'])
+    dotnet = tool(['dotnet/dotnet.exe']) or (Path(shutil.which('dotnet')) if shutil.which('dotnet') else None)
+    paths = [str(r / 'bin/launcher') for r in roots if (r / 'bin/launcher').is_dir()][:1]
+    paths += [str(x.parent) for x in (python, gcc, dotnet) if x]
+    env = dict(env, PATH=os.pathsep.join(paths + [env.get('PATH', '')]), SWR_PYTHON=python.as_posix())
+    if dotnet: env['DOTNET_ROOT'] = str(dotnet.parent)
+    keys = lib.parent / 'keys/prod.keys'
+    if keys.is_file(): env['SWR_PROD_KEYS'] = str(keys)
+    for r in roots:
+        if (r / 'shader-tools/Library/bin').is_dir(): env['NXSHADER_TOOLS'] = str(r / 'shader-tools/Library/bin'); break
+    return env
 
 
 def worker(run):
@@ -211,8 +235,10 @@ def worker(run):
                SWR_INPUT_REPLAY=str(run / 'replay.txt'))
     if config.get('metrics'): env['SWR_METRICS'] = str(run / 'metrics.csv'); env['SWR_FRAME_CSV'] = str(run / 'frames.csv')
     if config.get('record'): env['SWR_INPUT_RECORD'] = str(run / 'input-record.txt')
+    if config.get('as_launcher'): env = launcher_env(env)
     env.update(config['env'])
-    args = [str(exe), '--fullscreen=0'] + [f'--{x}' for x in config.get('options', [])] + (['-v'] if config['verbose'] else [])
+    # --as-launcher: what RecompLauncher's Play does (window.cpp play()): the exe alone, in its folder, the ini as it is
+    args = [str(exe)] + ([] if config.get('as_launcher') else ['--fullscreen=0']) + [f'--{x}' for x in config.get('options', [])] + (['-v'] if config['verbose'] else [])
     proc = subprocess.Popen(args, cwd=exe.parent, env=env, stdout=(run / 'stdout.log').open('wb'), stderr=subprocess.STDOUT)
     started = time.time(); start = time.monotonic(); deadline = start + config['seconds']
     atomic(run / 'session.json', json.dumps(dict(pid=proc.pid, started=started, args=args)))
@@ -280,7 +306,7 @@ def worker(run):
                     next_shot = time.monotonic() + config['shot_every']
                     continue
                 if action == 'ctl':
-                    reply = ctl(request['ctl'])
+                    reply = ctl(request['ctl'], game_pid(exe, proc, started))
                     record(ctl=request['ctl'], reply=reply.strip()[:2000])
                     time.sleep(request['settle'])
                     image = shot('ctl-' + re.sub(r'[^A-Za-z0-9]+', '_', request['ctl'])[:40])
@@ -341,6 +367,7 @@ def main():
     p.add_argument('--record', action='store_true', help='SWR_INPUT_RECORD: the pad as played, in input-record.txt (replayable)')
     p.add_argument('--option', action='append', default=[], help='KEY=VALUE: an ini option for this run only, e.g. docked=1 (passed as --KEY=VALUE, the ini is not touched)')
     p.add_argument('--wait', action='store_true', help='block until the run ends, then print the report')
+    p.add_argument('--as-launcher', action='store_true', help="start the game as RecompLauncher's Play does: no arguments (so the ini's fullscreen holds), the launcher's environment")
     p = sub.add_parser('worker'); p.add_argument('run', type=Path)
     p = sub.add_parser('report'); p.add_argument('run', type=Path)
     p = sub.add_parser('action'); p.add_argument('run', type=Path); p.add_argument('action', choices=[*BUTTONS, 'shot', 'ctl', 'replay', 'stop'])
@@ -358,7 +385,7 @@ def main():
         run = RUNS / (time.strftime('%Y%m%d-%H%M%S-') + a.label); run.mkdir()
         env = dict(x.split('=', 1) for x in a.env)
         atomic(run / 'config.json', json.dumps(dict(game=str(Path(a.game).resolve()), seconds=a.seconds, env=env,
-               shot_every=a.shot_every, options=a.option, verbose=a.verbose, stacks=a.stacks, metrics=a.metrics, record=a.record), indent=2))
+               shot_every=a.shot_every, options=a.option, as_launcher=a.as_launcher, verbose=a.verbose, stacks=a.stacks, metrics=a.metrics, record=a.record), indent=2))
         w = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', str(run)],
                              stdout=(run / 'harness.log').open('wb'), stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
         print(run, flush=True)

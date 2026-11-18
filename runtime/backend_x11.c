@@ -116,6 +116,10 @@ static void set_fullscreen(int on){
   XSendEvent(dpy,DefaultRootWindow(dpy),False,SubstructureRedirectMask|SubstructureNotifyMask,&e);
   if(on) XDefineCursor(dpy,win,g_blank); else XUndefineCursor(dpy,win);
   XFlush(dpy); g_fullscreen=on; }
+/* F11 / Alt+Enter: the player's choice is kept in the ini, so the next start opens the same way (it used to be forgotten:
+   the ini kept fullscreen=1 and every launch was fullscreen again). The controls window and the start go through
+   set_fullscreen and are not choices */
+static void toggle_fullscreen(void){ extern void ini_set(const char*,const char*); set_fullscreen(!g_fullscreen); ini_set("fullscreen",g_fullscreen?"1":"0"); }
 
 static void set_title(const char* t){ XStoreName(dpy,win,t); XFlush(dpy); }
 
@@ -225,10 +229,10 @@ static int key_once(KeySym k, int down){
 static void key_down(XKeyEvent* e){
   KeySym k=XLookupKeysym(e,0);
   int once=key_once(k,1);
-  if(k==XK_Return && (e->state&Mod1Mask)){ if(once) set_fullscreen(!g_fullscreen); return; }
+  if(k==XK_Return && (e->state&Mod1Mask)){ if(once) toggle_fullscreen(); return; }
   switch(k){
     case XK_Escape: g_quit=1; return;
-    case XK_F11: if(once) set_fullscreen(!g_fullscreen); return;
+    case XK_F11: if(once) toggle_fullscreen(); return;
     case XK_F1: if(once){ LOG("%s\n",HELP); plat_message(HELP,0,0); } return;
     case XK_F3: if(once) g_shot_req=1; return;
     case XK_F7: if(once) LOG("F7 video recording is only available on Windows\n"); return;

@@ -63,6 +63,12 @@ jobs:
           $env:PATH = "$pwd\gcc\Library\bin;$env:PATH"
           python tests/test_av1.py
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Opus decoder (committed libopus, a tone)
+        shell: pwsh
+        run: |
+          $env:PATH = "$pwd\gcc\Library\bin;$env:PATH"
+          python tests/test_opus.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: NVN archive and Windows runtime
         shell: pwsh
         run: |
@@ -74,7 +80,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Runtime links VP9, AV1, NVN telemetry and Sony HID
         run: |
-          python -c "import sys; d = open('bin/runtime_win64_win32.exe', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'dav1d %s decoding AV1', b'Error parsing OBU data', b'frame telemetry:', b'hid.dll', b'setupapi.dll', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
+          python -c "import sys; d = open('bin/runtime_win64_win32.exe', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'dav1d %s decoding AV1', b'Error parsing OBU data', b'audio: opus decoder %uHz', b'frame telemetry:', b'hid.dll', b'setupapi.dll', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -105,13 +111,16 @@ jobs:
         run: LD_LIBRARY_PATH="$PWD/lib" sh tests/run_audio.sh
       - name: AV1 decoder (committed dav1d, synthetic streams)
         run: python tests/test_av1.py
+      - name: Opus decoder (committed libopus, a tone)
+        run: python tests/test_opus.py
       - name: NVN archive and Linux runtime
         run: |
           python tools/build_nvn.py --linux --jobs 4
           test -s build/nvn_lin/libnvn.a
           test -s runtime/vp9/lin/libvpx.a
           test -s runtime/av1/lin/libdav1d.a
+          test -s runtime/opus/lin/libopus.a
           python switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
       - name: Runtime links VP9, AV1 and NVN telemetry
         run: |
-          python -c "import sys; d = open('bin/runtime_linux_x11', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'dav1d %s decoding AV1', b'Error parsing OBU data', b'frame telemetry:', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"
+          python -c "import sys; d = open('bin/runtime_linux_x11', 'rb').read(); m = [x for x in (b'WebM Project VP9 Decoder', b'dav1d %s decoding AV1', b'Error parsing OBU data', b'audio: opus decoder %uHz', b'frame telemetry:', b'SwitchRecomp runtime ABI 2\0') if x not in d]; sys.exit('missing: %r' % m if m else 0)"

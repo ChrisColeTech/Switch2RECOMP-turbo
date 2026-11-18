@@ -528,7 +528,7 @@ int swr_main(int argc, char** argv){
         LOG("warning: %d s without a new image (frames=%d, GPU submits=%llu)\n",sec,g_frames,(unsigned long long)g_gpu_submits); kernel_dump_threads_stall(); } }
     next+=16666667ull; u64 now=plat_ns(); if(next>now) plat_sleep_ns((i64)(next-now)); else if(now-next>100000000ull) next=now;
   }
-  save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } LOG("Exit.\n"); fflush(NULL);
+  save_hints(); if(g_ini_dirty){ g_ini_dirty=0; ini_write(); }  /* a setting changed in the last second (F11, then Esc) */ { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } LOG("Exit.\n"); fflush(NULL);
 #if defined(_WIN32)
   TerminateProcess(GetCurrentProcess(),0);   /* don't join the guest threads */
 #endif
@@ -620,6 +620,14 @@ int audren_update(SvcObj* o, IpcCtx* c){
        buffer is never touched */
     for(u32 i=0;i<nvoices;i++){ continuation[i*vstride+8]=0; continuation[i*vstride+0x159]=0; }
   }
+  /* after the effects: the splitter section (header word 9) when the game uses splitters, then the mixes and the sinks.
+     the mixes used to be read right behind the effects, whatever the splitter section's size */
+  u8* spl_in=eff_in+ef; u32 spl_size=ih[9];
+  if(spl_size>=4){ u32 magic; memcpy(&magic,spl_in,4);
+    if(magic!=0x48444E53){ static int said; if(!said){ said=1; WARN("audren: header word 9 is %u bytes but no splitter header follows the effects (%08x): read as before\n",spl_size,magic); } spl_size=0; } }
+  u8* mixes_in=spl_in+spl_size; u8* sinks_in=mixes_in+ih[6];
+  { static int said; if(!said){ said=1; LOG("audren: update sections: behaviour %u, pools %u, voices %u, voice resources %u, effects %u, mixes %u, sinks %u, performance %u, splitters %u bytes\n",ih[1],ih[2],ih[3],ih[4],ih[5],ih[6],ih[7],ih[8],ih[9]); } }
+  swr_audio_update_routing(o,spl_in,spl_size,mixes_in,ih[6]);
   swr_audio_configure_effects(o,eff_in,neff,estride);
   /* a new voice only waits out the catch up quanta of this same IPC. with AUX that's one quantum per IPC, making it
      wait for the whole debt across IPCs kept SMO's title voice and music silent on slow PCs */
@@ -627,7 +635,7 @@ int audren_update(SvcObj* o, IpcCtx* c){
   float pcm[SWR_AUDIO_FRAMES*2];
   for(unsigned block=0;block<blocks;block++){
     int active=swr_audio_mix(o,block && continuation?continuation:voices_in,nvoices,vstride,resources_in,vr,
-        eff_in+ef,ih[6],eff_in+ef+ih[6],ih[7],q,pcm);
+        mixes_in,ih[6],sinks_in,ih[7],q,pcm);
     o->u[7]=(u64)active;
     if(o->u[3]==0){ swr_audio_submit_at(pcm,SWR_AUDIO_FRAMES,block_end); o->u[6]+=5000000ull; block_end+=5000000ull; }
   }

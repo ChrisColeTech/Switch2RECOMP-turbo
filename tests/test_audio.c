@@ -35,6 +35,23 @@ int main(void){g_mem=calloc(1,65536);assert(g_mem);
  for(int i=0;i<2;i++){u8* p=mix+i*0x930;wf(p,.5);w32(p+8,2);p[0xc]=1;w32(p+0x10,i);w32(p+0x924,i?0:0x7fffffff);}
  wf(mix+0x930+0x24,1);wf(mix+0x930+0x24+(24+1)*4,1);
  swr_audio_mix(&o,v,1,sizeof v,resources,sizeof resources,mix,sizeof mix,NULL,0,st,out);near(out[0],.0625);near(out[1],.03125);puts("PASS per-channel routing, submix matrix and final-mix volumes");
+ /* REV7 and later: an update carries only the mixes that changed, behind a 0x20-byte header, and a voice can go through a
+    splitter to several mixes. Both are kept between updates. */
+ begin(2,1,480);for(int i=0;i<480;i++)((i16*)(g_mem+0x1000))[i]=16384;w32(v+0x58,0x7fffffff);w32(v+0x5c,0);
+ {static u8 dm[0x20+0x1260],sp[0x20+0x18+0xe0];memset(dm,0,sizeof dm);memset(sp,0,sizeof sp);
+  w32(dm+4,2);
+  for(int i=0;i<2;i++){u8* p=dm+0x20+i*0x930;wf(p,1);w32(p+8,2);p[0xc]=1;w32(p+0x10,i);w32(p+0x924,i?0:0x7fffffff);w32(p+0x928,0xffffffff);}
+  wf(dm+0x20+0x930+0x24,1);wf(dm+0x20+0x930+0x24+(24+1)*4,1);
+  w32(sp,0x48444E53);w32(sp+4,1);w32(sp+8,2);
+  u8* si=sp+0x20;w32(si,0x49444E53);w32(si+4,0);w32(si+8,48000);w32(si+12,2);w32(si+16,0);w32(si+20,1);
+  u8* d0=si+0x18;w32(d0,0x44444E53);w32(d0+4,0);wf(d0+8,.5);w32(d0+0x68,0);d0[0x6c]=1;
+  u8* d1=d0+0x70;w32(d1,0x44444E53);w32(d1+4,1);wf(d1+8+4,.25);w32(d1+0x68,1);d1[0x6c]=1;
+  swr_audio_update_routing(&o,sp,sizeof sp,dm,sizeof dm);
+  swr_audio_mix(&o,v,1,sizeof v,NULL,0,dm,sizeof dm,NULL,0,st,out);near(out[0],.25);near(out[1],.125);
+  static u8 none[0x20];v[8]=0;   /* the next update: no mix changed, no splitter section */
+  swr_audio_update_routing(&o,NULL,0,none,sizeof none);
+  swr_audio_mix(&o,v,1,sizeof v,NULL,0,none,sizeof none,NULL,0,st,out);near(out[0],.25);near(out[1],.125);
+  puts("PASS changed-mixes-only updates and splitter destinations are kept between updates");}
  /* A mono voice routed only into the 5.1 center must reach stereo output. */
  begin(2,1,240);for(int i=0;i<240;i++)((i16*)(g_mem+0x1000))[i]=8192;
  u8 res6[0x70]={0},mix6[0x930]={0},sink6[0x140]={0};res6[0x64]=1;wf(res6+4+2*4,1);

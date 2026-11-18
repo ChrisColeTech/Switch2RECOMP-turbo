@@ -137,6 +137,18 @@ void swr_audio_init(void){
 }
 void swr_audio_submit_at(const float* samples,unsigned frames,u64 sample_end){
   if(!frames || frames>SWR_AUDIO_FRAMES || audio_stopping()) return;
+  /* the mixed output, measured: every 5 s of sound the log gets its RMS and peak (full scale = 1), so "is there sound"
+     can be read from a log. one renderer / AudioOut submits at a time here, a second one's blocks land in the same sums */
+  { static double sq[2]; static float peak; static unsigned n, silent, lines;
+    for(unsigned f=0;f<frames;f++){ float l=samples[f*2],r=samples[f*2+1]; sq[0]+=(double)l*l; sq[1]+=(double)r*r;
+      float m=fabsf(l)>fabsf(r)?fabsf(l):fabsf(r); if(m>peak) peak=m; }
+    n+=frames;
+    if(n>=48000*5){ double l=sqrt(sq[0]/n),r=sqrt(sq[1]/n); int quiet=l<1e-5 && r<1e-5;
+      /* silence is said once, then every minute; sound every 5 s for the first 5 minutes, then every minute */
+      if(quiet? (silent++%12==0) : (silent=0, lines<60 || lines%12==0))
+        LOG("audio: output, last %.0f s: RMS %.5f / %.5f (%.1f / %.1f dBFS), peak %.4f\n",n/48000.0,l,r,l>0?20*log10(l):-200.0,r>0?20*log10(r):-200.0,(double)peak);
+      lines++; sq[0]=sq[1]=0; peak=0; n=0; }
+  }
 #if defined(SWR_RECORD_AUDIO)
   /* the recording keeps the original samples on the game/video timeline. only what you hear live gets stretched,
      F7 never encodes the slowed down audio */
@@ -161,9 +173,19 @@ typedef struct { i64 frame; i16 h0,h1,seed0,pcm[14],previous[14]; } Adpcm;
 typedef struct { float x1,x2,y1,y2; } BiquadState;
 typedef struct { Wave q[4]; u32 nq,consumed; u64 played; double pos,fraction;
   i16 carry0,carry1; u8 carry_valid; unsigned defer_blocks;
-  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
+  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged,unrouted_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
 typedef struct { u8 config[0xc0]; BiquadState filter[6]; int aux_logged; } Effect;
+/* splitters (a voice or mix sent to several mixes, each with its own volumes) and the mixes as the game last sent them.
+   since REV7 an update holds only the mixes that changed (after a 0x20-byte header with their count), and a splitter
+   update only what changed too, so both are kept here between updates. layouts as yuzu's audio_core reads them
+   (MixInfo::InParameter / InDirtyParameter, SplitterContext::Update; GPL-2.0-or-later, yuzu Emulator Project) */
+#define NSPL 512
+#define NSD 4096
+#define SPLD 64
+typedef struct { u32 n; i32 dest[SPLD]; } Split;
+typedef struct { u8 in_use; i32 mix; float vol[NC]; } SplitDest;
 typedef struct { Voice v[NV]; float* mix; u32 mix_cap; u64 updates,last_diag,ipc_serial; int logged;
+  u8 (*mixtab)[0x930]; u8 mix_used[NM]; unsigned nmix; Split* split; SplitDest* sdst; u32 sdd_size; int route_logged;
   Effect* effects; Effect** effect_order; u32 neffects,update_blocks; int effect_log,v2_logged; } AudioState;
 static AudioState* audio_state(SvcObj* o){
   AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(!a){ a=calloc(1,sizeof *a); o->u[4]=(u64)(uintptr_t)a; }return a;
@@ -255,7 +277,42 @@ static void mix_effects(AudioState* a,unsigned index,unsigned id,unsigned buffer
     }
   }
 }
-void swr_audio_destroy(SvcObj* o){ AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(a){ free(a->mix); free(a->effects); free(a->effect_order); free(a); }o->u[4]=0; }
+void swr_audio_destroy(SvcObj* o){ AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(a){ free(a->mix); free(a->effects); free(a->effect_order); free(a->mixtab); free(a->split); free(a->sdst); free(a); }o->u[4]=0; }
+/* once per RequestUpdate: the splitter section and the mix section into the kept tables */
+void swr_audio_update_routing(SvcObj* o,const u8* spl,u32 spl_size,const u8* mixes,u32 mixes_size){
+  AudioState* a=audio_state(o); if(!a) return;
+  if(!a->mixtab){ a->mixtab=calloc(NM,0x930); a->split=calloc(NSPL,sizeof(Split)); a->sdst=calloc(NSD,sizeof(SplitDest)); if(!a->mixtab || !a->split || !a->sdst) return; }
+  const u32 SNDH=0x48444E53,SNDI=0x49444E53,SNDD=0x44444E53;
+  unsigned ninfo=0,ndest=0;
+  if(spl_size>=0x20 && rd32(spl)==SNDH){
+    u32 off=0x20;
+    while(off+0x10<=spl_size){ u32 magic=rd32(spl+off);
+      if(magic==SNDI){ u32 id=rd32(spl+off+4),n=rd32(spl+off+12); if(n>4096 || off+0x10+4ull*n>spl_size) break;
+        if(id<NSPL){ Split* s=&a->split[id]; s->n=n>SPLD?SPLD:n; for(u32 k=0;k<s->n;k++) s->dest[k]=(i32)rd32(spl+off+0x10+4*k); }
+        ninfo++; off+=0x10+4*n;
+      } else if(magic==SNDD){ if(off+0x70>spl_size) break;
+        u32 next=off+0x70; while(next+4<=spl_size && rd32(spl+next)!=SNDI && rd32(spl+next)!=SNDD) next+=4;
+        /* 0x70 bytes with the in-use flag at 0x6c; the newer record carries two biquad filters before the flag and
+           12 bytes from the flag to its end (0x90, or 0xa8 with float filters). the size is the distance to the next
+           record, learned from the first destination that has one behind it */
+        if(next+4<=spl_size && !a->sdd_size){ a->sdd_size=next-off; LOG("audio: splitter destinations of %#x bytes\n",a->sdd_size); }
+        u32 size=a->sdd_size? a->sdd_size : 0x70; if(off+size>spl_size) size=0x70;
+        u32 id=rd32(spl+off+4);
+        if(id<NSD){ SplitDest* d=&a->sdst[id]; d->mix=(i32)rd32(spl+off+0x68); d->in_use=spl[off+(size<=0x70? 0x6c : size-12)]!=0; for(int k=0;k<NC;k++) d->vol[k]=rdf(spl+off+8+k*4); }
+        ndest++; off=next;
+      } else off+=4;
+    }
+  }
+  /* mixes: the whole list, or (the section is 0x20 bytes longer than a whole number of mixes) the changed ones */
+  const u8* p=mixes; u32 n=0; int dirty=0;
+  if(mixes_size>=0x20 && mixes_size%0x930==0x20){ dirty=1; n=rd32(mixes+4); if(n>(mixes_size-0x20)/0x930) n=(mixes_size-0x20)/0x930; p=mixes+0x20; }
+  else if(mixes_size && mixes_size%0x930==0){ n=mixes_size/0x930; memset(a->mix_used,0,sizeof a->mix_used); }
+  for(u32 i=0;i<n;i++){ const u8* m=p+(size_t)i*0x930; u32 id=rd32(m+0x10); if(id>=NM) continue;
+    if(m[0xc]){ memcpy(a->mixtab[id],m,0x930); a->mix_used[id]=1; } else if(dirty) a->mix_used[id]=0; }
+  a->nmix=0; for(unsigned i=0;i<NM;i++) if(a->mix_used[i]) a->nmix=i+1;
+  if(!a->route_logged && (n || ninfo || ndest)){ a->route_logged=1;
+    LOG("audio: mix section %u bytes (%s, %u in this update), splitter section %u bytes (%u splitters, %u destinations in this update)\n",mixes_size,dirty?"changed mixes only":"every mix",n,spl_size,ninfo,ndest); }
+}
 static void ad_reset(Voice* v,int restart){
   v->ad.frame=v->nq?(i64)v->q[0].start/14-1:-1;
   v->ad.h0=(!restart && v->carry_valid)?v->carry0:0;
@@ -354,9 +411,10 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
  const u8* mixes,u32 mixes_size,const u8* sinks,u32 sinks_size,u8* status,float* stereo){
   memset(stereo,0,NF*2*sizeof(float)); if(count>NV || (stride<0x170 && stride!=0x188)) return 0;
   AudioState* a=audio_state(o); if(!a) return 0;
-  unsigned nm=mixes_size/0x930; if(nm>NM || mixes_size%0x930) nm=0;
+  swr_audio_update_routing(o,NULL,0,mixes,mixes_size);   /* the mixes come from the kept table, index = mix ID (the same bytes again in a catch-up block change nothing) */
+  unsigned nm=a->mixtab? a->nmix : 0;
   int map[NM]; const u8* mi[NM]; unsigned nbuf[NM]; memset(mi,0,sizeof mi); memset(nbuf,0,sizeof nbuf); for(int i=0;i<NM;i++) map[i]=-1;
-  for(unsigned i=0;i<nm;i++){ const u8* p=mixes+i*0x930; u32 id=rd32(p+0x10),nb=rd32(p+8); if(p[0xc] && id<NM && nb>0 && nb<=NC){ map[id]=(int)i; mi[i]=p; nbuf[i]=nb; } }
+  for(unsigned i=0;i<nm;i++){ const u8* p=a->mixtab[i]; u32 nb=rd32(p+8); if(a->mix_used[i] && nb>0 && nb<=NC){ map[i]=(int)i; mi[i]=p; nbuf[i]=nb; } }
   if(nm){ u32 cap=nm*NC*NF; if(a->mix_cap<cap){ float* t=realloc(a->mix,(size_t)cap*4); if(!t) return 0; a->mix=t; a->mix_cap=cap; }memset(a->mix,0,(size_t)cap*4); }
   int active=0; const int v2=stride==0x188;
   if(v2 && !a->v2_logged){ a->v2_logged=1; LOG("audio: REV15 voices, converting 0x188 -> legacy 0x170 per update\n"); }
@@ -415,12 +473,34 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
           produced++;
           v->pos+=step; v->fraction+=step; u64 advance=(u64)(v->fraction+1e-9); v->played+=advance; v->fraction-=advance;
         }normalize(v,format,co);
-        for(unsigned ch=0;ch<channels;ch++){
+        u32 sid=rd32(vi+0x5c); const Split* sp= dest<0 && nm && sid<NSPL && a->split[sid].n? &a->split[sid] : NULL;
+        for(unsigned ch=0;ch<channels;ch++){ int routed=0;
           if(dest>=0){
             for(unsigned k=0;k<nbuf[dest];k++){ float g=routing[ch][k]; if(g==0) continue;
               float* dst=a->mix+(dest*NC+k)*NF;
               for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*g;
             }
+          } else if(sp){   /* channel ch of N goes to the splitter's destinations ch, ch+N, ch+2N... */
+            for(unsigned j=ch;j<sp->n;j+=channels){ i32 did=sp->dest[j]; if(did<0 || did>=NSD) continue;
+              const SplitDest* d=&a->sdst[did]; if(!d->in_use || d->mix<0 || d->mix>=NM || map[d->mix]<0) continue;
+              int dm=map[d->mix]; routed=1;
+              for(unsigned k=0;k<nbuf[dm];k++){ float g=d->vol[k]; if(g==0) continue;
+                float* dst=a->mix+(dm*NC+k)*NF;
+                for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*g;
+              }
+            }
+          }
+          if(dest<0 && !routed && nm && map[0]>=0){
+            /* mixes are known and this voice reaches none: no mix named, and a splitter without a destination in use.
+               Ocarina of Time plays its opening's sound on such voices (splitters 13 to 17 are sent with 0 destinations;
+               why is open: a console would not be silent there). Kept audible in the final mix, front left and right */
+            int fm=map[0];
+            if(!v->unrouted_logged){ v->unrouted_logged=1; static int said; if(said<8){ said++;
+              LOG("audio: voice %u names no mix and its splitter %d has no destination in use (%u listed): played in the final mix\n",id,(i32)sid,sid<NSPL?a->split[sid].n:0); } }
+            if(channels==1){ for(unsigned k=0;k<2 && k<nbuf[fm];k++){ float* dst=a->mix+(fm*NC+k)*NF; for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*.70710678f; } }
+            else { float* dst=a->mix+(fm*NC+(ch<nbuf[fm]?ch:0))*NF; for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]; }
+          }
+          if(dest>=0 || sp || nm){
           } else if(channels==1){
             for(unsigned f=0;f<produced;f++){ float x=decoded[ch][f]*.70710678f; stereo[f*2]+=x; stereo[f*2+1]+=x; }
           } else { unsigned side=ch==1 || ch==5?1:0; for(unsigned f=0;f<produced;f++) stereo[f*2+side]+=decoded[ch][f]; }
@@ -436,12 +516,24 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
   }
   int diagnostic=active && (!a->logged || a->updates-a->last_diag>=400);
   /* mixes that feed others go first, whatever order they come in */
-  int incoming[NM]={0},done[NM]={0}; for(unsigned i=0;i<nm;i++) if(mi[i]){ u32 id=rd32(mi[i]+0x924); if(id<NM && map[id]>=0 && map[id]!=(int)i) incoming[map[id]]++; }
-  for(unsigned pass=0;pass<nm;pass++) for(unsigned i=0;i<nm;i++) if(mi[i] && !done[i] && !incoming[i]){
-    done[i]=1; if(o->u[3]==0) mix_effects(a,i,rd32(mi[i]+0x10),nbuf[i]); u32 id=rd32(mi[i]+0x924); int dst=id<NM?map[id]:-1;
-    if(dst>=0 && dst!=(int)i){ float volume=gain(mi[i]); for(unsigned sc=0;sc<nbuf[i];sc++) for(unsigned dc=0;dc<nbuf[dst];dc++){
+  /* a mix goes to another mix (0x924) or, with none named, through a splitter (0x928): destination j takes the mix's
+     buffer j % buffers into its own mix with its own volumes */
+  int incoming[NM]={0},done[NM]={0};
+  for(unsigned i=0;i<nm;i++) if(mi[i]){ u32 id=rd32(mi[i]+0x924),sid=rd32(mi[i]+0x928);
+    if(id<NM && map[id]>=0){ if(map[id]!=(int)i) incoming[map[id]]++; }
+    else if(sid<NSPL) for(u32 j=0;j<a->split[sid].n;j++){ i32 did=a->split[sid].dest[j]; if(did<0 || did>=NSD) continue; const SplitDest* d=&a->sdst[did];
+      if(d->in_use && d->mix>=0 && d->mix<NM && map[d->mix]>=0 && map[d->mix]!=(int)i) incoming[map[d->mix]]++; } }
+  for(unsigned pass=0;pass<nm;pass++) for(unsigned i=0;i<nm;i++) if(mi[i] && !done[i] && incoming[i]<=0){
+    done[i]=1; if(o->u[3]==0) mix_effects(a,i,rd32(mi[i]+0x10),nbuf[i]); u32 id=rd32(mi[i]+0x924),sid=rd32(mi[i]+0x928); int dst=id<NM?map[id]:-1;
+    float volume=gain(mi[i]);
+    if(dst>=0 && dst!=(int)i){ for(unsigned sc=0;sc<nbuf[i];sc++) for(unsigned dc=0;dc<nbuf[dst];dc++){
         float g=rdf(mi[i]+0x24+(sc*NC+dc)*4)*volume; if(g==0) continue; for(unsigned f=0;f<NF;f++) a->mix[(dst*NC+dc)*NF+f]+=a->mix[(i*NC+sc)*NF+f]*g; }
       incoming[dst]--; }
+    else if(dst<0 && sid<NSPL) for(u32 j=0;j<a->split[sid].n;j++){ i32 did=a->split[sid].dest[j]; if(did<0 || did>=NSD) continue; const SplitDest* d=&a->sdst[did];
+      if(!d->in_use || d->mix<0 || d->mix>=NM || map[d->mix]<0 || map[d->mix]==(int)i) continue;
+      int dm=map[d->mix]; unsigned sc=j%nbuf[i];
+      for(unsigned dc=0;dc<nbuf[dm];dc++){ float g=d->vol[dc]*volume; if(g==0) continue; for(unsigned f=0;f<NF;f++) a->mix[(dm*NC+dc)*NF+f]+=a->mix[(i*NC+sc)*NF+f]*g; }
+      incoming[dm]--; }
   }
   int final=map[0]; if(final>=0){
     float downmix[4]={1.f,.70710678f,.5f,.70710678f};

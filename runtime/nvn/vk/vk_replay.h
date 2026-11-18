@@ -30,7 +30,7 @@ int vkr_fmt_as_ct(int nvn_format, int ct);
 
 typedef struct {
     uint64_t handles, records, draws, draws_skipped, dispatches, passes, clears, copies, tex_copies, updates, fills, barriers, queries, bad;
-    uint64_t skip_no_shader, skip_no_pipeline, skip_no_target, skip_state, inexact_vertex;
+    uint64_t skip_no_shader, skip_no_pipeline, skip_no_target, skip_state, inexact_vertex, ndve;   // ndve: dispatches of the movie network the host took (vk_replay.c ndve_host)
     uint64_t desc_sets, writebacks, wb_joined;   // wb_joined: ranges to copy back that an adjacent one took (vk_replay.c wb_add)
     uint64_t plain_nocmp;   // plain samples bound with a sampler without comparison (vk_replay.c, plain_nocmp)
 } vkr_stats_t;

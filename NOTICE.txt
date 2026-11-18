@@ -76,3 +76,7 @@ runtime/av1video.inc drives it (frame threads, each unit's time riding with its 
 is ported from nxnative's dm/host/hle_movie_av1.c (MIT, (c) seedds; licence in runtime/nvn/third_party).
 
 Thanks to all of these projects.
+
+The runtime links libopus 1.5.2 (https://opus-codec.org, BSD-3-Clause, (c) Xiph.Org Foundation and contributors) for the
+hwopus service; its licence is runtime/opus/LICENSE, its source and build are named in runtime/opus/README.md. The recognition of
+nn::ndve's movie network by its shader keys (runtime/nvn/vk/vk_replay.c ndve_host) follows nxnative (MIT, (c) seedds).
