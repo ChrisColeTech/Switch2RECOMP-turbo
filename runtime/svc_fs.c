@@ -468,6 +468,32 @@ static SvcObj* sysdata_open(u64 id){
   u64 tot=0; u8* img=synrom_build(f,n,&tot); if(!img) return NULL;
   SvcObj* s=svcobj_new("IStorage(system)",synstorage,0); s->data=img; s->u[0]=tot; return s; }
 
+/* add-on content: the RomFS of a title in dlc.manifest (dlc.c). The first reads are logged: with an empty stand-in
+   they show what the game looks for in it */
+static PMutex g_dlclock;
+
+static int dlcstorage(SvcObj* o, IpcCtx* c){
+  DlcStore* s=o->data; u64 tot=dlc_store_size(s);
+  switch(c->cmd){
+    case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
+      if(off>tot) return RC(2,6001); if(off+sz>tot) sz=tot-off;
+      if(o->u[1]<24){ o->u[1]++; LOG("dlc: %016llx read %llx +%llx\n",(unsigned long long)o->u[0],(unsigned long long)off,(unsigned long long)sz); }
+      pm_lock(&g_dlclock); int r=dlc_store_read(s,off,GP(a),sz); pm_unlock(&g_dlclock);
+      return r? RC(2,6001) : 0; }
+    case 4: out64(c,tot); return 0;
+    case 1: case 2: case 3: return RC(2,6300);
+    case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }
+  }
+  return stub_ok(o,c); }
+
+static void dlcstorage_destroy(SvcObj* o){ pm_lock(&g_dlclock); dlc_store_close(o->data); o->data=NULL; pm_unlock(&g_dlclock); }
+
+static SvcObj* dlc_open(u64 id){
+  DlcStore* s=dlc_store_open(g_datadir,id); if(!s) return NULL;
+  SvcObj* o=svcobj_new("IStorage(dlc)",dlcstorage,0); o->data=s; o->u[0]=id; o->destroy=dlcstorage_destroy;
+  LOG("fs: add-on content %016llx (%s, %.1f KB)\n",(unsigned long long)id,dlc_store_kind(s),(double)dlc_store_size(s)/1024.0);
+  return o; }
+
 static int fsp_disp(SvcObj* o, IpcCtx* c){
   char p[1200];
   switch(c->cmd){
@@ -488,7 +514,9 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
     case 60: case 61: case 62: out_obj(c,svcobj_new("ISaveDataInfoReader",savereader,0)); return 0;
     case 200: { if(!rtotal) { WARN("fs: the game requests the RomFS but there is none (put the romfs folder in %s)\n",g_datadir); }
       out_obj(c,svcobj_new("IStorage(romfs)",romstorage,0)); return 0; }
-    case 202: { u64 id=in64(c,8); SvcObj* syn=sysdata_open(id);
+    case 202: { u64 id=in64(c,8); SvcObj* syn=dlc_open(id);
+      if(syn){ out_obj(c,syn); return 0; }
+      syn=sysdata_open(id);
       if(syn){ LOG("fs: system data %016llx (synthetic copy)\n",(unsigned long long)id); out_obj(c,syn); return 0; }
       emptyrom_init(); LOG("fs: system data %016llx (not available on PC: provided empty)\n",(unsigned long long)id);
       out_obj(c,svcobj_new("IStorage(system)",emptystorage,0)); return 0; }
@@ -511,5 +539,6 @@ static int fsppr_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
 static SvcObj* new_fsppr(void){ return svcobj_new("fsp-pr",fsppr_disp,0); }
 
 void svc_fs_init(void){
+  pm_init(&g_dlclock);
   svc_register("fsp-srv",new_fsp); svc_register("fsp-pr",new_fsppr); svc_register("fsp-ldr",new_fsppr);
 }
