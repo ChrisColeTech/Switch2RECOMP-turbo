@@ -25,6 +25,7 @@ for every 300 frames shown), Vulkan renderer, runtime 0.4.1, Windows, 60 Hz disp
 | Game | FPS while loading | FPS after loading | p95 frame time | Worst frame | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Mario Kart World | 22–45 | 57–59 | 17–21 ms | 230–810 ms | Hitches remain, mostly texture transcodes ([details](docs/MKW_PERFORMANCE_INVESTIGATION.md)) |
+| Donkey Kong Bananza | 55 | 52–60 (dips to 45) | 17–29 ms | 130–1420 ms | Stretches where every frame takes about 19 ms (about 55 FPS), plus hitches |
 | Mario Kart 8 Deluxe | 56 | 60.0 | 17.1 ms | 31 ms | 22-second run, through to a race |
 | Pokémon Legends: Z-A | 30.0 | 30.0 | 34 ms | 42–240 ms | Held at exactly 30; whether 60 is possible is still being investigated |
 | The Legend of Zelda: Ocarina of Time | none | none | none | none | Stalls at the opening before 300 frames are shown, so no line was logged |
