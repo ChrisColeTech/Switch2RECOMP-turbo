@@ -19,6 +19,7 @@ typedef struct { uint64_t lookups, found, keys, missing_keys, dumped, requested,
 
 int nxs_rt_enabled(void);                     // a cache to read (the backends ask before resolving)
 const char *nxs_rt_cache_dir(void);
+extern int nxs_rt_force_look;                 // nonzero: a missing shader is looked for at every call (a draw waiting for the live translator)
 const nxs_shader *nxs_get(const char *key);   // NULL while missing (the first time: logged, no dump: the caller has no program to dump from)
 const nxs_shader *nxs_peek(const char *key);  // the same, quiet: NULL when missing, nothing logged or marked (the pipeline prewarm)
 // Stage i of program p (in SetShaders' order): 1 with *out set, 0 missing (logged, dumped, requested the first time), -1 no such stage

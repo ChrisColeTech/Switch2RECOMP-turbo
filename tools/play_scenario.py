@@ -101,6 +101,7 @@ def main():
     ap.add_argument('run', nargs='?', help='with stats: the run folder')
     ap.add_argument('--game'); ap.add_argument('--label'); ap.add_argument('--env', action='append', default=[]); ap.add_argument('--option', action='append', default=[], help='KEY=VALUE ini option for this run, e.g. docked=1')
     ap.add_argument('--window', help='seconds from,to for the numbers'); ap.add_argument('--seconds', type=int)
+    ap.add_argument('--slow', type=float, default=1, help='every wait times this (a first run on an empty shader cache loads longer)')
     a = ap.parse_args()
     win = tuple(float(x) for x in a.window.split(',')) if a.window else None
     if a.scenario == 'stats':
@@ -115,7 +116,7 @@ def main():
     try:
         for step in sc['steps']:
             extra = ['--file', INPUTS / step[3]] if step[0] == 'replay' else []
-            probe('action', run, step[0], '--observed', step[2], '--settle', step[1], *extra)
+            probe('action', run, step[0], '--observed', step[2], '--settle', step[1] * a.slow, *extra)
     finally:
         try: probe('action', run, 'stop', '--observed', 'done')
         except SystemExit as e: print(e)

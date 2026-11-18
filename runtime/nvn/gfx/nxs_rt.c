@@ -164,6 +164,7 @@ static int dump(const char *key, const NVNshaderData *sd) {
     snprintf(p, sizeof p, "%s\\%s.code", g_dump, key); if (!(f = ufopen(p, L"wb"))) return 0; fwrite((const void *)(uintptr_t)sd->data, 1, ncode, f); fclose(f);
     return 1;
 }
+int nxs_rt_force_look;   // a caller waiting for the live translator: missing entries are looked for at every call, not twice a second
 static const nxs_shader *get(const char *key, const NVNshaderData *sd) {
     init();
     if (!g_on) return NULL;
@@ -172,7 +173,7 @@ static const nxs_shader *get(const char *key, const NVNshaderData *sd) {
     ent *e = find(key, 1);
     if (e->state == E_FOUND) { g_n.found++; ReleaseSRWLockExclusive(&g_lk); return &e->sh; }
     uint64_t now = now_ns();
-    if (e->state == E_UNKNOWN || now >= e->next_look) {   // a missing entry is looked for again twice a second (on-demand results, a build run meanwhile)
+    if (e->state == E_UNKNOWN || now >= e->next_look || nxs_rt_force_look) {   // a missing entry is looked for again twice a second (on-demand results, a build run meanwhile)
         if (load(e)) { if (e->state == E_FOUND && e->miss_t0) g_n.arrived++, LOG("[nxs] shader %s is in the cache now (%.1f s after it was missed)", key, (now - e->miss_t0) / 1e9); g_n.found++; ReleaseSRWLockExclusive(&g_lk); return &e->sh; }
         e->next_look = now + 500000000ull;
     }

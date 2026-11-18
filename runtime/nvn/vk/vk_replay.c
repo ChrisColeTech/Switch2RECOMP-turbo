@@ -450,6 +450,31 @@ static void pass_targets(void) {
     P.valid = 1;
 }
 // Opens the pass over the current targets (loading what they hold). An attachment-less pass covers the viewport (nvn_mtl.m bare_dims)
+// A draw whose shaders the live translator (tools/nxshader/nxs_live.py) has not delivered yet waits for them, once per set of programs, instead of being skipped.
+// A skipped draw is not always made up for by the next frame: Mario Kart 8 Deluxe renders parts of a course's lighting once as the course loads, and with a cold
+// shader cache those draws were skipped, the race stayed black for as long as it ran although every shader had arrived within the first seconds (60 FPS, 700 draws
+// a frame, 95 % of the picture black). nxnative translates at first use and the game waits. The translator answers in 0.3 to 1.6 s (it takes the shaders of a
+// batch together), so the first load of a course is some seconds longer, once. NXRT_VK_SHADER_WAIT_MS (3000): the longest wait; 0: skipped at once, as before
+static void shader_wait(const vks_shader **sh, int mesh) {
+    static int ms = -1; if (ms < 0) ms = getenv("SWR_NXS_LIVE") ? vkc_int("shader_wait_ms", 3000) : 0;
+    if (ms <= 0) return;
+    static uint64_t waited[4096]; uint64_t h = 1469598103934665603ull;
+    for (int s = 0; s < 5; s++) h = (h ^ (uint64_t)(uintptr_t)S->bst[s]) * 1099511628211ull;
+    if (!h) h = 1;
+    unsigned k = (unsigned)(h >> 20) & 4095; if (waited[k] == h) return;   // waited for once: a shader that never comes (one the translator fails on) is skipped from then on
+    waited[k] = h;
+    uint64_t t0 = now_ns(); int all = 0;
+    nxs_rt_force_look = 1;
+    while (!all && now_ns() - t0 < (uint64_t)ms * 1000000ull) {
+        Sleep(5);
+        for (int s = 0; s < 5; s++) if (S->bst[s] && !sh[s]) sh[s] = prog_stage(S->bst[s], s);
+        all = mesh ? sh[4] != NULL : sh[0] && (!S->bst[1] || sh[1] || S->rast_discard);   // the stages the draw cannot go without (a place an earlier program left bound may stay empty)
+    }
+    nxs_rt_force_look = 0;
+    static uint64_t total, n, said; total += now_ns() - t0; n++;
+    if (now_ns() - said > 2000000000ull) { said = now_ns(); VKLOG("draws that waited for their shaders from the live translator so far: %llu, %.1f s in all (the last one %.0f ms, %s)",
+                                                                 (unsigned long long)n, total / 1e9, (now_ns() - t0) / 1e6, all ? "they came" : "not all came: skipped"); }
+}
 // The sizes the game renders at: passes by target size, in the log every 600 frames (which resolution a game really draws its scene at: docked or handheld,
 // its dynamic resolution's step, docs/GAMEPLAY_INVESTIGATION.md section 7)
 static struct { uint32_t w, h; uint64_t n, nd; } g_rsz[24]; static int g_nrsz;
@@ -1359,6 +1384,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (S->poly.cull == NVN_FACE_FRONT_AND_BACK && !S->rast_discard) return;
     const vks_shader *sh[5] = {0};
     for (int s = 0; s < 5; s++) if (S->bst[s]) sh[s] = prog_stage(S->bst[s], s);
+    if (mesh ? !sh[4] : !sh[0] || (S->bst[1] && !sh[1] && !S->rast_discard)) shader_wait(sh, mesh);
     if (fr && (vkc_hidden(fr->vs) || vkc_hidden(fr->ps))) { fr->flags |= FL_HIDDEN; return; }
     if (!fr && vkc_any_hidden() && (vkc_hidden(vkf_key(sh[0] ? sh[0]->key : NULL)) || vkc_hidden(vkf_key(sh[1] ? sh[1]->key : NULL)))) return;
     if (mesh) {   // a mesh program has no vertex or geometry stage, and a task shader only if it is the same program's: what an earlier program left in those places goes
