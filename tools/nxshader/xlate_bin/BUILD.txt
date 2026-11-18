@@ -1,0 +1,27 @@
+dmsh_xlate in this folder: how it was built (2026-11-18)
+
+Source: nxnative (https://github.com/seedds/nxnative, MIT, (c) seedds), commit 1a410e6e5 (2026-11-07):
+  dm/gfx/tools/dmsh_xlate          the tool (Program.cs, dmsh_xlate.csproj)
+  dm/third_party/ryujinx           the shader translator it builds on (Ryujinx.Graphics.Shader, Ryujinx.Common,
+                                   Spv.Generator; MIT), with nxnative's changes
+The build before this one was nxnative commit 9507c221c (2026-11-05).
+
+One change of ours on top, in
+dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+(TryGenerateRawStorageOp, the "if (writes)" block; constants GmemLogLog2 = 10, GmemLogProbes = 8 kept):
+the write log of raw global memory stays the hash set of guest pages (address >> 12) it was at 9507c221c,
+with the slot read before the compare-and-swap. nxnative made it a bitmap of memory pool table entries at this
+commit; a Vulkan host that mirrors the pools copies what a shader wrote back to guest memory, and a page is
+what it can afford to copy. The memory pool table itself is nxnative's of this commit: 8192 entries, with the
+lookup hint in each entry's seventh word (runtime/nvn/gfx/dmsh_abi.h DMSH_GMEM_*).
+
+Build (the .NET 10 SDK):
+  cd dm/gfx/tools/dmsh_xlate
+  dotnet publish -c Release -o <out>
+and from <out> the files of this folder (the satellite resource folders and dmsh_xlate.exe are left out; the
+runtime starts it as "dotnet dmsh_xlate.dll").
+
+What it brought for the games here (docs/GAMEPLAY_INVESTIGATION.md section 9): float atomic adds
+(RED.F32.FTZ.RN: agl's scene analysis sums, which the game reads back into its exposure), ATOMG.CAS (Ampere
+instruction 243), ATOMS as compare-and-swap loops, LDSM fenced by subgroup barriers, HMMA chains, raw global
+memory lookups that start from the entry chosen last.

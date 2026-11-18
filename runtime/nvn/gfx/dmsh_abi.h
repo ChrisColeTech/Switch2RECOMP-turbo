@@ -75,8 +75,9 @@
 // Raw global memory: the translator reserves that table as a storage buffer under this constant buffer slot, which no game has (Ryujinx GlobalToStorage.GmemMapCbSlot), finds the pool
 // holding an address by a binary search over the table's starts and accesses the address plus the pool's delta through a physical storage buffer pointer
 #define DMSH_GMEM_MAP_CB_SLOT 0xFF
-#define DMSH_GMEM_MAP_ENTRIES 4096       // entries of the table (GlobalToStorage.GmemMapLog2 = 12), sorted by start: entry 0 is empty (start 0, end 0) and unused entries start at ~0
-#define DMSH_GMEM_MAP_ENTRY 32           // bytes of an entry: start, end (exclusive) and delta (the pool's Metal GPU address minus its guest address), 64 bits each, then 8 bytes of padding
+#define DMSH_GMEM_MAP_ENTRIES 8192       // entries of the table (GlobalToStorage.GmemMapLog2 = 13), sorted by start: entry 0 is empty (start 0, end 0) and unused entries start at ~0. 4096 with the translator build before 2026-11-18, whose shaders search the first half only
+#define DMSH_GMEM_MAP_ENTRY 32           // bytes of an entry: start, end (exclusive) and delta (the pool's Metal GPU address minus its guest address), 64 bits each, then a 32-bit lookup hint and 4 bytes of padding
+#define DMSH_GMEM_HINT_SHIFT 21          // the hint in entry (chunk & (entries - 1)) names the entry that holds all of this 2 MiB guest chunk: chunk in the high bits, entry index in the low 13, 0 = none. Tagged, so a colliding chunk searches
 // Where such a store or atomic lands is known only when the GPU runs it, so each one also puts its guest page (address >> 12) in a write log, reserved under the same slot at offset 1
 // (Ryujinx GlobalToStorage.GmemLogCbOffset, GmemLogLog2): 32-bit words, word 0 set when a page found no free slot, then a hash set of 1 << DMSH_GMEM_LOG_LOG2 pages (0 = empty).
 // The host learns the pages from it
