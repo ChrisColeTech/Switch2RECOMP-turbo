@@ -8,9 +8,13 @@ do not load (black screens, black gaps); MKW plays at about 30 FPS instead of 60
 
 | game | before | now | open |
 |---|---|---|---|
-| Donkey Kong Bananza | gameplay reached, terrain black | terrain shaded, tutorial video plays | the console's own reset of the append counters is not identified (emulated by rule); queue order across GPU events; 40-60 FPS |
-| Mario Kart World | race at 44-51 FPS | race at 57 FPS mean, 59 in steady stretches | streaming and pipeline stalls (p99) |
-| Pokemon Legends Z-A | title -> Language -> Appearance | loads the save into the world; UI drawn, **world black** | deferred lighting / post-processing output black; transform feedback (skinned characters) not implemented |
+| Donkey Kong Bananza | gameplay reached, terrain black | terrain shaded by the game's own mechanism (section 6), queues interleaved at their event waits, 48.7 FPS in the tunnel | 60 FPS: the per-chunk write-backs (section 6) |
+| Mario Kart World | race at 44-51 FPS | race at 58.6 FPS mean | texture streaming bursts (single frames of 60-170 ms) |
+| Pokemon Legends Z-A | title -> Language -> Appearance | in the world, lit, characters skinned, walking; 30 FPS (the game's interval) | 32x32 cube placeholders viewed as arrays |
+| Ocarina of Time | did not start (svcBreak 1.6 s in) | title screen and menu | no AV1 decoder (movies are black); the game itself not reached yet |
+
+Sections 1 to 5 are the first round as it was written; section 6 is the second round, which found the causes sections 1
+and 3 left open.
 
 Display: console session, 60 Hz, Vulkan on an RTX 5090. All numbers are from the real library builds, rebuilt through
 the engine CLI into each entry's `buildDir`, driven by `tools/plza_probe.py` (pad replay, runtime screenshots).
@@ -328,11 +332,11 @@ depth-sampling dispatch now runs between the main queue's pre-pass and its shadi
 
 Same scripted run (title, Continue, walk, punch, walk), window 100-150 s, console session at 60 Hz:
 
-| | before (`-180124-final-dkb`) | now (`{DKBRUN}`) |
+| | before (`-180124-final-dkb`) | now (`-203354-dkb-final`) |
 |---|---|---|
-| FPS mean | 36.9 (39.6 with nothing beside it) | {DKBFPS} |
-| present interval p50 / p95 / p99 | 25.1 / 32.9 / 89.7 ms | {DKBINT} |
-| terrain: black cells of 64 in the five gameplay screenshots | 1, 0, 0 | {DKBCELLS} |
+| FPS mean | 36.9 (39.6 with nothing beside it) | 48.7 |
+| present interval p50 / p95 / p99 | 25.1 / 32.9 / 89.7 ms | 20.0 / 26.3 / 28.6 ms (8 intervals over 33 ms of 2,435) |
+| terrain: black cells of 64 in the gameplay screenshots | 1, 0, 0 | 0, 0, 0, 0 |
 | `append_counter_reset` a second | about 25,000 | 0 |
 
 Where the frame goes now (`-201836-dkb-park`, `SWR_HOST_PROF=100,25`): the translation thread is busy 67 % of the time
@@ -343,7 +347,8 @@ copies), and what the 630 terrain chunks' write-backs cost is about a quarter: e
 list are copied back to guest memory every frame (two barriers and a copy each, a page copy aside when the write is
 recorded, a compare when it lands, and the page sent to the device again after it landed), although the CPU never reads
 them. nxnative has no such copies (its memory is the game's). `wb_add` now joins ranges that follow each other, which
-takes most of the per-range cost; the per-page cost stays.
+takes most of the per-range cost; the per-page cost stays. With it and the parked queues the tunnel went from 43.5 to
+48.7 FPS (`-201836-dkb-park` with the profiler on, then the run of the table).
 
 **Open, and the next step for 60 FPS**: write-back on demand. A draw-stage storage buffer the CPU has not touched for some
 frames stops being copied back; its guest pages are made inaccessible, and the first CPU access brings the device's bytes
@@ -427,7 +432,26 @@ use; a per-frame budget for that work (drawing a frame or two with what is alrea
 
 ### Regression checks of this round
 
-{REG}
+All five library builds were rebuilt through the engine CLI into their `buildDir` with the final runtime (after the merge
+of `origin/turbo` with the Mario Kart 8 Deluxe Mii change) and run with the harness. The games' saves were copied aside
+before the runs (`build/plza-investigation/save-backups-20261117b`) and put back after them where a run had written one
+(Donkey Kong Bananza, Mario Kart World; Z-A's was unchanged).
+
+| game | run | result |
+|---|---|---|
+| Donkey Kong Bananza | `-203354-dkb-final` | title, Continue, walk, punch, walk: terrain shaded in every screenshot, 0 black cells of 64 (near-black 17-35 %: the tunnel); 48.7 FPS, present interval p50 20.0 / p95 26.3 / p99 28.6 ms; 11,669 event waits met by the other queue, none unmet; `append_counter_reset` 0 |
+| Mario Kart World | `-202635-mkw-nx` | above |
+| Pokemon Legends Z-A | `-203745-plza-final` | title, A, the station; two walks with the stick: the scene moves, people and Pokemon are drawn; near-black 0.1-1.1 %, 0 black cells; 30.0 FPS, present interval p50 33.3 / p95 34.0 / p99 34.5 ms, longest 35.7 ms |
+| Ocarina of Time | `-204152-zelda-final` | title screen and menu; 2,700 frames, 27.6 FPS at the title (present interval p50 36.1 ms); after A the opening movie (black: no AV1 decoder) |
+| Mario Kart 8 Deluxe | `-204430-mk8d-final` | not worse: with turbo's Mii change it runs on (3,600 frames at 60 FPS, no crash); before, the Mii renderer's null access 6.6 s in |
+
+Tests: `python -m unittest discover -s tests -p "test_n*.py"` (17), `tests/test_controllers.py`, `tests/test_mkw_runtime.py`,
+`tests/test_mkw_perf.py` pass (the last two now make `build/mkw-investigation` themselves). Linux: the NVN archive and the
+runtime build in WSL (`tools/build_nvn.py --linux`, `--build-runtime --target linux --backend x11`).
+
+Run folders of this round are under `build/plza-investigation/` of the worktree `D:\Projects\Switch2RECOMP-gameplay2`
+(not in git): `-193016-dkb-gmem`, `-201836-dkb-park` (with `hostprof`), `-203354-dkb-final`, `-193450-plza-layer`,
+`-203745-plza-final`, `-202635-mkw-nx`, `-201542-zelda-vram`, `-204152-zelda-final`, `-204430-mk8d-final`.
 
 ### Switches added
 
