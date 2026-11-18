@@ -212,7 +212,7 @@ def worker(run):
     if config.get('metrics'): env['SWR_METRICS'] = str(run / 'metrics.csv'); env['SWR_FRAME_CSV'] = str(run / 'frames.csv')
     if config.get('record'): env['SWR_INPUT_RECORD'] = str(run / 'input-record.txt')
     env.update(config['env'])
-    args = [str(exe), '--fullscreen=0'] + (['-v'] if config['verbose'] else [])
+    args = [str(exe), '--fullscreen=0'] + [f'--{x}' for x in config.get('options', [])] + (['-v'] if config['verbose'] else [])
     proc = subprocess.Popen(args, cwd=exe.parent, env=env, stdout=(run / 'stdout.log').open('wb'), stderr=subprocess.STDOUT)
     started = time.time(); start = time.monotonic(); deadline = start + config['seconds']
     atomic(run / 'session.json', json.dumps(dict(pid=proc.pid, started=started, args=args)))
@@ -339,6 +339,7 @@ def main():
     p.add_argument('--stacks', action='store_true', help='native stacks with cdb at the first two stalls')
     p.add_argument('--metrics', action='store_true', help='SWR_METRICS: metrics.csv (each second) and frames.csv (each frame) in the run folder')
     p.add_argument('--record', action='store_true', help='SWR_INPUT_RECORD: the pad as played, in input-record.txt (replayable)')
+    p.add_argument('--option', action='append', default=[], help='KEY=VALUE: an ini option for this run only, e.g. docked=1 (passed as --KEY=VALUE, the ini is not touched)')
     p.add_argument('--wait', action='store_true', help='block until the run ends, then print the report')
     p = sub.add_parser('worker'); p.add_argument('run', type=Path)
     p = sub.add_parser('report'); p.add_argument('run', type=Path)
@@ -357,7 +358,7 @@ def main():
         run = RUNS / (time.strftime('%Y%m%d-%H%M%S-') + a.label); run.mkdir()
         env = dict(x.split('=', 1) for x in a.env)
         atomic(run / 'config.json', json.dumps(dict(game=str(Path(a.game).resolve()), seconds=a.seconds, env=env,
-               shot_every=a.shot_every, verbose=a.verbose, stacks=a.stacks, metrics=a.metrics, record=a.record), indent=2))
+               shot_every=a.shot_every, options=a.option, verbose=a.verbose, stacks=a.stacks, metrics=a.metrics, record=a.record), indent=2))
         w = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', str(run)],
                              stdout=(run / 'harness.log').open('wb'), stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
         print(run, flush=True)
