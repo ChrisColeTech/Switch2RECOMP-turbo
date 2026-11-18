@@ -18,6 +18,7 @@ typedef struct vkt_image {
     const pool_t *pool; int64_t off; uint8_t *mem; nvn_texdesc d; int cls, has_layout;
     uint64_t storage;                    // bytes of storage it reads (t->L.size)
     // Vulkan
+    uint8_t cube_ok;      // created cube compatible (a cube map, or a square 2D array of six layers or more): cube views of it are valid
     uint8_t superseded;   // a newer texture sits over the same storage: freed once idle (a change of the game's dynamic resolution)
     uint32_t min_lod;   // levels under this one have no memory: its views never reach them (vk_sparse.inc)
     const vkf_info *fi; VkImage img; vk_alloc alloc; VkImageViewType vtype; VkImageAspectFlags aspect;

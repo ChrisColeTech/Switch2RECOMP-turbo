@@ -257,6 +257,10 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
         if (!depth && (fi->feat & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fi->feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
+    // A square 2D array of six layers or more may be viewed as a cube: Pokemon Legends Z-A keeps its environment maps (64x64x6, 128x128x6) as 2D arrays and its
+    // lighting samples them through cube views; viewed as 2D arrays instead the cube lookup's direction was read as (u, v, layer)
+    if (!cube && type == VK_IMAGE_TYPE_2D && im->layers >= 6 && im->w == im->h && im->samples == VK_SAMPLE_COUNT_1_BIT) cube = 2;
+    im->cube_ok = cube != 0;
     VkImageCreateFlags cf = (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) | (!depth ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
     if (type == VK_IMAGE_TYPE_3D) cf |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     if (type == VK_IMAGE_TYPE_3D && (g_vk.has.image_2d_of_3d || g_vk.has.sampler_2d_of_3d)) cf |= VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
@@ -692,7 +696,7 @@ VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz) 
     }
     VkImageAspectFlags asp = im->aspect;
     if (asp == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) asp = v && v->set_dsmode && v->dsmode == 1 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-    if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !(im->vtype == VK_IMAGE_VIEW_TYPE_CUBE || im->vtype == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)) {
+    if ((vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !(im->vtype == VK_IMAGE_VIEW_TYPE_CUBE || im->vtype == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !(im->cube_ok && b0 + 6 <= im->layers)) {
         static int n; if (n++ < 8) VKRED("a cube view of a %ux%u texture that is not a cube map: viewed as a 2D array", im->w, im->h);
         vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     }

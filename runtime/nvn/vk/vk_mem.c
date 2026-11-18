@@ -5,6 +5,7 @@
 #include "vk_submit.h"
 #include "vk_flight.h"
 #include "vk_perf.h"
+#include "dmsh_abi.h"   // gfx/: DMSH_GMEM_MAP_*, the layout of the memory pool table
 #include "nvn_dirty.h"   // gfx/: the dirty-page tracker the recording layer shares (nxnative's, ported by track A)
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@ typedef struct {
     uintptr_t lo, hi, base;       // the pool [lo, hi) as given; base = lo rounded down to a page
     uint64_t size, npages;        // bytes the buffer covers (from base, whole pages)
     const void *key;
+    VkDeviceAddress da[MAXWIN];   // the windows' device addresses, asked for when the memory pool table first lists them (vkm_gmem_table)
     VkBuffer buf[MAXWIN]; uint64_t win_lo[MAXWIN], win_n[MAXWIN]; int nwin;   // window k covers [win_lo, win_lo + win_n) of the pool, from base
     int sparse;
     vk_alloc *gran; uint64_t ngran, bound;   // sparse: one allocation per bound granule, bound into every window that covers it
@@ -39,6 +41,7 @@ typedef struct {
 static pool_t_ *g_pool[MAXPOOL]; static int g_npool;
 static _Atomic uint32_t g_pool_gen = 1;   // moves whenever a pool comes or goes (vkm_use's remembered buffers and offsets are then stale)
 static SRWLOCK g_lk = SRWLOCK_INIT;
+static _Atomic uint32_t g_bind_gen;       // moves when a pool that is not sparse gets its memory (it has a device address from then on: vkm_gmem_table)
 static uint64_t g_frame = 1;
 static _Atomic uint64_t s_wb_words, s_wb_kept, s_wb_stale, s_wb_merged, s_wb_cpu_newer;   // cpu_newer: GPU words landed over a value the CPU wrote while the GPU work ran (wr_land; metrics column wb_cpu_newer)
 uint64_t vkm_wb_cpu_newer(void) { return atomic_load(&s_wb_cpu_newer); }   // metrics (vk_perf.c)
@@ -320,7 +323,7 @@ static int pool_bind(pool_t_ *p, uint64_t o, uint64_t n) {
             if (vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &p->mem[k])) { VKRED("no device memory for memory pool %p+%#llx", p->key, (unsigned long long)p->size); rc = -1; }
             else vkBindBufferMemory(g_vk.dev, p->buf[k], p->mem[k].mem, p->mem[k].off);
         }
-        if (!rc) p->bound = p->size;
+        if (!rc) { p->bound = p->size; atomic_fetch_add(&g_bind_gen, 1); }
         ReleaseSRWLockExclusive(&lk);
         return rc;
     }
@@ -806,6 +809,73 @@ void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint3
     if (!fill) { uint8_t *c = malloc((size_t)len); memcpy(c, data, (size_t)len); w->cpu = c; }
     gpu_pending_drain(); gpu_pending(addr, len, 1);
     vks_post_fn(wb_land, w);
+}
+
+// ---------- The memory pool table: raw global memory ----------
+// A shader that reads or writes memory at an address it loaded from memory (not at a bound buffer's) cannot be given a buffer for it: the translator (nxnative's
+// GlobalToStorage.TryGenerateRawStorageOp, docs/reference/shaders.md "Global memory at an address loaded from memory"; MIT, (c) seedds) makes such an access look the
+// address up in a table of the memory pools the host binds as a storage buffer, add that pool's delta and go through a physical storage buffer pointer. The table
+// (dmsh_abi.h DMSH_GMEM_MAP_*): 4096 entries of {start, end, delta, padding}, 64 bits each, sorted by start; entry 0 is empty and unused entries start at ~0. Here the
+// delta is the pool mirror's device address minus the guest address. Donkey Kong Bananza's terrain depends on it: gsys's vertex shader c9a56f796ea4a4cd writes
+// {count 0, 1 instance} every frame into each chunk's indirect draw record, whose address it reads from a list (docs/NXNATIVE_GAP_ANALYSIS.md).
+// A pool is listed once its buffer has memory (sparse: always; the unbacked parts read undefined and drop writes, as Vulkan defines). The table is written anew when
+// a pool comes, goes or gets memory, into the next of GM_TABLES buffers, so that work already submitted keeps the table it was recorded with.
+// The write log (DMSH_GMEM_LOG_*): word 0 set when the set was full, then a hash set of 1024 guest page numbers a store or atomic went to. One log for all draws,
+// read and cleared once a frame (vkm_gmem_log_take): the replay learns from it which pages such shaders write and has them copied back to guest memory.
+enum { GM_TABLES = 4, GM_BYTES = DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY, GM_LOG_WORDS = 1 + (1 << DMSH_GMEM_LOG_LOG2) };
+static struct { VkBuffer buf[GM_TABLES], log; vk_alloc mem[GM_TABLES], logmem; int state, cur; uint32_t pgen, bgen, entries; } g_gm;   // state: 0 not tried, 1 ready, 2 unavailable
+static int gm_buffer(VkDeviceSize n, VkBuffer *b, vk_alloc *m, const char *name) {
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (vkCreateBuffer(g_vk.dev, &bci, NULL, b) != VK_SUCCESS) return -1;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, *b, &mr);
+    if (vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, m) || !m->map) return -1;
+    vkBindBufferMemory(g_vk.dev, *b, m->mem, m->off); memset(m->map, 0, (size_t)n); vk_name((uint64_t)*b, VK_OBJECT_TYPE_BUFFER, name);
+    return 0;
+}
+static int gm_ready(void) {
+    if (g_gm.state) return g_gm.state == 1;
+    g_gm.state = 2;
+    if (!g_vk.f12.bufferDeviceAddress) { VKRED("raw global memory: the device has no buffer device addresses; shaders that read or write through loaded pointers get an empty table"); return 0; }
+    for (int i = 0; i < GM_TABLES; i++) if (gm_buffer(GM_BYTES, &g_gm.buf[i], &g_gm.mem[i], "raw global memory: pool table")) { VKRED("raw global memory: no memory for the pool table"); return 0; }
+    if (gm_buffer(GM_LOG_WORDS * 4, &g_gm.log, &g_gm.logmem, "raw global memory: write log")) { VKRED("raw global memory: no memory for the write log"); return 0; }
+    g_gm.state = 1; g_gm.cur = -1;
+    return 1;
+}
+// The table for the submission being recorded (the recording thread only); VK_NULL_HANDLE when the device cannot do it
+VkBuffer vkm_gmem_table(VkDeviceSize *size) {
+    *size = GM_BYTES;
+    if (!gm_ready()) return VK_NULL_HANDLE;
+    uint32_t pg = atomic_load(&g_pool_gen), bg = atomic_load(&g_bind_gen);
+    if (g_gm.cur >= 0 && pg == g_gm.pgen && bg == g_gm.bgen) return g_gm.buf[g_gm.cur];
+    int nx = (g_gm.cur + 1) % GM_TABLES; uint64_t *t = g_gm.mem[nx].map; uint32_t n = 1, left = 0; uint64_t last_end = 0;
+    t[0] = t[1] = t[2] = t[3] = 0;
+    AcquireSRWLockShared(&g_lk);
+    for (int i = 0; i < g_npool; i++) { pool_t_ *p = g_pool[i];
+        if (!p->sparse && !p->bound) continue;
+        for (int k = 0; k < p->nwin; k++) {
+            uint64_t lo = p->base + p->win_lo[k], hi = k + 1 < p->nwin ? p->base + p->win_lo[k + 1] : p->base + p->size;
+            if (lo < last_end) lo = last_end;   // pools the game laid over each other: the first one has the overlap
+            if (lo >= hi) continue;
+            if (n == DMSH_GMEM_MAP_ENTRIES) { left++; continue; }
+            if (!p->da[k]) { VkBufferDeviceAddressInfo ai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, p->buf[k]}; p->da[k] = vkGetBufferDeviceAddress(g_vk.dev, &ai); }
+            t[4 * n] = lo; t[4 * n + 1] = hi; t[4 * n + 2] = p->da[k] - (p->base + p->win_lo[k]); t[4 * n + 3] = 0; n++; last_end = hi;
+        }
+    }
+    ReleaseSRWLockShared(&g_lk);
+    for (uint32_t i = n; i < DMSH_GMEM_MAP_ENTRIES; i++) { t[4 * i] = ~0ull; t[4 * i + 1] = 0; t[4 * i + 2] = 0; t[4 * i + 3] = 0; }
+    if (left) { static int said; if (!said++) VKRED("raw global memory: %u more memory pools than the table's %d entries; reads through loaded pointers into them give 0 (missing geometry)", left, DMSH_GMEM_MAP_ENTRIES); }
+    { static int said; if (!said++) VKLOG("raw global memory: a shader reads or writes through pointers it loaded from memory; the memory pool table has %u ranges (written again when pools change)", n - 1); }
+    g_gm.cur = nx; g_gm.pgen = pg; g_gm.bgen = bg; g_gm.entries = n - 1;
+    return g_gm.buf[nx];
+}
+VkBuffer vkm_gmem_log(VkDeviceSize *size) { *size = GM_LOG_WORDS * 4; return gm_ready() ? g_gm.log : VK_NULL_HANDLE; }
+// The guest pages logged since the last call (at most max), and the log cleared. *full: the set overflowed, some pages are not in it
+int vkm_gmem_log_take(uint64_t *pages, int max, int *full) {
+    *full = 0; if (g_gm.state != 1) return 0;
+    uint32_t *w = g_gm.logmem.map; int n = 0;
+    if (w[0]) { *full = 1; w[0] = 0; }
+    for (int i = 1; i < GM_LOG_WORDS; i++) if (w[i]) { if (n < max) pages[n++] = w[i]; w[i] = 0; }
+    return n;
 }
 
 // ---------- Frames, statistics ----------

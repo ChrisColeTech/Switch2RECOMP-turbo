@@ -162,6 +162,7 @@ typedef struct rs {
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4];
     float blend_color[4], alpha_ref; int64_t copy_stride, copy_img_stride;
     int tf_on, rast_discard, tex_base, samp_base, render_skip, vis_on;
+    struct { uint64_t addr, size; } tfb[4];   // BindTransformFeedbackBuffer(s)
     p_prim_restart restart;
     // render targets (the snapshots copied: the record's command memory may be reused after the submission)
     int nrt; tex_t ct[8]; uint8_t has_ct[8]; view_t cview[8]; uint8_t has_cview[8]; tex_t dt; uint8_t has_dt; view_t dview; uint8_t has_dview;
@@ -326,9 +327,11 @@ static void gt_frame(uint64_t frame) {
         vkResetQueryPool(g_vk.dev, g_gtp, 0, GT_MAX); g_gt_n = 0; g_gt_on = 1;
     }
 }
+static void tf_end_open(VkCommandBuffer cb);
 static void pass_end(void) {
     if (!P.open) return;
     VkCommandBuffer cb = vks_cb();
+    tf_end_open(cb);
     vkq_close(cb);
     if (P.query >= 0) { vkCmdEndQuery(cb, R0.qp, (uint32_t)P.query); q_post(0, (uint32_t)P.query, 0); P.query = -1; }
     vkCmdEndRendering(cb);
@@ -411,7 +414,14 @@ static int pass_begin(void) {
     if (P.dv) da = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, P.dv, VK_IMAGE_LAYOUT_GENERAL, 0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED,
                                                VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, {{{0}}}};
     sa = da;
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, 1, 0, (uint32_t)P.ncolor, ca, P.hd ? &da : NULL, P.hs ? &sa : NULL};
+    // A layered pass: a vertex shader may pick the layer it draws into (Pokemon Legends Z-A builds its 32x32x32 colour grading table with one instance per plane,
+    // vertex shader b29f08619f379a83 writing the layer; drawn into one layer, 31 planes stayed black and the tone mapping gave a black world: nxnative's finding,
+    // dm/games/0100F43008C44000/README.md). The pass has as many layers as every attachment's view holds; a shader that writes no layer draws into the first, as before
+    uint32_t nlay = 0;
+    for (int i = 0; i < P.ncolor; i++) if (P.cv[i] && (!nlay || P.cnl[i] < nlay)) nlay = P.cnl[i];
+    if (P.dv && (!nlay || P.dnl < nlay)) nlay = P.dnl;
+    if (!nlay || !g_vk.f12.shaderOutputLayer) nlay = 1;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, nlay, 0, (uint32_t)P.ncolor, ca, P.hd ? &da : NULL, P.hs ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
     P.open = 1; g_st.passes++;
     if (g_gt_on) { g_gt_w = w; g_gt_h = h; g_gt_d0 = g_st.draws; snprintf(g_gt_fmt, sizeof g_gt_fmt, "%s", P.ncolor && P.ci[0] ? P.ci[0]->fi->name : P.di ? P.di->fi->name : "-"); }
@@ -826,7 +836,7 @@ static int set_reusable(const vks_shader *sh) {
     if (!sh->ds_reuse) {
         int ok = 1;
         for (int i = 0; i < sh->nb && ok; i++) { const vks_bind *b = &sh->b[i];
-            if (b->rw || b->kind == VKB_IMG || b->kind == VKB_SBUF_UBO || b->kind == VKB_UNKNOWN || b->count != 1) ok = 0; }
+            if (b->rw || b->kind == VKB_IMG || b->kind == VKB_SBUF_UBO || b->kind == VKB_GMEM_MAP || b->kind == VKB_GMEM_LOG || b->kind == VKB_UNKNOWN || b->count != 1) ok = 0; }
         ((vks_shader *)sh)->ds_reuse = ok ? 1 : 2;
     }
     return sh->ds_reuse == 1;
@@ -859,6 +869,40 @@ static inline int a2c_on(void) { static const volatile int *p; if (!p) p = vkc_p
 #define PH0() uint64_t ph0_ = ph_on() ? PH_T() : 0
 #define PH1(i) do { if (ph0_) g_ph_ns[i] += PH_T() - ph0_; } while (0)
 uint64_t vkm_use_cycles(void);   // vk_mem.c: cycles inside vkm_use with the phases on (the memory sync of every binding)
+// ---------- Raw global memory: where the stores went ----------
+// A store through a loaded pointer (vk_mem.c vkm_gmem_table) lands in a pool's mirror, at a place known only once the GPU has run it. The shader logs the guest page
+// of every such store; the log is read once a frame. Pages seen there are learned (nxnative learns whole pools; pages are enough here, a miss costs one frame of
+// write-back, not a wrong picture: the mirror has the bytes either way), and every draw or dispatch of a shader with a write log has the learned pages copied back to
+// guest memory like any storage buffer it writes. A page not logged for GM_FORGET frames is forgotten.
+enum { GM_PAGES = 2048, GM_RANGES = 96, GM_FORGET = 600, GM_GAP = 4 };
+static struct { uint64_t page; uint64_t seen; } g_gmp[GM_PAGES]; static int g_ngmp;
+static struct { uint64_t a, n; } g_gmr[GM_RANGES]; static int g_ngmr;
+static uint64_t g_gm_frame, g_gm_used;   // the frame; the last frame a shader with a write log was bound
+static int gmp_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static void gm_writes(int *swrites) {
+    g_gm_used = g_gm_frame;
+    if (!swrites) return;
+    for (int i = 0; i < g_ngmr; i++) { int dup = 0; for (int k = 0; k < g_nwb; k++) dup |= g_wb[k].a == g_gmr[i].a && g_wb[k].n == g_gmr[i].n;
+        if (!dup && g_nwb < 256) { g_wb[g_nwb].a = g_gmr[i].a; g_wb[g_nwb].n = g_gmr[i].n; g_wb[g_nwb].base = 0; g_nwb++; *swrites = 1; } }
+}
+static void gm_frame(uint64_t frame) {
+    g_gm_frame = frame + 1;
+    if (g_gm_used + 2 < g_gm_frame && !g_ngmp) return;
+    static uint64_t pg[1024]; int full, n = vkm_gmem_log_take(pg, 1024, &full), changed = 0;
+    if (full) RED_ONCE(61, "raw global memory: more than 1024 pages written through loaded pointers in a frame; some are not copied back to guest memory");
+    for (int i = 0; i < n; i++) { int k = 0; while (k < g_ngmp && g_gmp[k].page != pg[i]) k++;
+        if (k == g_ngmp) { VkBuffer b_; VkDeviceSize o_; if (g_ngmp == GM_PAGES || !vkm_addr(pg[i] << 12, 4096, &b_, &o_)) continue; g_gmp[g_ngmp++].page = pg[i]; changed = 1; VKC(VKC_GMEM_LEARN); }
+        g_gmp[k].seen = g_gm_frame; }
+    for (int k = 0; k < g_ngmp; ) { if (g_gmp[k].seen + GM_FORGET < g_gm_frame) { g_gmp[k] = g_gmp[--g_ngmp]; changed = 1; } else k++; }
+    if (!changed) return;
+    qsort(g_gmp, (size_t)g_ngmp, sizeof *g_gmp, gmp_cmp);
+    g_ngmr = 0;
+    for (int k = 0; k < g_ngmp; k++) { uint64_t a = g_gmp[k].page << 12; VkBuffer b_; VkDeviceSize o_;
+        if (g_ngmr && a <= g_gmr[g_ngmr - 1].a + g_gmr[g_ngmr - 1].n + GM_GAP * 4096ull && vkm_addr(g_gmr[g_ngmr - 1].a, a + 4096 - g_gmr[g_ngmr - 1].a, &b_, &o_)) { g_gmr[g_ngmr - 1].n = a + 4096 - g_gmr[g_ngmr - 1].a; continue; }
+        if (g_ngmr == GM_RANGES) { RED_ONCE(62, "raw global memory: the pages written through loaded pointers make more than %d ranges; the rest is not copied back to guest memory", GM_RANGES); break; }
+        g_gmr[g_ngmr].a = a; g_gmr[g_ngmr].n = 4096; g_ngmr++; }
+    { static int nlog; if (nlog++ < 12) VKLOG("raw global memory: %d pages in %d ranges are written through loaded pointers (copied back to guest memory with each such draw)", g_ngmp, g_ngmr); }
+}
 static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites);
 extern volatile LONG g_vkt_reg_gen;
 static VkDescriptorSet write_set(const vks_shader *sh, int st, int *swrites) {
@@ -913,6 +957,12 @@ static VkDescriptorSet write_set_(const vks_shader *sh, int st, int *swrites) {
             if (b->kind == VKB_SBUF_UBO && b->reg >= 0 && b->reg < 16 && S->ubo[st][b->reg].addr && (uint64_t)b->c0_off + 12 <= S->ubo[st][b->reg].size) {   // address and size kept in the game's own uniform buffer
                 uint32_t w_[3]; uint64_t at = S->ubo[st][b->reg].addr + b->c0_off;
                 if (read_u32(at, &w_[0]) && read_u32(at + 4, &w_[1]) && read_u32(at + 8, &w_[2])) { memset(&ptr_, 0, sizeof ptr_); ptr_.addr = (uint64_t)w_[1] << 32 | w_[0]; ptr_.size = w_[2]; u = &ptr_; }
+            }
+            if (b->kind == VKB_GMEM_MAP || b->kind == VKB_GMEM_LOG) {   // raw global memory: the memory pool table, and the log of the pages written through it
+                VkDeviceSize gn; VkBuffer gb = b->kind == VKB_GMEM_MAP ? vkm_gmem_table(&gn) : vkm_gmem_log(&gn);
+                if (gb) *o = (VkDescriptorBufferInfo){gb, 0, gn};
+                if (b->kind == VKB_GMEM_LOG && gb) gm_writes(swrites);
+                x->pBufferInfo = o; break;
             }
             VkBuffer bb; VkDeviceSize oo;
             // A buffer bound with size 0 is still the memory at its address: an NVN shader holds the address (c0) and reads and writes through it, the size is only what the
@@ -1154,7 +1204,7 @@ static void app_frame_start(void) {   // the first draw of a frame: the counts t
     g_app_non = keep;
 }
 static void app_draw(const vks_shader *const *sh, uint64_t ind, int indexed) {
-    static const volatile int *on; if (!on) on = vkc_ptr("append_reset", 1);
+    static const volatile int *on; if (!on) on = vkc_ptr("append_reset", 0);
     if (!*on) return;
     if (g_app_started != g_app_frame) app_frame_start();
     for (int s = 0; s < 5; s++) if (sh[s]) { uint16_t m = app_regs(sh[s]); for (int r = 0; m; r++, m >>= 1) if ((m & 1) && S->ssbo[s][r].addr) { int h = app_find(S->ssbo[s][r].addr, 1); if (h >= 0) g_app[h].bound = g_app_frame; } }
@@ -1168,6 +1218,55 @@ static void app_draw(const vks_shader *const *sh, uint64_t ind, int indexed) {
                                            "(docs/GAMEPLAY_INVESTIGATION.md; gamectl set append_reset 0 turns it off)", indexed ? "indexed " : "", (unsigned long long)ind); }
 }
 
+// ---------- Transform feedback ----------
+// A game that skins on the GPU (Pokemon Legends Z-A: about 190 captures a frame) draws each mesh once with a vertex-only program between BeginTransformFeedback and
+// EndTransformFeedback, rasterizer discard on, and later draws read the feedback buffers as vertex streams; uncaptured, those streams hold nothing and the characters
+// are missing or collapse (nxnative, docs/reference/rendering.md "Transform feedback captured by a vertex entry point"). Here: VK_EXT_transform_feedback. The vertex
+// shader's capture variant (vk_shader.c vksh_xfb_variant, the layout from the program's control section) is drawn with the feedback buffers bound, one
+// vkCmdBegin/EndTransformFeedback around each draw (no other pipeline may be bound while a capture is active); a capture of several draws continues through the
+// counters Vulkan saves at each end. The captured bytes are copied back to guest memory like any GPU write into a pool.
+static struct { int active, cont; uint64_t off[4]; VkBuffer cnt; vk_alloc cnt_m; int cnt_state; } g_tf;
+static void tf_state(int what) { if (what == 0) { g_tf.cont = 0; memset(g_tf.off, 0, sizeof g_tf.off); } }
+static void tf_end(VkCommandBuffer cb) {
+    if (!g_tf.active) return;
+    VkBuffer c[4] = {g_tf.cnt, g_tf.cnt, g_tf.cnt, g_tf.cnt}; VkDeviceSize co[4] = {0, 4, 8, 12};
+    if (g_tf.cnt) vkCmdEndTransformFeedbackEXT(cb, 0, (uint32_t)g_tf.active, c, co); else vkCmdEndTransformFeedbackEXT(cb, 0, 0, NULL, NULL);
+    g_tf.active = 0; g_tf.cont = 1;
+}
+static const uint8_t *tf_ctl(const prog_t *p, const vks_shader *vs) {   // the control section of the program's stage that is vs
+    for (unsigned i = 0; p && i < p->nstage && i < 6; i++) if (vksh_get(p, i) == vs) return (const uint8_t *)p->sd[i].control;
+    return NULL;
+}
+static int tf_begin(VkCommandBuffer cb, const vks_xfb *L, uint64_t verts) {
+    if (!g_tf.cnt_state) { g_tf.cnt_state = 2;
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 64, VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+        VkMemoryRequirements mr;
+        if (vkCreateBuffer(g_vk.dev, &bci, NULL, &g_tf.cnt) == VK_SUCCESS) { vkGetBufferMemoryRequirements(g_vk.dev, g_tf.cnt, &mr);
+            if (!vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &g_tf.cnt_m)) { vkBindBufferMemory(g_vk.dev, g_tf.cnt, g_tf.cnt_m.mem, g_tf.cnt_m.off); g_tf.cnt_state = 1; } }
+        if (g_tf.cnt_state != 1) g_tf.cnt = VK_NULL_HANDLE;
+    }
+    VkBuffer b[4]; VkDeviceSize o[4], n[4];
+    for (int i = 0; i < L->nbuf; i++) {
+        if (!S->tfb[i].addr || !S->tfb[i].size || !vkm_use(S->tfb[i].addr, S->tfb[i].size, &b[i], &o[i]) || (o[i] & 3)) {
+            RED_ONCE(111, "transform feedback buffer %d (%#llx, %llu bytes) is in no memory pool or not word aligned: the capture is not written", i, (unsigned long long)S->tfb[i].addr, (unsigned long long)S->tfb[i].size);
+            return 0; }
+        n[i] = S->tfb[i].size;
+    }
+    vkCmdBindTransformFeedbackBuffersEXT(cb, 0, L->nbuf, b, o, n);
+    if (g_tf.cont && g_tf.cnt) { VkBuffer c[4] = {g_tf.cnt, g_tf.cnt, g_tf.cnt, g_tf.cnt}; VkDeviceSize co[4] = {0, 4, 8, 12}; vkCmdBeginTransformFeedbackEXT(cb, 0, L->nbuf, c, co); }
+    else { if (g_tf.cont) RED_ONCE(112, "a transform feedback capture continued over several draws without a counter buffer: it starts again at the buffers' start"); vkCmdBeginTransformFeedbackEXT(cb, 0, 0, NULL, NULL); }
+    g_tf.active = L->nbuf;
+    for (int i = 0; i < L->nbuf; i++) {   // the bytes this draw captures go back to guest memory with the pass's other GPU writes
+        uint64_t at = g_tf.off[i], len = verts * L->stride[i];
+        if (at >= S->tfb[i].size) continue;
+        if (len > S->tfb[i].size - at) len = S->tfb[i].size - at;
+        g_tf.off[i] = at + len;
+        if (len && g_nwb < 256) { g_wb[g_nwb].a = S->tfb[i].addr + at; g_wb[g_nwb].n = len; g_wb[g_nwb].base = 0; g_nwb++; }
+    }
+    VKC(VKC_TF_CAPTURE);
+    return 1;
+}
+static void tf_end_open(VkCommandBuffer cb) { tf_end(cb); }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     vkf_row *fr = fl_draw(dw, di);
     if (S->render_skip) { g_st.draws_skipped++; VKC(VKC_DRAW_RENDER_SKIP); if (fr) fr->flags |= FL_RC_SKIP; return; }
@@ -1194,7 +1293,17 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (!sh[4] || sh[4]->mesh != 2) { g_st.skip_no_shader++; g_st.draws_skipped++; skip_why(S->bst[4], 4, "a mesh draw"); return; }
     } else if (sh[4] && sh[4]->mesh) sh[3] = sh[4] = NULL;
     if (!mesh && (!sh[0] || (S->bst[1] && !sh[1] && !S->rast_discard))) { g_st.skip_no_shader++; g_st.draws_skipped++; skip_why(!sh[0] ? S->bst[0] : S->bst[1], !sh[0] ? 0 : 1, "a draw"); return; }
+    const vks_shader *vs0 = sh[0];
     if (!mesh) sh[0] = vin_shader(sh[0]);
+    vks_xfb xl; int tf = 0;
+    if (g_tf.active) tf_end(vks_cb());   // a capture left open by a draw that gave up half way
+    if (S->tf_on && !mesh && sh[0]) {
+        static const volatile int *xon; if (!xon) xon = vkc_ptr("xfb", 1);   // gamectl set xfb 0 (NXRT_VK_XFB=0): captures are not written, as before
+        if (!*xon || !vkCmdBeginTransformFeedbackEXT) RED_ONCE(113, "transform feedback is off (%s): captures are not written", *xon ? "the device has no VK_EXT_transform_feedback" : "xfb 0");
+        else if (sh[2] || sh[3] || sh[4]) RED_ONCE(114, "transform feedback from a geometry or tessellation stage is not captured yet (vertex shader %s)", sh[0]->key);
+        else if (!vksh_xfb_layout(tf_ctl(S->bst[0], vs0), &xl)) RED_ONCE(115, "transform feedback: the control section of vertex shader %s names no capture this replay knows: not written", sh[0]->key);
+        else { const vks_shader *x = vksh_xfb_variant(sh[0], &xl); if (x) { sh[0] = x; tf = 1; } }
+    }
     if (S->rast_discard) sh[1] = NULL;
     { static const volatile int *ng; if (sh[2]) { if (!ng) ng = vkc_ptr("no_gs", 0); if (*ng) sh[2] = NULL; } }
     if (!mesh) app_draw(sh, ind, di != NULL);
@@ -1408,6 +1517,18 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
               VKLOG("drawlog: %s vertex input: %s", dl[k], vi); }
           dn[k]++; if (now - dt[k] > 5000000000ull) { VKLOG("drawlog: %s drawn %llu times in %.1f s (frame %llu)", dl[k], (unsigned long long)dn[k], (now - dt[k]) / 1e9, (unsigned long long)g_dl_frame); dn[k] = 0; dt[k] = now; }
           } }
+    if (tf) {
+        uint64_t nv = (uint64_t)(dw ? dw->count : di->count) * (uint64_t)(inst ? inst : 1);
+        if (ind) { RED_ONCE(116, "an indirect draw captured by transform feedback: the bytes written are taken as the whole buffers"); nv = ~0ull >> 16; }
+        else switch (prim) {
+            case NVN_DRAW_PRIMITIVE_POINTS: break;
+            case NVN_DRAW_PRIMITIVE_LINES: nv &= ~1ull; break;
+            case NVN_DRAW_PRIMITIVE_LINE_STRIP: nv = nv > 1 ? 2 * (nv - 1) : 0; break;
+            case NVN_DRAW_PRIMITIVE_TRIANGLES: nv -= nv % 3; break;
+            default: nv = nv > 2 ? 3 * (nv - 2) : 0; break;   // strips and fans: three vertices a triangle
+        }
+        tf_begin(cb, &xl, nv);
+    }
     if (mesh) {
         static uint64_t nm; if (!(nm++ & 0xfff)) VKLOG("mesh draws so far: %llu; this one %d workgroups, task shader %s, mesh shader %s, fragment shader %s", (unsigned long long)nm, dw->count, sh[3] ? sh[3]->key : "-", sh[4]->key, sh[1] ? sh[1]->key : "-");
         vkCmdDrawMeshTasksEXT(cb, (uint32_t)dw->count, 1, 1);
@@ -1448,6 +1569,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             else if (di->count > 0) for (int r = 0; r < rep; r++) vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
         }
     }
+    if (g_tf.active) tf_end(cb);
     g_st.draws++;
     (void)swrites;
     if (g_nwb >= 240) pass_end();   // the write-back list is nearly full: record the copies now
@@ -1830,7 +1952,7 @@ static void state_op(uint32_t op, const void *a) {
     case OP_BLEND_COLOR: memcpy(S->blend_color, ((const p_blend_color *)a)->rgba, 16); break;
     case OP_ALPHA_REF: S->alpha_ref = ((const p_alpha_ref *)a)->ref; break;
     case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S->copy_img_stride = cs->stride; else S->copy_stride = cs->stride; break; }
-    case OP_TF_STATE: { const p_tf_state *b = a; S->tf_on = b->what == 0 || b->what == 3; PD("transform feedback %s (control buffer %#llx)", b->what == 0 ? "begin" : b->what == 1 ? "end" : b->what == 2 ? "pause" : "resume", (unsigned long long)b->ctl); if (S->tf_on) RED_ONCE(111, "transform feedback is not captured yet"); break; }
+    case OP_TF_STATE: { const p_tf_state *b = a; S->tf_on = b->what == 0 || b->what == 3; tf_state(b->what); PD("transform feedback %s (control buffer %#llx)", b->what == 0 ? "begin" : b->what == 1 ? "end" : b->what == 2 ? "pause" : "resume", (unsigned long long)b->ctl);  break; }
     case OP_PRIM_RESTART: S->restart = *(const p_prim_restart *)a; break;
     case OP_RAST_DISCARD: S->rast_discard = ((const p_rast_discard *)a)->on; break;
     default: break;
@@ -1954,7 +2076,7 @@ static int walk(const uint8_t *p, int depth, uint64_t *budget) {
         case OP_DRAW_TEX: RED_ONCE(120, "DrawTexture is not replayed yet"); break;
         case OP_RENDER_COND: render_cond((const p_render_cond *)a); break;
         case OP_PUSH_CONST: { const p_push_const *r = (const p_push_const *)a; if ((uint32_t)r->offset + r->size <= DMSH_PUSH_SIZE) { memcpy(S->push[r->compute != 0] + r->offset, r->data, r->size); for (int k = 0; k < 6; k++) g_bver[k]++; } break; }
-        case OP_TF_BIND: { const p_tf_bind *b = (const p_tf_bind *)a; PD("transform feedback buffer %d: %#llx, %llu bytes", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); break; }
+        case OP_TF_BIND: { const p_tf_bind *b = (const p_tf_bind *)a; if (b->index >= 0 && b->index < 4) { S->tfb[b->index].addr = b->addr; S->tfb[b->index].size = b->size; } PD("transform feedback buffer %d: %#llx, %llu bytes", b->index, (unsigned long long)b->addr, (unsigned long long)b->size); break; }
         default: state_op(h.op, a); break;
         }
         p += h.size;
@@ -2078,6 +2200,7 @@ static void slow_frame(uint64_t frame) {
 }
 void vkr_frame(uint64_t frame) {
     g_app_frame = frame + 2;   // from 1: 0 means "never bound"
+    gm_frame(frame);
     static vkr_stats_t prev; static uint64_t pf;
     g_dl_frame = frame;
     slow_frame(frame);

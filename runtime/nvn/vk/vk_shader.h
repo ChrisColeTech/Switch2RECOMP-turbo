@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 enum { VKS_VS = 0, VKS_FS = 1, VKS_GS = 2, VKS_TCS = 3, VKS_TES = 4, VKS_CS = 5 };   // NVNshaderStage
-enum { VKB_SUPPORT = 1, VKB_CBUF, VKB_C1, VKB_DRV, VKB_SBUF, VKB_TEX, VKB_TBUF, VKB_IMG, VKB_UBOP, VKB_SBUF_UBO, VKB_UNKNOWN };
+enum { VKB_SUPPORT = 1, VKB_CBUF, VKB_C1, VKB_DRV, VKB_SBUF, VKB_TEX, VKB_TBUF, VKB_IMG, VKB_UBOP, VKB_SBUF_UBO, VKB_GMEM_MAP, VKB_GMEM_LOG, VKB_UNKNOWN };   // GMEM_*: the memory pool table and the write log of raw global memory (vk_mem.c vkm_gmem_table)
 enum { VKB_SAMP_NONE = 0, VKB_SAMP_TEX, VKB_SAMP_SLOT, VKB_SAMP_ID };   // where a combined image sampler's sampler comes from
 enum { VKS_CT_FLOAT = 0, VKS_CT_UINT, VKS_CT_INT };
 
@@ -24,6 +24,8 @@ typedef struct {
     uint8_t dref, plain;   // the shader samples it with a depth comparison (OpImage*Dref*), and without one
 } vks_bind;
 
+// What a program captures with transform feedback (vk_shader.c vksh_xfb_layout): per captured output its buffer, location, components and byte offset in the record
+typedef struct { uint8_t nbuf, n; uint16_t stride[4]; struct { uint8_t buf, loc, ncomp; uint16_t off; } o[16]; } vks_xfb;
 typedef struct vks_shader {
     struct { int reg; uint32_t word, value; } first[8]; int nfirst;   // stores the replay makes before a dispatch (nxs_spv.py FirstStore)
     char key[17]; int stage, set, mesh;   // mesh: 1 a task shader, 2 a mesh shader, in the tessellation stages' places
@@ -46,7 +48,10 @@ typedef struct vks_shader {
     uint8_t ds_reuse;                                       // vk_replay.c set_reusable: 0 not looked at yet, 1 its set may serve the next draw, 2 never
     uint8_t app_look; uint16_t app_regs;                    // vk_replay.c app_regs: the storage buffer slots it writes (looked up once)
     uint64_t keyn;                                          // vk_replay.c sh_keyn: the key as a number (0 until asked for)
+    uint8_t xfb_state; struct vks_shader *xfb;              // vksh_xfb_variant: 0 not asked for yet, 1 made (xfb), 2 cannot be made
 } vks_shader;
+int vksh_xfb_layout(const uint8_t *ctl, vks_xfb *L);
+const vks_shader *vksh_xfb_variant(const vks_shader *vs, const vks_xfb *L);
 
 int vksh_init(void);
 void vksh_shutdown(void);

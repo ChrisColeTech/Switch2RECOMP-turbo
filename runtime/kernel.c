@@ -109,6 +109,11 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
   t->entry=entry; t->arg=arg; t->stack_top=stack_top; t->prio=prio; t->core=core<0? 0 : core; t->ideal=t->core; t->affinity=1ull<<t->core;
   t->tls=alloc_tls(); pc_init(&t->cv); t->ct_core=-1; t->ct_grant=-1;
   pm_lock(&g_klock); t->id=g_next_tid++; if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
+  /* The thread's ID at ThreadLocalRegion+0x110. SDK 22's InternalCriticalSection compares a mutex's owner word with the 32-bit ID it reads there
+     (mrs tpidrro_el0; ldr w8,[x8,#0x110]); left 0 it equals an unlocked mutex's owner, every mutex read as already held by the caller, and the SDK's own allocator
+     aborted at its first lock (pthread_mutex_lock <- TlsHeapCentral::LockMutexSlow_ <- __nnmusl_init_dso): Ocarina of Time (SDK 22.2.8) stopped with svcBreak
+     1.6 s in. From nxnative, docs/reference/threads.md "The thread ID at ThreadLocalRegion+0x110 (SDK 22)" (MIT, (c) seedds) */
+  { u32 id32=(u32)t->id; memcpy((u8*)GP(t->tls)+0x110,&id32,4); }
   CPU* c=&t->cpu; memset(c,0,sizeof *c);
   c->mem=g_mem; c->disp=g_disp; c->code_lo=g_code_lo; c->code_hi=g_code_hi; c->rt=&g_rtapi; c->thread=t;
   c->tpidrro=t->tls; c->x[0]=arg; c->x[31]=stack_top; c->pc=entry;

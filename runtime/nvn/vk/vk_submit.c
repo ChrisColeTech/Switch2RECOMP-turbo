@@ -25,6 +25,7 @@ static int g_order[NSLOT], g_norder;        // committed slots (pending, then su
 static int g_cur = -1;                      // the NVN submission being recorded
 static DWORD g_cur_tid;                     // the thread recording it (M6 phase B: another thread's uploads go to a one-shot of its own, not into this slot)
 static SRWLOCK g_lk = SRWLOCK_INIT;         // slots, order, value assignment
+static CONDITION_VARIABLE g_work = CONDITION_VARIABLE_INIT; static int g_comp_sleep;   // a submission went to the queue (completion_main)
 static CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;   // a slot freed / a value completed
 static HANDLE g_thread; static _Atomic int g_stop;
 static int g_batch = 4;                     // NXRT_VK_BATCH: committed submissions held back before one queue submit
@@ -77,6 +78,7 @@ static void flush_locked(void) {
         s->state = S_SUBMITTED; last = s->value; n++;
     }
     if (!n) return;
+    WakeAllConditionVariable(&g_work);
     AcquireSRWLockExclusive(&g_vk.qlock);
     VkResult r = vkQueueSubmit2(g_vk.q, (uint32_t)n, si, VK_NULL_HANDLE);
     ReleaseSRWLockExclusive(&g_vk.qlock);
@@ -113,8 +115,11 @@ static unsigned __stdcall completion_main(void *arg) {
             if (s->state == S_PENDING && !age_from) age_from = s->t_commit;
         }
         if (age_from && now_ns() - age_from > AGE_FLUSH_NS) flush_locked();
+        // Nothing submitted: woken when a submission goes to the queue (flush_locked), not at the end of a sleep. The game waits for each frame's fence, and the fence
+        // is reported from this thread: a millisecond's sleep here was up to a millisecond of every frame (NXRT_VK_COMPLETION_SLEEP=1: the sleep, as before)
+        if (!want && !g_comp_sleep) SleepConditionVariableSRW(&g_work, &g_lk, 1, 0);
         ReleaseSRWLockExclusive(&g_lk);
-        if (!want) { vk_retire_poll(); Sleep(1); continue; }
+        if (!want) { vk_retire_poll(); if (g_comp_sleep) Sleep(1); continue; }
         if (!vk_tl_wait(want, 1000000)) continue;
         uint64_t done = vk_tl_value();
         for (;;) {   // apply in value order; effects run outside the lock (an event write can wake a guest thread that submits)
@@ -139,6 +144,7 @@ int vks_init(void) {
     const char *e = getenv("NXRT_VK_BATCH"); if (e && atoi(e) > 0) g_batch = atoi(e) < NSLOT / 2 ? atoi(e) : NSLOT / 2;
     for (int i = 0; i < NSLOT; i++) slot_init(&g_slot[i]);
     atomic_store(&g_stop, 0);
+    { const char *e = getenv("NXRT_VK_COMPLETION_SLEEP"); g_comp_sleep = e && *e == '1'; }
     g_thread = (HANDLE)_beginthreadex(NULL, 0, completion_main, NULL, 0, NULL);
     return g_thread ? 0 : -1;
 }

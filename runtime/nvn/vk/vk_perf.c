@@ -50,7 +50,7 @@ static unsigned __stdcall writer(void *arg) {
 }
 _Atomic uint64_t vkc_count[VKC_N];
 static const char *const vkc_name[VKC_N] = {"tex_new", "tex_no_format", "tex_create_failed", "tex_no_memory", "tex_unaddressable", "tex_unreadable",
-    "view_failed", "shader_unusable", "draw_prim_unsupported", "draw_no_mesh_shader", "draw_render_skip", "ind_draw_no_instances", "append_counter_reset", "sbuf_size0"};
+    "view_failed", "shader_unusable", "draw_prim_unsupported", "draw_no_mesh_shader", "draw_render_skip", "ind_draw_no_instances", "append_counter_reset", "sbuf_size0", "gmem_pages_learned", "tf_captures"};
 // the graphics columns of the metrics row (kernel.c metrics_tick): per second, except tex_order
 uint64_t vkm_wb_cpu_newer(void);
 static void metrics_gfx(FILE *f, int header) {

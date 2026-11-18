@@ -780,6 +780,124 @@ static const vks_shader *fs_variant_l(const vks_shader *fs_, int flags) {
     static int nl; if (nl++ < 16) VKLOG("fragment shader %s: %s%s%s%s variant", fs->key, dual ? "dual-source" : "", dual && alpha ? " + " : "", alpha ? "alpha test" : "", ik ? (dual || alpha ? " + int outputs" : "int outputs") : "");
     return s;
 }
+// ---------- Transform feedback: the capture variant of a vertex shader ----------
+// An NVN program's control section says what its last vertex-processing stage captures (nxnative dmsh_build.py tf_layout, docs/reference/rendering.md "Transform
+// feedback captured by a vertex entry point"; MIT, (c) seedds): u16 strides at +0x6dc, per-buffer output counts at +0x6e8, the buffer count at +0x6ec, and per buffer b
+// the output locations (0x20 + n) at +0xdc + 0x80 b with their component counts, a byte each, at +0x4dc + 0x80 b; a buffer's outputs are interleaved in that order.
+// Vulkan captures whole output variables, and the translator's outputs are float vec4s, so each captured output gets a variable of its own with as many components as
+// the layout names (XfbBuffer, XfbStride, Offset), stored from the original at every return of the entry point. Returns 0 when the section names no capture
+int vksh_xfb_layout(const uint8_t *ctl, vks_xfb *L) {
+    memset(L, 0, sizeof *L);
+    if (!ctl) return 0;
+    unsigned nb = ctl[0x6ec]; if (!nb || nb > 4) return 0;
+    for (unsigned b = 0; b < nb; b++) {
+        uint16_t st; memcpy(&st, ctl + 0x6dc + 2 * b, 2); unsigned cnt = ctl[0x6e8 + b], off = 0;
+        L->stride[b] = st;
+        for (unsigned i = 0; i < cnt; i++) {
+            unsigned loc = ctl[0xdc + 0x80 * b + i], nc = ctl[0x4dc + 0x80 * b + i];
+            if (loc < 0x20 || loc >= 0x40 || nc < 1 || nc > 4 || L->n == 16) return 0;   // a built-in (position, point size) or a form not met yet
+            L->o[L->n].buf = (uint8_t)b; L->o[L->n].loc = (uint8_t)(loc - 0x20); L->o[L->n].ncomp = (uint8_t)nc; L->o[L->n].off = (uint16_t)off; L->n++; off += 4 * nc;
+        }
+        if (off > st) return 0;
+    }
+    L->nbuf = (uint8_t)nb;
+    return L->n > 0;
+}
+static uint32_t *vkspv_xfb(const uint32_t *w, size_t n, const vks_xfb *L, size_t *out_n) {
+    enum { OP_CAPABILITY_ = 17, OP_EXEC_MODE_ = 16, OP_TYPE_FLOAT_ = 22, OP_TYPE_VECTOR_ = 23, OP_TYPE_POINTER_ = 32, OP_VARIABLE_ = 59, OP_LOAD_ = 61, OP_DECORATE_ = 71, OP_COMPOSITE_EXTRACT_ = 81,
+           OP_VECTOR_SHUFFLE_ = 79, DEC_LOCATION_ = 30, DEC_XFB_BUFFER_ = 36, DEC_XFB_STRIDE_ = 37, CAP_XFB_ = 53, MODE_XFB_ = 11 };
+    if (!spv_ok(w, n)) return NULL;
+    uint32_t bound = w[3], f32 = 0, vec[5] = {0}, ptr[5] = {0}, entry = 0, used_loc = 0;
+    uint32_t *loc_of = calloc(bound, 4), *type_of = calloc(bound, 4), *is_out = calloc(bound, 4), *ptr_to = calloc(bound, 4);
+    size_t last_cap = 0, entry_at = 0, last_dec = 0, first_fn = 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (!wc || i + wc > n) goto fail;
+        if (op == OP_CAPABILITY_) last_cap = i + wc;
+        if (op == OP_ENTRY_POINT && !entry) { entry = w[i + 2]; entry_at = i; }
+        if (op == OP_DECORATE_ || op == OP_MEMBER_DECORATE) last_dec = i + wc;
+        if (op == OP_DECORATE_ && wc == 4 && w[i + 2] == DEC_LOCATION_ && w[i + 1] < bound) loc_of[w[i + 1]] = w[i + 3] + 1;
+        if (op == OP_TYPE_FLOAT_ && w[i + 2] == 32) f32 = w[i + 1];
+        if (op == OP_TYPE_VECTOR_ && f32 && w[i + 2] == f32 && w[i + 3] <= 4) vec[w[i + 3]] = w[i + 1];
+        if (op == OP_TYPE_POINTER_ && w[i + 1] < bound) { ptr_to[w[i + 1]] = w[i + 3]; if (w[i + 2] == SC_OUTPUT) { if (w[i + 3] == f32) ptr[1] = w[i + 1]; for (int c = 2; c <= 4; c++) if (vec[c] && w[i + 3] == vec[c]) ptr[c] = w[i + 1]; } }
+        if (op == OP_VARIABLE_ && wc >= 4 && w[i + 3] == SC_OUTPUT && w[i + 2] < bound) { is_out[w[i + 2]] = 1; type_of[w[i + 2]] = w[i + 1]; }
+        if (op == OP_FUNCTION && !first_fn) first_fn = i;
+        i += wc;
+    }
+    if (!f32 || !vec[4] || !entry || !first_fn || !last_dec || !last_cap) goto fail;
+    uint32_t src[16] = {0};
+    for (uint32_t id = 0; id < bound; id++) if (is_out[id] && loc_of[id]) {
+        if (loc_of[id] - 1 < 32) used_loc |= 1u << (loc_of[id] - 1);
+        for (int k = 0; k < L->n; k++) if (L->o[k].loc == loc_of[id] - 1) { if (ptr_to[type_of[id]] != vec[4]) goto fail; src[k] = id; }
+    }
+    for (int k = 0; k < L->n; k++) if (!src[k]) goto fail;   // the shader does not write an output the layout captures
+    wbuf decs = {0}, types = {0}, stores = {0};
+    uint32_t nv[16], iface[16]; int nif = 0;
+    #define PUT(b, ...) do { uint32_t t_[] = {__VA_ARGS__}; wput(&(b), t_, sizeof t_ / 4); } while (0)
+    for (int k = 0; k < L->n; k++) {
+        int nc = L->o[k].ncomp; uint32_t var = src[k];
+        if (nc < 4) {
+            if (nc == 1 && !ptr[1]) { ptr[1] = bound++; PUT(types, 4u << 16 | OP_TYPE_POINTER_, ptr[1], SC_OUTPUT, f32); }
+            if (nc > 1 && !vec[nc]) { vec[nc] = bound++; PUT(types, 4u << 16 | OP_TYPE_VECTOR_, vec[nc], f32, (uint32_t)nc); }
+            if (nc > 1 && !ptr[nc]) { ptr[nc] = bound++; PUT(types, 4u << 16 | OP_TYPE_POINTER_, ptr[nc], SC_OUTPUT, vec[nc]); }
+            var = bound++; PUT(types, 4u << 16 | OP_VARIABLE_, ptr[nc], var, SC_OUTPUT);
+            int fl = 31; while (fl >= 0 && (used_loc >> fl & 1)) fl--; if (fl < 0) { free(decs.w); free(types.w); free(stores.w); goto fail; }
+            used_loc |= 1u << fl; PUT(decs, 4u << 16 | OP_DECORATE_, var, DEC_LOCATION_, (uint32_t)fl);
+            iface[nif++] = var;
+        }
+        nv[k] = var;
+        PUT(decs, 4u << 16 | OP_DECORATE_, var, DEC_XFB_BUFFER_, L->o[k].buf);
+        PUT(decs, 4u << 16 | OP_DECORATE_, var, DEC_XFB_STRIDE_, L->stride[L->o[k].buf]);
+        PUT(decs, 4u << 16 | OP_DECORATE_, var, DEC_OFFSET, L->o[k].off);
+    }
+    wbuf o = {0}; wput(&o, w, 5);
+    int in_entry = 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (i == last_cap) PUT(o, 2u << 16 | OP_CAPABILITY_, CAP_XFB_);
+        if (i == last_dec) wput(&o, decs.w, decs.n);
+        if (i == first_fn) wput(&o, types.w, types.n);
+        if (op == OP_FUNCTION) in_entry = w[i + 2] == entry;
+        if (i == entry_at) {   // the new variables join the interface; the execution mode follows the entry points
+            uint32_t h = (wc + (uint32_t)nif) << 16 | OP_ENTRY_POINT; wput(&o, &h, 1); wput(&o, w + i + 1, wc - 1); wput(&o, iface, (size_t)nif);
+            PUT(o, 3u << 16 | OP_EXEC_MODE_, entry, MODE_XFB_);
+            i += wc; continue;
+        }
+        if (op == OP_RETURN && in_entry) for (int k = 0; k < L->n; k++) if (nv[k] != src[k]) {
+            uint32_t ld = bound++, v = bound++; int nc = L->o[k].ncomp;
+            PUT(o, 4u << 16 | OP_LOAD_, vec[4], ld, src[k]);
+            if (nc == 1) PUT(o, 5u << 16 | OP_COMPOSITE_EXTRACT_, f32, v, ld, 0);
+            else { uint32_t x[8] = {(5u + (uint32_t)nc) << 16 | OP_VECTOR_SHUFFLE_, vec[nc], v, ld, ld, 0, 1, 2}; wput(&o, x, 5 + (size_t)nc); }
+            PUT(o, 3u << 16 | OP_STORE, nv[k], v);
+        }
+        wput(&o, w + i, wc); i += wc;
+    }
+    #undef PUT
+    o.w[3] = bound;
+    free(decs.w); free(types.w); free(stores.w); free(loc_of); free(type_of); free(is_out); free(ptr_to);
+    *out_n = o.n; return o.w;
+fail:
+    free(loc_of); free(type_of); free(is_out); free(ptr_to);
+    return NULL;
+}
+// The variant of vertex shader vs that captures layout L (remembered per shader; the layout is the program's, and a vertex shader is met with one). NULL when none can be made
+const vks_shader *vksh_xfb_variant(const vks_shader *vs_, const vks_xfb *L) {
+    vks_shader *vs = (vks_shader *)vs_;
+    if (vs->xfb_state) return vs->xfb_state == 1 ? vs->xfb : NULL;
+    size_t nn = 0; uint32_t *w = g_vk.has.xfb ? vkspv_xfb(vs->words, vs->nwords, L, &nn) : NULL;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nn * 4, w};
+    if (!w || vk_module(&mci, &mod, vs->key, "transform feedback") != VK_SUCCESS) {
+        free(w); vs->xfb_state = 2;
+        static int k; if (k++ < 8) VKRED("shader %s: no transform feedback variant (%s): its captures are not written", vs->key, !g_vk.has.xfb ? "the device has no VK_EXT_transform_feedback" : "its outputs are not what the control section names");
+        return NULL;
+    }
+    vks_shader *s = malloc(sizeof *s); *s = *vs;
+    s->mod = mod; s->words = w; s->nwords = nn; s->base = vs->base ? vs->base : vs; s->nvar = 0; s->xfb_state = 0; s->xfb = NULL;
+    vs->xfb = s; vs->xfb_state = 1;
+    static int nl; if (nl++ < 16) VKLOG("vertex shader %s: transform feedback variant (%d outputs into %d buffers, strides %u/%u/%u/%u)", vs->key, L->n, L->nbuf, L->stride[0], L->stride[1], L->stride[2], L->stride[3]);
+    return s;
+}
 // A pixel shader that draws a number as a flat colour: 1 + n / 32 in each channel, 5 bits a channel, which R11G11B10F keeps exactly (NXRT_VK_DUMP_AT_S, tools/pass_pair.py)
 const vks_shader *vksh_id_variant(const vks_shader *fs) {
     enum { MAXID = 4096 }; static const vks_shader *from[MAXID], *to[MAXID]; static int n;
@@ -917,7 +1035,10 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
         const char *k = vj_str(vj_get(nv, "kind"), "?");
         b->reg = (int16_t)vj_int(vj_get(nv, "reg"), 0); b->bank = (uint8_t)vj_int(vj_get(nv, "bank"), 0);
         b->kind = !strcmp(k, "support") ? VKB_SUPPORT : !strcmp(k, "cbuf") ? VKB_CBUF : !strcmp(k, "c1") ? VKB_C1 : !strcmp(k, "drvcb") ? VKB_DRV : !strcmp(k, "sbuf") ? VKB_SBUF :
-                  !strcmp(k, "tex") ? VKB_TEX : !strcmp(k, "tbuf") ? VKB_TBUF : !strcmp(k, "img") ? VKB_IMG : !strcmp(k, "ubo_ptr") ? VKB_UBOP : !strcmp(k, "sbuf_ubo") ? VKB_SBUF_UBO : VKB_UNKNOWN;
+                  !strcmp(k, "tex") ? VKB_TEX : !strcmp(k, "tbuf") ? VKB_TBUF : !strcmp(k, "img") ? VKB_IMG : !strcmp(k, "ubo_ptr") ? VKB_UBOP : !strcmp(k, "sbuf_ubo") ? VKB_SBUF_UBO :
+                  !strcmp(k, DMSH_KIND_GMEM_MAP) ? VKB_GMEM_MAP : !strcmp(k, DMSH_KIND_GMEM_LOG) ? VKB_GMEM_LOG : VKB_UNKNOWN;
+        // Reflections made before nxs_refl.py named them: the translator's sentinel uniform slot (DMSH_GMEM_MAP_CB_SLOT) read as a storage buffer kept in uniform slot 252
+        if (b->kind == VKB_SBUF_UBO && b->reg == DMSH_GMEM_MAP_CB_SLOT - 3) b->kind = vj_int(vj_get(nv, "off"), 0) == DMSH_GMEM_LOG_CB_OFFSET * 4 ? VKB_GMEM_LOG : VKB_GMEM_MAP;
         if (b->kind == VKB_UNKNOWN) { static int n; if (n++ < 16) VKRED("shader %s binding %u: kind %s is not replayed yet (bound as empty)", key, b->binding, k); }
         b->rw = vj_true(vj_get(nv, "rw")); b->c0_off = (uint16_t)vj_int(vj_get(nv, "c0_offset"), 0);
         if (b->kind == VKB_SBUF_UBO) b->c0_off = (uint16_t)vj_int(vj_get(nv, "off"), 0);   // where in uniform slot reg the buffer's address and size are
@@ -1004,7 +1125,7 @@ static vks_shader *get_l(const nxs_shader *n) {   // g_shl held
         g_loaded++;
         vk_hm_put(&g_sh, n->key, s);
         { char k[128]; int o = 0; int cnt[VKB_UNKNOWN + 1] = {0}; for (int i = 0; i < s->nb; i++) cnt[s->b[i].kind]++;
-          static const char *nm[] = {"", "support", "cbuf", "c1", "drv", "sbuf", "tex", "tbuf", "img", "ubop", "sbuf_ubo", "?"};
+          static const char *nm[] = {"", "support", "cbuf", "c1", "drv", "sbuf", "tex", "tbuf", "img", "ubop", "sbuf_ubo", "gmem_map", "gmem_log", "?"};
           for (int i = 1; i <= VKB_UNKNOWN; i++) if (cnt[i]) o += snprintf(k + o, sizeof k - o, " %s %d", nm[i], cnt[i]);
           VKLOG("shader %s (%s):%s%s%s", n->key, s->stage == VKS_VS ? "vertex" : s->stage == VKS_FS ? "fragment" : s->stage == VKS_CS ? "compute" : s->stage == VKS_GS ? "geometry" : "tessellation", k,
                 s->drv_read[0] || s->drv_read[2] ? " (reads driver segments)" : "", s->s2cs ? " (Switch 2 compute bank)" : ""); }

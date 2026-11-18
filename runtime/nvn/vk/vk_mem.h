@@ -27,6 +27,10 @@ uint64_t vkm_wb_base(uint64_t addr, uint64_t len);
 void vkm_gpu_wrote_base(uint64_t addr, uint64_t len, uint64_t base);
 // GPU writes whose bytes the CPU knows (inline uniform updates, fills): guest memory gets the same bytes at completion; data is copied
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value);
+// Raw global memory (a shader's accesses at addresses it loaded from memory): the memory pool table and the write log to bind, and the logged pages (vk_mem.c)
+VkBuffer vkm_gmem_table(VkDeviceSize *size);
+VkBuffer vkm_gmem_log(VkDeviceSize *size);
+int vkm_gmem_log_take(uint64_t *pages, int max, int *full);
 // Every pool's written pages, within the frame's upload budget (the policy until the replay calls vkm_use; then a background prefetch). Returns bytes queued
 uint64_t vkm_sync_all(void);
 void vkm_frame_tick(uint64_t frame);       // at each present: the budget restarts, hot pages age, statistics every 300 frames

@@ -107,7 +107,11 @@ static void vsync_tick_vt(void){
   u64 v=guest_ns(); if(!next) next=v;
   if(v>=next){ vi_vsync_tick(); next+=16666667ull; if(v>next+50000000ull) next=v; } }
 
-static u64 rt_ticks(void){ return (u64)((double)guest_ns()*0.0192); }
+/* The system counter, on the guest clock. A Switch program converts it at 19.2 MHz; the Switch 2's SDK at 31.25 MHz (nn::os::GetSystemTickFrequency answers 0x1dcd650,
+   32 ns a tick, and reads cntpct_el0 itself). Served at 19.2 MHz, every span a Switch 2 game measured in ticks came out 0.6144 of its length (nxnative,
+   docs/reference/frame-rate.md "The Switch 2's system tick is 31.25 MHz": Donkey Kong Bananza's frame-rate controller). SWR_TICK_HZ=<Hz> overrides */
+static double g_tick_per_ns=0.0192;
+static u64 rt_ticks(void){ return (u64)((double)guest_ns()*g_tick_per_ns); }
 
 void swr_fpcr_apply(CPU* c){
 #if defined(__aarch64__)
@@ -456,6 +460,9 @@ int swr_main(int argc, char** argv){
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }
+  if((g_title_id>>56)==0x04) g_tick_per_ns=0.03125;
+  { const char* e=getenv("SWR_TICK_HZ"); if(e && atof(e)>=1e6) g_tick_per_ns=atof(e)*1e-9; }
+  if(g_tick_per_ns!=0.0192) LOG("clock: system tick %.2f MHz%s\n", g_tick_per_ns*1e3, (g_title_id>>56)==0x04? " (a Switch 2 program)" : "");
   if((g_title_id>>56)==0x04 && !getenv("SWR_HEAP8")){ mem_layout_nx2(); LOG("memory: Switch 2 layout, 12 GB heap region\n"); }
   /* texture byte order inside a GOB (nvn/gfx/nvn_texio.c, s2tex): a Switch 1 program (title 01..., a "Switch 2 Edition"
      upgrade too) ships its textures in the Tegra X1 order; read in the Switch 2 order (bits 5 and 6 exchanged) Pokemon
