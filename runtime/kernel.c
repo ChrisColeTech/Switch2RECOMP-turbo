@@ -1094,6 +1094,17 @@ static void swr_svc_(CPU* c, u32 imm){
   case 0x29: { u64 o=0; x[0]=svc_get_info((u32)x[1],(u32)x[2],x[3],&o); x[1]=o; return; }
   case 0x2A: case 0x2B: case 0x5D: case 0x5E: case 0x5F: case 0x36: x[0]=0; return;
   case 0x2C: { u64 a=x[0], s=x[1]; if((a|s)&0xFFF){ x[0]=R_BADADDR; return; }
+    /* A map past the application pool fails with ResultLimitReached, as on Horizon (nxnative, docs/reference/memory.md "Maps past the application
+       pool fail as on Horizon", its profile key mem_map_limit; MIT, (c) seedds). The SDK's allocator keeps freed pages mapped and maps new ones
+       until a map fails; only then does it unmap its cached block and try again. Never refused, the block that nninitStartup's probe left (all
+       that could be allocated: 3.15 GB in Pokemon Legends Z-A) stayed mapped beside what the game used. For the two titles nxnative has it on
+       for (another of its games maps a little past the pool it is told of); SWR_MAP_LIMIT=1/0 for any title */
+    { static int lim=-1; if(lim<0){ const char* e=getenv("SWR_MAP_LIMIT"); lim= e&&*e? atoi(e)!=0 : g_title_id==0x0100F43008C44000ull || g_title_id==0x0400486024DEC000ull; }
+      if(lim){ u64 need=0;
+        for(u64 p=a;p<a+s;){ MemBlock b; mem_query(p,&b); u64 e=b.addr+b.size; if(e>a+s) e=a+s; if(e<=p) break; if(b.state==MS_FREE) need+=e-p; p=e; }
+        if(need && used_memory()+need>mem_total()){ static int nl; if(nl++<8) LOG("memory: MapPhysicalMemory +%llu MB refused: %llu MB mapped, the application pool (%llu MB) is full (ResultLimitReached: the SDK gives its cached pages back and tries again)\n",
+            (unsigned long long)(need>>20),(unsigned long long)(g_phys_mapped>>20),(unsigned long long)(mem_total()>>20));
+          x[0]=0x10801; return; } } }
     /* only map the holes */
     for(u64 p=a;p<a+s;){ MemBlock b; mem_query(p,&b); u64 e=b.addr+b.size; if(e>a+s) e=a+s; if(e<=p) break;
       if(b.state==MS_FREE){ if(mem_map(p,e-p,MS_NORMAL,PERM_RW)){ WARN("svc MapPhysicalMemory %llx size %llx: out of memory (the PC couldn't commit it)\n",(unsigned long long)p,(unsigned long long)(e-p)); x[0]=R_OUTOFMEM; return; } g_phys_mapped+=e-p; } p=e; }
