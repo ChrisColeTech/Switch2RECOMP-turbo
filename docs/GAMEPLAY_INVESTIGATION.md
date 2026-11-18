@@ -11,10 +11,10 @@ do not load (black screens, black gaps); MKW plays at about 30 FPS instead of 60
 | Donkey Kong Bananza | gameplay reached, terrain black | terrain shaded by the game's own mechanism (section 6), queues interleaved at their event waits, 48.7 FPS in the tunnel | 60 FPS: the per-chunk write-backs (section 6) |
 | Mario Kart World | race at 44-51 FPS | race at 58.6 FPS mean | texture streaming bursts (single frames of 60-170 ms) |
 | Pokemon Legends Z-A | title -> Language -> Appearance | in the world, lit, characters skinned, walking; 30 FPS (the game's interval) | 32x32 cube placeholders viewed as arrays |
-| Ocarina of Time | did not start (svcBreak 1.6 s in) | title screen and menu | no AV1 decoder (movies are black); the game itself not reached yet |
+| Ocarina of Time | did not start (svcBreak 1.6 s in) | title screen and menu; its AV1 movies are decoded (dav1d, `AV1_DECODER.md`) and reach the game's textures | the movie network (`nn::ndve`) between those textures and the screen does not compute yet, so the movies still show black; the game itself not reached yet |
 
 Sections 1 to 5 are the first round as it was written; section 6 is the second round, which found the causes sections 1
-and 3 left open.
+and 3 left open. The AV1 decoder that section 6 left open for Ocarina of Time is in `AV1_DECODER.md`.
 
 Display: console session, 60 Hz, Vulkan on an RTX 5090. All numbers are from the real library builds, rebuilt through
 the engine CLI into each entry's `buildDir`, driven by `tools/plza_probe.py` (pad replay, runtime screenshots).
@@ -396,7 +396,8 @@ Seven stops, each found from the log's stack and fixed; the first two and the fi
 | 13.5 s | device lost in a dispatch of `d15370a382630d4e` (384 raw loads, 384 raw stores) | the pool table and the write log were in host memory | device memory (above) |
 
 Result (`-201542-zelda-vram`): the title screen with its logo and menu ("New Game", "Options"), 2,700 frames in 108 s
-with no abort, crash or device loss. The picture behind the logo is black (the AV1 movie). Open: an AV1 decoder; 26.7 FPS
+with no abort, crash or device loss. The picture behind the logo is black (the AV1 movie). Open: an AV1 decoder (done since:
+`AV1_DECODER.md`, which also says why the picture is still black); 26.7 FPS
 at the title; what nxnative lists for the game itself (task and mesh shader culling through raw loads, 4,170 pool ranges
 against the table's 4,096, texture rewrites: turned on for this title, not yet seen working).
 
