@@ -173,7 +173,7 @@ typedef struct { i64 frame; i16 h0,h1,seed0,pcm[14],previous[14]; } Adpcm;
 typedef struct { float x1,x2,y1,y2; } BiquadState;
 typedef struct { Wave q[4]; u32 nq,consumed; u64 played; double pos,fraction;
   i16 carry0,carry1; u8 carry_valid; unsigned defer_blocks;
-  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
+  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged,unrouted_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
 typedef struct { u8 config[0xc0]; BiquadState filter[6]; int aux_logged; } Effect;
 /* splitters (a voice or mix sent to several mixes, each with its own volumes) and the mixes as the game last sent them.
    since REV7 an update holds only the mixes that changed (after a 0x20-byte header with their count), and a splitter
@@ -474,7 +474,7 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
           v->pos+=step; v->fraction+=step; u64 advance=(u64)(v->fraction+1e-9); v->played+=advance; v->fraction-=advance;
         }normalize(v,format,co);
         u32 sid=rd32(vi+0x5c); const Split* sp= dest<0 && nm && sid<NSPL && a->split[sid].n? &a->split[sid] : NULL;
-        for(unsigned ch=0;ch<channels;ch++){
+        for(unsigned ch=0;ch<channels;ch++){ int routed=0;
           if(dest>=0){
             for(unsigned k=0;k<nbuf[dest];k++){ float g=routing[ch][k]; if(g==0) continue;
               float* dst=a->mix+(dest*NC+k)*NF;
@@ -483,13 +483,24 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
           } else if(sp){   /* channel ch of N goes to the splitter's destinations ch, ch+N, ch+2N... */
             for(unsigned j=ch;j<sp->n;j+=channels){ i32 did=sp->dest[j]; if(did<0 || did>=NSD) continue;
               const SplitDest* d=&a->sdst[did]; if(!d->in_use || d->mix<0 || d->mix>=NM || map[d->mix]<0) continue;
-              int dm=map[d->mix];
+              int dm=map[d->mix]; routed=1;
               for(unsigned k=0;k<nbuf[dm];k++){ float g=d->vol[k]; if(g==0) continue;
                 float* dst=a->mix+(dm*NC+k)*NF;
                 for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*g;
               }
             }
-          } else if(nm){   /* mixes are known and this voice goes to none of them */
+          }
+          if(dest<0 && !routed && nm && map[0]>=0){
+            /* mixes are known and this voice reaches none: no mix named, and a splitter without a destination in use.
+               Ocarina of Time plays its opening's sound on such voices (splitters 13 to 17 are sent with 0 destinations;
+               why is open: a console would not be silent there). Kept audible in the final mix, front left and right */
+            int fm=map[0];
+            if(!v->unrouted_logged){ v->unrouted_logged=1; static int said; if(said<8){ said++;
+              LOG("audio: voice %u names no mix and its splitter %d has no destination in use (%u listed): played in the final mix\n",id,(i32)sid,sid<NSPL?a->split[sid].n:0); } }
+            if(channels==1){ for(unsigned k=0;k<2 && k<nbuf[fm];k++){ float* dst=a->mix+(fm*NC+k)*NF; for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*.70710678f; } }
+            else { float* dst=a->mix+(fm*NC+(ch<nbuf[fm]?ch:0))*NF; for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]; }
+          }
+          if(dest>=0 || sp || nm){
           } else if(channels==1){
             for(unsigned f=0;f<produced;f++){ float x=decoded[ch][f]*.70710678f; stereo[f*2]+=x; stereo[f*2+1]+=x; }
           } else { unsigned side=ch==1 || ch==5?1:0; for(unsigned f=0;f<produced;f++) stereo[f*2+side]+=decoded[ch][f]; }
