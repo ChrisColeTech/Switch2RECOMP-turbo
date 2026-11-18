@@ -875,11 +875,14 @@ Each of these is a general fix in `runtime/nvn`.
 
 - **The slowdown and the crash.** From about 450 s after the start (some 200 s into the first scene, with A pressed every 25 s) frames take
   2 to 24 s, with none of the slow-frame line's categories (sparse binds, GPU waits, uploads, pipelines, pool copies) holding the time,
-  and near 630 s the game crashes on a NULL pointer with `heap 6316 MB ... used 8628 MB of 9216 MB`. In every stall dump the main thread is
-  running game code at `main+0x40cd90` (guest 0x842dd90, called from 0xb48d78c), no host wait. Run `-162145-g4-r17` (alone on the machine;
-  `-053444-g4-r16` shows the same but another game was running). Not yet known: whether the heap grows because something of ours never
-  finishes (a resource the game frees when the GPU is done with it), or the scene's loading is this slow here. Next step: disassemble that
-  function (`gamectl peek 0x842dd00 80` while it runs) and count what it walks.
+  and near 630 s the game crashes on a NULL pointer with `heap 6316 MB ... used 8628 MB of 9216 MB`. In the stall dumps of that stretch the main thread is inside the frame callback
+  (`blr` at guest 0x842dd88 in the game's frame loop, which times the callback with two tick reads; the dump's 0x842dd90 is its return
+  address), and the dump adds `thread 80 looping on SleepThread (919019 times) from lr=806e57c` (`lr=8077838` in another run): the game's
+  main thread is polling for something with sleeps, hundreds of thousands of times, while its heap fills. Runs `-162145-g4-r17` (alone on
+  the machine; `-053444-g4-r16` shows the same but another game was running), `stall-3-threads.txt` and `stall-4-threads.txt` there.
+  Not yet known: what it polls for. Next step: disassemble around 0x806e57c and 0x8077838 (`gamectl peek 0x806e500 64` while it runs;
+  `build/evidence/gameplay4/peekdis.py` turns a peek into ARM64) to find the flag or counter the loop reads, then who should set it (a
+  file read, a job of one of the game's worker threads, a GPU sync or a texture the game waits to become ready).
 - **The picture.** With `NXRT_VK_TO_GPU=0` (the default now) the scene looks right in shape and too dark: the two 256x256 RGBA16F sky
   tables (ser 4144 / 4150, drawn each frame by fragment shader `7f9331c268da06e7` from a CPU-written 256x32x16 table, then summed into
   the ambient light by compute `21d9f83e6027c565`) are read from guest memory, so the draws into them are lost and the ambient is 0.
