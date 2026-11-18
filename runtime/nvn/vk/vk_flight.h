@@ -1,7 +1,7 @@
 // The flight recorder and the control channel (docs/DEBUG_TOOLS.md).
 // Flight recorder: the last frames as shown, and what each frame drew, kept in memory all the time. F5, "gamectl flight" or a timed trigger writes them to <exe folder>/flight/<time>/,
 // read with tools/flight.py. NXRT_VK_FLIGHT=0 turns it off (benchmarks).
-// Control: a named pipe, \\.\pipe\swr_ctl, one command per connection (tools/gamectl.py): pause, step, hide a shader, change a switch, take a RenderDoc capture, read memory.
+// Control: a named pipe, \\.\pipe\swr_ctl_<process ID>, one command per connection (tools/plza_probe.py, action ctl): pause, step, hide a shader, change a switch, take a RenderDoc capture, read memory.
 #pragma once
 #include "vk_internal.h"
 

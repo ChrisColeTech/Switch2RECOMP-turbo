@@ -528,7 +528,7 @@ int swr_main(int argc, char** argv){
         LOG("warning: %d s without a new image (frames=%d, GPU submits=%llu)\n",sec,g_frames,(unsigned long long)g_gpu_submits); kernel_dump_threads_stall(); } }
     next+=16666667ull; u64 now=plat_ns(); if(next>now) plat_sleep_ns((i64)(next-now)); else if(now-next>100000000ull) next=now;
   }
-  save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } LOG("Exit.\n"); fflush(NULL);
+  save_hints(); if(g_ini_dirty){ g_ini_dirty=0; ini_write(); }  /* a setting changed in the last second (F11, then Esc) */ { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } LOG("Exit.\n"); fflush(NULL);
 #if defined(_WIN32)
   TerminateProcess(GetCurrentProcess(),0);   /* don't join the guest threads */
 #endif

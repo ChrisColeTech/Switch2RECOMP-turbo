@@ -250,6 +250,10 @@ static void set_fullscreen(int on){
     SetWindowPos(g_hwnd,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
     ShowCursor(TRUE); g_fullscreen=0; }
 }
+/* F11 / Alt+Enter: the player's choice is kept in the ini, so the next start opens the same way (it used to be forgotten:
+   the ini kept fullscreen=1 and every launch was fullscreen again). The controls window and the start go through
+   set_fullscreen and are not choices */
+static void toggle_fullscreen(void){ extern void ini_set(const char*,const char*); set_fullscreen(!g_fullscreen); ini_set("fullscreen",g_fullscreen?"1":"0"); }
 
 /* optional: launch the lossless scaling app next to the game (lossless_scaling=1). this path doesn't touch its
    dll, the app just captures our window */
@@ -442,14 +446,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
   case WM_MOVE: mouse_capture(); break;
   case WM_SETFOCUS: mouse_capture(); return 0;
   case WM_SIZE: mouse_capture(); g_ww=LOWORD(l); g_wh=HIWORD(l); if(g_ww<1) g_ww=1; if(g_wh<1) g_wh=1; { extern void nvn_window_resized(int,int); nvn_window_resized(g_ww,g_wh); } return 0;
-  case WM_SYSKEYDOWN: if(w==VK_RETURN){ if(!(l&(1<<30))) set_fullscreen(!g_fullscreen); return 0; } if(w==VK_F4) break; /* let Alt+F4 through */
+  case WM_SYSKEYDOWN: if(w==VK_RETURN){ if(!(l&(1<<30))) toggle_fullscreen(); return 0; } if(w==VK_F4) break; /* let Alt+F4 through */
   /* fallthrough */
   case WM_KEYDOWN:
     /* a held key auto repeats (bit 30), the one shot actions below only fire on the first press or holding F7
        would start and stop the recording every frame */
     if((l&(1<<30)) && (w==VK_ESCAPE||w==VK_F1||w==VK_F3||w==VK_F4||w==VK_F5||w==VK_F7||w==VK_F8||w==VK_F11)) return 0;
     if(w==VK_ESCAPE){ controllers_shutdown(); g_quit=1; return 0; }
-    if(w==VK_F11){ set_fullscreen(!g_fullscreen); return 0; }
+    if(w==VK_F11){ toggle_fullscreen(); return 0; }
     if(w==VK_F1){ show_controls(); return 0; }
     if(w==VK_F3){ g_shot_req=1; return 0; }
     if(w==VK_F7){ g_rec_toggle=1; return 0; }

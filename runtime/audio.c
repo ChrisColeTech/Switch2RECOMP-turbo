@@ -137,6 +137,18 @@ void swr_audio_init(void){
 }
 void swr_audio_submit_at(const float* samples,unsigned frames,u64 sample_end){
   if(!frames || frames>SWR_AUDIO_FRAMES || audio_stopping()) return;
+  /* the mixed output, measured: every 5 s of sound the log gets its RMS and peak (full scale = 1), so "is there sound"
+     can be read from a log. one renderer / AudioOut submits at a time here, a second one's blocks land in the same sums */
+  { static double sq[2]; static float peak; static unsigned n, silent, lines;
+    for(unsigned f=0;f<frames;f++){ float l=samples[f*2],r=samples[f*2+1]; sq[0]+=(double)l*l; sq[1]+=(double)r*r;
+      float m=fabsf(l)>fabsf(r)?fabsf(l):fabsf(r); if(m>peak) peak=m; }
+    n+=frames;
+    if(n>=48000*5){ double l=sqrt(sq[0]/n),r=sqrt(sq[1]/n); int quiet=l<1e-5 && r<1e-5;
+      /* silence is said once, then every minute; sound every 5 s for the first 5 minutes, then every minute */
+      if(quiet? (silent++%12==0) : (silent=0, lines<60 || lines%12==0))
+        LOG("audio: output, last %.0f s: RMS %.5f / %.5f (%.1f / %.1f dBFS), peak %.4f\n",n/48000.0,l,r,l>0?20*log10(l):-200.0,r>0?20*log10(r):-200.0,(double)peak);
+      lines++; sq[0]=sq[1]=0; peak=0; n=0; }
+  }
 #if defined(SWR_RECORD_AUDIO)
   /* the recording keeps the original samples on the game/video timeline. only what you hear live gets stretched,
      F7 never encodes the slowed down audio */
