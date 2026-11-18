@@ -7,8 +7,8 @@ Status 2026-11-17: Mario Kart 8 Deluxe (a Switch 1 program, NintendoSDK 4.4.0, b
 `P:/Games/Nintendo/DUMPS/Mario Kart 8 Deluxe/dump` into the launcher entry's buildDir
 `.../SwitchRecomp Builds/Mario Kart 8 Deluxe 1G1U1D`) boots. Graphics, audio and the DualSense come up, it plays
 its intro logo and shows the title screen key art at about 5 s. It then crashes at about 6.8 s, when the title
-menu builds its Mii renderer. That last crash needs the content of the console's MiiModel system archive, and it
-is open: see [Open items](#open-items).
+menu builds its Mii renderer: the MiiModel system archive it reads is still served empty. The archive's format
+is fully mapped (section 5); writing the synthesizer is open: see [Open items](#open-items).
 
 Before: `Mario Kart 8 Deluxe 1G1U1D.log` ended at 1.45 s with a crash in `nnosInitialize`, before any window
 content.
@@ -183,9 +183,11 @@ empty)`).
 
 How the renderer reads it (`F_88E7D3C`, `F_88E8D40` and helpers in `_build/code_077.c`):
 
-- `F_88EF9D4(shapeFile, partType<=11, index)` → `file + base[type] + index*0x58`. Bases: 108, 460, 1516, 2572,
-  14188, 25804, 37420, 49036, 60652, 0x10000|6732, 0x10000|8404.
-- `F_88EFBC8(textureFile, partType<=10, index)` → `file + base[type] + index*0x1C`. Bases: 100 to 8752.
+- `F_88EF9D4(shapeFile, partType<=11, index)` → `file + base[type] + index*0x58`. 12 kinds, bases 108, 460,
+  1516, 2572, 14188, 25804, 37420, 49036, 60652, 72268, 72356, 73940 (the `0x10000|` forms in the generated C
+  are only how constants ≥ 65536 are materialized, not flags). Tables tile exactly, end 75524.
+- `F_88EFBC8(textureFile, partType<=10, index)` → `file + base[type] + index*0x1C`. 11 kinds, bases 100 to
+  8752, counts 132, 62, 24, 2, 12, 12, 20, 2, 37, 6, 18 (327 entries; tables end 9256).
 - `F_88EF5E0(part)`: a part is valid when its `u32` size at `+4` is not 0. Valid parts are copied into a memory
   pool and mapped. Invalid ones are skipped (`goto L_88E922C`).
 
@@ -229,10 +231,72 @@ A guard that leaves the slot empty (`if (!t) return;` in `nvnTexturePoolRegister
 then crashed in its own Mii drawing code (`88f0fd0`, `F_88EB1C0`, under `88e6550`) on a garbage pointer
 (`0x23b0c1010`), because it draws from parts that do not exist. The guard was not committed.
 
-Getting further needs MiiModel content the renderer accepts, made up by the runtime: real part entries (size,
-offset, and the texture formats and shape attribute/index layouts the renderer reads) pointing at tiny dummy
-textures and shapes. That means reverse-engineering the NFTR/NFSR part entry formats from the renderer code above
-(and the sdk's `nn::mii` resource code), then generating a minimal valid archive in `sysdata_open`.
+Getting further needs MiiModel content the renderer accepts, made up by the runtime.
+
+### The format (deep dive 2026-11-17)
+
+A verification pass re-read the generated C and the module bytes (main base 0x8005000) and cross-checked public
+reverse engineering of the same archive: the Wii U FFL resource format it descends from (the public
+`aboood40091/ffl` decomp), and three synthesizers written against real firmware data — S2Arm
+`pack/sysdata_mii.py`, nxnative `dm/host/hle_mii.c` (another MK8D native host, same SDK 4.4.0), and the Lichii
+yuzu fork's `mii_model.cpp`. The layouts agree. Corrections to earlier notes: the sdk module carries no
+`nn::mii` resource code — the loader is entirely in main — and the `0x10000|` bases are constant
+materialization, not flags.
+
+- The renderer validates almost nothing: no `NFTR`/`NFSR` magic, no file length, no index bounds. The only gate
+  is entry `+4 != 0` (`F_88EF5E0`). The file pool is sized from `GetFileSize`; the model's decompress pool is
+  sized from the header's largest-size and alignment arrays (nxnative cites MK8D `main+0x8f2e6c`), so the
+  headers must be filled — zero headers only got this far because every part was skipped.
+- Every payload is zlib: the copy call `F_8B59EA0` is `nn::util::DecompressZlib(dst, size@+4, file+offset@+0,
+  compressedSize@+8, work, 7152)`. The Wii U raw escape (strategy 5) did not survive; synthesized payloads must
+  be valid zlib streams — a stored deflate block plus Adler-32 is enough. The `0x806` params `u32` at `+0xC`
+  is metadata MK8D never reads.
+- Texture entry, 0x1C at `file + base[type] + index*0x1C`: `+0` payload offset, `+4` decompressed size (the
+  gate, also zlib dstSize), `+8` compressed size, `+0xC` zlib params (unread), `+0x10` alignment (unread),
+  `+0x14` width, `+0x16` height, `+0x18` format index into the game's 7-entry palette (`0x201`, `0x901`,
+  `0xb01`, `0x1d01`, `0x1e01`, `0x2001`, `0x2d01`; index 0 = R8_UNORM, all supported by the vk backend),
+  `+0x19` mip count, `+0x1A` tile index (0 = plain; the `0x2380`/`0x2381` path for larger values is unprobed —
+  stay at 0).
+- Shape entry, 0x58 at `file + base[type] + index*0x58`: `+0/+4/+8` payload offset / decompressed / compressed
+  size, `+0xC` zlib params (unread), `+0x10..+0x37` five attribute strides then five attribute offsets
+  (position stride 8: four f16), `+0x38` index offset, `+0x3C` index byte count (u16 indices, count =
+  bytes/2), `+0x40` bounding box (6 floats). After the tables: hair transforms 132×0x48 at 75524 and faceline
+  transforms 12×0x24 at 85028 (end 85460). Zero-filled transforms are safe — float-only consumers, the model
+  just sits mispositioned.
+- What the title-menu model actually touches: texture kinds 0 (hair), 10 (nose) and 6 (glasses — only when the
+  CharInfo glassType is non-zero; the runtime's default Miis have 0). Shapes kind 0 and 1 (faceline) for the
+  draw, plus kinds {5, 6, 7, 8, 3, 4, 10, 11} only when the flag bytes `impl+9338..9345` (CharInfo bits) are
+  set. An invalid shape entry just drops the part, but the draw runs in the same frame as registration
+  (`F_881A724` inserts the model, `F_88F0F78` uploads), so the missing faceline position buffer is exactly the
+  guard crash above: texture-only validity does not survive the title frame.
+- Prior art agrees on strategy: yuzu's 16-byte stubs only survive because few games look inside; nxnative,
+  S2Arm and Lichii all ship all-entries-valid degenerate archives and report blank Miis without crashes.
+
+### Plan
+
+1. `sysdata_open` (`runtime/svc_fs.c`) builds the six files for real instead of zero-padded headers:
+   - Header: magic, version 1, file length, then largest-size `u32[11 or 12]` and alignment arrays — one page
+     (0x1000) per kind, first alignment 0x1000 (nxnative's tested values; the largest sizes size the model's
+     decompress pool).
+   - 11 texture tables (counts 132, 62, 24, 2, 12, 12, 20, 2, 37, 6, 18; 100..9256) or 12 shape tables (counts
+     4, 12, 12, 132, 132, 132, 132, 132, 132, 1, 18, 18; 108..75524) plus the two transform tables, then the
+     shared payloads (texture file ≥ 9256 bytes, shape file ≥ 85460).
+   - Textures: every entry valid, pointing at one shared 8×4 R8_UNORM texture (palette index 0, mips 1,
+     tile 0) as a zlib stored block.
+   - Shapes: every entry valid, pointing at one shared degenerate mesh — 1 vertex (8-byte f16 position),
+     u16 indices (0, 0, 0), strides {8, 0, 0, 0, 0} — as a zlib stored block; zero transform tables.
+   - Reference implementation: nxnative `dm/host/hle_mii.c`, cloned at `D:\Projects\nxnative` (MIT; Apple-only
+     host, but the stand-in writer is plain portable C — the same 0x20 zero bytes inflate to both the blank
+     texture and the degenerate mesh: zlib `78 01 01 20 00 df ff` + Adler-32). Same layout serves the Switch 2
+     MiiResource 0400000000000849, which adds `OunceTexture{Low,Mid,High}{Linear,SRGB}.dat`.
+2. Probe run: `SWR_TRACE_FN=8b59ea0,88ef71c,88ef76c,88ef5e0,88ef7bc,88ef840,88efb08,88efd40,858badc,88e7d3c,88e609c,88ef904,88ef920,88f0f78,881a724`
+   shows the (file, kind, index) traffic, zlib acceptance, and what gets registered.
+3. Iteration is runtime-only: edit `svc_fs.c`, `switchrecomp.py --build-runtime`, relaunch. `runtime/cpu.h` is
+   untouched, so no ABI bump.
+4. Expected end state: the title menu renders with blank/placeholder Miis (nxnative and S2Arm report the same),
+   no crash. Residual unknowns, probe-only: tile-index values ≥ 2, whether anything reads entry `+0x10`, and
+   what the character-select path (reached at 40 s with the firmware archive) requests beyond the title path —
+   the all-valid archive covers it by construction.
 
 ## How to reproduce and analyse
 
@@ -275,7 +339,9 @@ Techniques that found each step:
 
 ## Open items
 
-1. **MiiModel content** (crash 5): synthesize a minimal valid NFTR/NFSR archive, see section 5.
+1. **MiiModel content** (crash 5): the format is fully mapped (section 5, deep dive 2026-11-17); what remains
+   is writing the synthesizer in `sysdata_open` and probing. No firmware dump or emulator is needed — the game's
+   own code is the spec, and nxnative (another MK8D recomp host) ships the same synthesizer as prior art.
 2. **Stale `libnvn.a` / runtime without an ABI change:** after a submodule bump the build still copies
    `bin/`'s runtime and links `build/nvn/libnvn.a` as they are. Only an ABI mismatch triggers a rebuild, so fixes
    in runtime sources are silently missing until `build_nvn.py` and `--build-runtime` are run.
