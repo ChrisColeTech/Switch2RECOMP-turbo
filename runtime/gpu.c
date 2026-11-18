@@ -16,8 +16,17 @@ static PMutex g_gpulock;
 /* ============================================================ GPU memory */
 extern volatile int g_cs_any; void cs_mem_need(u64 a, u64 n);
 
+/* a GPU address is not a CPU address: with an address space of its own (a Switch 1 program whose GPU mappings sit
+   where the CPU has nothing, pokemon legends arceus) the range is fine when the memory mapped behind it is */
+static int gmem_span_ok(u64 gva, u64 size, int write){
+  if(write? guest_span_writable(gva,size,1) : guest_span_readable(gva,size,1)) return 1;
+  for(u64 a=gva, end=gva+size; a<end; ){ u64 cpu=gmmu_translate(a), n=0x1000-(a&0xFFF); if(n>end-a) n=end-a;
+    if(cpu && !(write? guest_span_writable(cpu,n,1) : guest_span_readable(cpu,n,1))) return 0;
+    a+=n; }
+  return 1; }
+
 int gmem_read(u64 gva, void* dst, u64 size){
-  u8* d=dst; if(size && !guest_span_readable(gva,size,1)) return -1; if(g_cs_any) cs_mem_need(gva,size);
+  u8* d=dst; if(size && !gmem_span_ok(gva,size,0)) return -1; if(g_cs_any) cs_mem_need(gva,size);
   while(size){ u64 cpu=gmmu_translate(gva); u64 n=0x1000-(gva&0xFFF); if(n>size) n=size;
     if(!cpu){ memset(d,0,n); } else memcpy(d,GP(cpu),n);
     d+=n; gva+=n; size-=n; }
@@ -26,7 +35,7 @@ int gmem_read(u64 gva, void* dst, u64 size){
 void (*g_ww_touch)(u64 cpu);   /* GPU wrote guest memory, record it for write tracking */
 int gmem_write(u64 gva, const void* src, u64 size){
   const u8* s=src; u64 g0=gva, s0=size;
-  if(size && !guest_span_writable(gva,size,1)) return -1;
+  if(size && !gmem_span_ok(gva,size,1)) return -1;
   while(size){ u64 cpu=gmmu_translate(gva); u64 n=0x1000-(gva&0xFFF); if(n>size) n=size;
     if(cpu){ memcpy(GP(cpu),s,n); if(g_ww_touch) g_ww_touch(cpu); } s+=n; gva+=n; size-=n; }
   gpu_mem_written(g0,s0);
@@ -34,7 +43,7 @@ int gmem_write(u64 gva, const void* src, u64 size){
 
 u8* gmem_ptr(u64 gva, u64 size){
   /* host pointer, only if the whole range is contiguous */
-  if(size && !guest_span_readable(gva,size,1)) return NULL;
+  if(size && !gmem_span_ok(gva,size,0)) return NULL;
   if(g_cs_any) cs_mem_need(gva,size);
   u64 c0=gmmu_translate(gva); if(!c0) return NULL;
   for(u64 o=(0x1000-(gva&0xFFF));o<size;o+=0x1000){ if(gmmu_translate(gva+o)!=c0+o) return NULL; }

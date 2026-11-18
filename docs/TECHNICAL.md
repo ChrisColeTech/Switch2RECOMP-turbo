@@ -10,6 +10,9 @@ program. The runtime supplies the Horizon OS services and graphics the game expe
 
 - **Direct package builds:** NUP and NSP packages build directly, and RomFS data is read in place from the original
   package. See [direct NUP](NUP_IN_PLACE.md) and [direct NSP](NSP_IN_PLACE.md).
+- **Combined and encrypted NSPs:** a package that holds the game with its update, and optionally its DLC (1G+1U,
+  1G+1U+1D), builds directly: the update's patch is applied per read and both are decrypted with your `prod.keys`
+  while the game runs, nothing is extracted. See [combined NSP](COMBINED_NSP.md).
 - **DLC:** `--install-dlc` installs add-on content from NSP, NSZ, XCI, XCZ and NCA packages ([DLC](DLC.md)).
 - **Graphics:** native NVN calls replayed on Vulkan with live SPIR-V shader translation, a shader cache, and frame-time
   diagnostics.

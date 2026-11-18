@@ -401,7 +401,7 @@ def load_program(entry):
             romfs = nup.NupRomfs(package)
         elif nsp.is_nsp(entry):
             package = nsp.load(entry)
-            romfs = nsp.NspRomfs(package)
+            romfs = nsp.romfs_of(package)
         else:
             raise ValueError('%s is not an NRO, NUP or NSP file' % entry)
         exefs = {name: reader for name, _, reader in package.exefs()}

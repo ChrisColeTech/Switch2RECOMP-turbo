@@ -4,8 +4,9 @@
 # Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
 """Read standard application NSPs in place without copying their RomFS.
 
-The NCA header is inspected with hactool and the supported Switch 2 dumps keep their
-ExeFS and RomFS sections plaintext. Encrypted sections and BKTR updates are rejected.
+Two readers. Nsp, here: one Program NCA with plaintext sections (Switch 2 dumps), its header inspected with
+hactool. nca.Package: encrypted sections and a package that holds the game with its update (a BKTR patch), read
+with the user's keys. load() picks the one the package needs.
 """
 import functools
 import os
@@ -73,6 +74,65 @@ def _pfs(path, offset, size):
         names.add(name)
         result.append(SimpleNamespace(name=name, offset=data_at + relative, size=length))
     return result
+
+
+def romfs_tree(path, romfs_size, read, origin=0):
+    """the directory tree of a RomFS image of romfs_size bytes that read(offset, size) returns; a file node's offset
+    is its position in the image plus origin"""
+    values = ROMFS_HEAD.unpack(read(0, ROMFS_HEAD.size))
+    if values[0] != 0x50:
+        raise Error('%s: invalid RomFS header' % path)
+    _, _, _, dirs_at, dirs_size, _, _, files_at, files_size, data_at = values
+    for at, size in ((dirs_at, dirs_size), (files_at, files_size)):
+        if size > MAX_TABLE or at > romfs_size or size > romfs_size - at:
+            raise Error('%s: RomFS metadata is out of range' % path)
+    if data_at > romfs_size:
+        raise Error('%s: RomFS data offset is out of range' % path)
+    dirs = read(dirs_at, dirs_size)
+    files = read(files_at, files_size)
+    seen_dirs, seen_files = set(), set()
+
+    def name(table, at, fixed):
+        if at > len(table) - fixed:
+            raise Error('%s: RomFS entry is out of range' % path)
+        length, = struct.unpack_from('<I', table, at + fixed - 4)
+        if length > 0x1000 or length > len(table) - at - fixed:
+            raise Error('%s: RomFS name is out of range' % path)
+        try:
+            return table[at + fixed:at + fixed + length].decode('utf-8')
+        except UnicodeDecodeError:
+            raise Error('%s: non-UTF-8 RomFS name' % path)
+
+    def directory(at, depth=0):
+        if at in seen_dirs or depth > 128:
+            raise Error('%s: cyclic RomFS directory tree' % path)
+        seen_dirs.add(at)
+        if at > len(dirs) - 0x18:
+            raise Error('%s: RomFS directory is out of range' % path)
+        _, sibling, child, first_file = struct.unpack_from('<4I', dirs, at)
+        node = SimpleNamespace(name=name(dirs, at, 0x18), is_file=False, kids=[])
+        current = child
+        while current != EMPTY:
+            child_node = directory(current, depth + 1)
+            node.kids.append(child_node)
+            _, current = struct.unpack_from('<II', dirs, current)
+        current = first_file
+        while current != EMPTY:
+            if current in seen_files or current > len(files) - 0x20:
+                raise Error('%s: cyclic or invalid RomFS file list' % path)
+            seen_files.add(current)
+            _, sibling, relative, size = struct.unpack_from('<IIQQ', files, current)
+            if relative > romfs_size - data_at or size > romfs_size - data_at - relative:
+                raise Error('%s: RomFS file is out of range' % path)
+            node.kids.append(SimpleNamespace(name=name(files, current, 0x20), is_file=True,
+                                              kids=(), offset=origin + data_at + relative,
+                                              size=size))
+            current = sibling
+        node.kids.sort(key=lambda item: item.name.encode('utf-8'))
+        if any(node.kids[i - 1].name == node.kids[i].name for i in range(1, len(node.kids))):
+            raise Error('%s: duplicate RomFS name' % path)
+        return node
+    return directory(0)
 
 
 def _keys_path(explicit=None):
@@ -162,60 +222,8 @@ class Nsp:
         self.root = self._romfs_tree()
 
     def _romfs_tree(self):
-        values = ROMFS_HEAD.unpack(_read(self.path, self.romfs_offset, ROMFS_HEAD.size))
-        if values[0] != 0x50:
-            raise Error('%s: invalid RomFS header' % self.path)
-        _, _, _, dirs_at, dirs_size, _, _, files_at, files_size, data_at = values
-        for at, size in ((dirs_at, dirs_size), (files_at, files_size)):
-            if size > MAX_TABLE or at > self.romfs_size or size > self.romfs_size - at:
-                raise Error('%s: RomFS metadata is out of range' % self.path)
-        if data_at > self.romfs_size:
-            raise Error('%s: RomFS data offset is out of range' % self.path)
-        dirs = _read(self.path, self.romfs_offset + dirs_at, dirs_size)
-        files = _read(self.path, self.romfs_offset + files_at, files_size)
-        seen_dirs, seen_files = set(), set()
-
-        def name(table, at, fixed):
-            if at > len(table) - fixed:
-                raise Error('%s: RomFS entry is out of range' % self.path)
-            length, = struct.unpack_from('<I', table, at + fixed - 4)
-            if length > 0x1000 or length > len(table) - at - fixed:
-                raise Error('%s: RomFS name is out of range' % self.path)
-            try:
-                return table[at + fixed:at + fixed + length].decode('utf-8')
-            except UnicodeDecodeError:
-                raise Error('%s: non-UTF-8 RomFS name' % self.path)
-
-        def directory(at, depth=0):
-            if at in seen_dirs or depth > 128:
-                raise Error('%s: cyclic RomFS directory tree' % self.path)
-            seen_dirs.add(at)
-            if at > len(dirs) - 0x18:
-                raise Error('%s: RomFS directory is out of range' % self.path)
-            _, sibling, child, first_file = struct.unpack_from('<4I', dirs, at)
-            node = SimpleNamespace(name=name(dirs, at, 0x18), is_file=False, kids=[])
-            current = child
-            while current != EMPTY:
-                child_node = directory(current, depth + 1)
-                node.kids.append(child_node)
-                _, current = struct.unpack_from('<II', dirs, current)
-            current = first_file
-            while current != EMPTY:
-                if current in seen_files or current > len(files) - 0x20:
-                    raise Error('%s: cyclic or invalid RomFS file list' % self.path)
-                seen_files.add(current)
-                _, sibling, relative, size = struct.unpack_from('<IIQQ', files, current)
-                if relative > self.romfs_size - data_at or size > self.romfs_size - data_at - relative:
-                    raise Error('%s: RomFS file is out of range' % self.path)
-                node.kids.append(SimpleNamespace(name=name(files, current, 0x20), is_file=True,
-                                                  kids=(), offset=self.romfs_offset + data_at + relative,
-                                                  size=size))
-                current = sibling
-            node.kids.sort(key=lambda item: item.name.encode('utf-8'))
-            if any(node.kids[i - 1].name == node.kids[i].name for i in range(1, len(node.kids))):
-                raise Error('%s: duplicate RomFS name' % self.path)
-            return node
-        return directory(0)
+        return romfs_tree(self.path, self.romfs_size, lambda offset, size: _read(self.path, self.romfs_offset + offset, size),
+                          self.romfs_offset)
 
     def exefs(self):
         return [(node.name, node.size, functools.partial(_read, self.path, node.offset, node.size))
@@ -249,12 +257,24 @@ class NspRomfs:
 
 @functools.lru_cache(maxsize=4)
 def _load(path, identity, keys_path, keys_identity, hactool):
+    import nca
+    try:
+        package = nca.Package(path, keys_path)
+    except nca.Locked:
+        package = None      # these keys open no NCA header here: the plaintext reader says what is wrong
+    if package and (package.update or package.encrypted):
+        return package
     return Nsp(path, keys_path, hactool)
+
+
+def romfs_of(package):
+    """the RomFS wrapper the build walks, for either reader"""
+    import nca
+    return nca.PackageRomfs(package) if isinstance(package, nca.Package) else NspRomfs(package)
 
 
 def load(path, keys=None, hactool=None):
     stat = os.stat(path); keys_path = _keys_path(keys); key_stat = os.stat(keys_path)
     identity = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     keys_identity = (key_stat.st_size, key_stat.st_mtime_ns)
-    return _load(os.path.abspath(os.fsdecode(path)), identity, keys_path, keys_identity,
-                 _hactool_path(hactool))
+    return _load(os.path.abspath(os.fsdecode(path)), identity, keys_path, keys_identity, hactool)

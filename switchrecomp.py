@@ -467,7 +467,21 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
                 with open(dst, 'wb') as fileobj: fileobj.write(data)
         with open(nsp_marker, 'w', encoding='utf-8', newline='\n') as fileobj:
             fileobj.write(romfs.nsp.marker())
+        # a package read with the keys also has the control data: title, version and icon
+        control = getattr(romfs.nsp, 'control', None) or {}
+        icons = sorted(name for name in control if name.startswith('icon_'))
+        for name, blob in (('control.nacp', control.get('control.nacp')),
+                           ('icon_AmericanEnglish.dat', control.get('icon_AmericanEnglish.dat')
+                            or (control[icons[0]] if icons else None))):
+            if blob:
+                with open(os.path.join(datadir, name), 'wb') as fileobj: fileobj.write(blob)
+        if getattr(romfs.nsp, 'update', None):
+            say('Package: game with its update %s (v%d), applied in place' % (
+                romfs.nsp.display_version or '', romfs.nsp.version))
         say('RomFS: using %s in place' % romfs.path)
+        if getattr(romfs.nsp, 'addons', None):
+            say('DLC: this package also holds add-on content %s; install it with --install-dlc (the launcher does)'
+                % ' '.join('%016x' % title for title in romfs.nsp.addons))
         return
     if os.path.exists(nup_marker): os.remove(nup_marker)
     if os.path.exists(nsp_marker): os.remove(nsp_marker)
@@ -506,6 +520,15 @@ def copy_nxshader(outdir, say):
     with open(os.path.join(dst, 'python.path'), 'w', encoding='utf-8', newline='\n') as fileobj:
         fileobj.write(os.path.abspath(sys.executable) + '\n')
     if copied: say('Vulkan shader translator: %d files copied' % copied)
+
+
+def output_name(title):
+    """the name of the executable, the code module and the data folder: ASCII letters, digits, '-', '_' and spaces.
+    Accented letters lose their accent (Pokémon -> Pokemon): the runtime and the shader tools pass these paths
+    between programs as bytes, and a name outside ASCII does not survive that on every system"""
+    import unicodedata
+    plain = unicodedata.normalize('NFKD', title)
+    return ''.join(ch for ch in plain if ch.isascii() and (ch.isalnum() or ch in '-_ ')).strip() or 'Game'
 
 
 def check_writable(*paths):
@@ -599,7 +622,7 @@ def main():
     src_name = os.path.basename(os.path.normpath(a.input))
     if os.path.isfile(a.input): src_name = os.path.splitext(src_name)[0]
     title = a.out or (info['name'] if info['name'] not in ('Application', '') else None) or src_name
-    title = ''.join(ch for ch in title if ch.isalnum() or ch in '-_ ').strip() or 'Game'
+    title = output_name(title)
     outdir = os.path.abspath(a.outdir or os.getcwd())
     os.makedirs(outdir, exist_ok=True)
     base = os.path.join(outdir, title)
