@@ -1,7 +1,9 @@
 # Building From A Combined NSP (Game + Update, Optionally + DLC)
 
-Status 2026-11-18: **plan**, written after the investigation and before the code. Results are added at the end
-when the work is done.
+Status 2026-11-18: **built**. Pokémon Legends: Arceus `(1G+1U)` and Pokémon Violet `(1G+1U+1D)` build from their
+combined packages and run their openings with the RomFS read in place. Sections 1 to 7 are the plan as it was
+written before the code; [section 8](#8-results-2026-11-18) is what was built, what the real titles turned up, and
+what is open.
 
 Goal: `switchrecomp.py "Game (1G+1U).nsp"` builds a Switch 1 game straight from the package that holds the base
 game and its update (and, in a `1G+1U+1D` package, its DLC), and the built game reads its RomFS from that package
@@ -161,3 +163,63 @@ the engine reports add-on content, show the game's version (from `control.nacp`)
   but correct.
 - **Package moved or keys removed after the build**: the game reports which one is missing; rebuilding (or
   restoring the path) fixes it, as with markers today.
+
+## 8. Results (2026-11-18)
+
+### 8.1 What was built
+
+As planned in section 5, with these differences:
+
+- **Marker paths are UTF-8.** `runtime/nsp.c` opens the package and the keys file through the wide API on Windows.
+  The first run of Arceus failed here: `Pokémon Legends - Arceus [...] (1G+1U).nsp` was "missing" because the
+  runtime opened the marker's UTF-8 path in the ANSI code page. The `SWRNSP1` path had the same fault.
+- **Output names are ASCII** (`switchrecomp.py output_name`, the launcher's `outputNameFor`): `Pokémon Legends -
+  Arceus (1G+1U)` builds as `Pokemon Legends - Arceus 1G1U`. With `é` in the build folder the Vulkan renderer stayed
+  black: the live shader translator wrote its shaders into a second folder named `Pok<U+FFFD>mon ...`, because the
+  runtime and the shader tools hand that path to each other as bytes. The display title keeps its spelling.
+- **The base's key is proved at build time** too (its ExeFS has to decrypt), not only the update's: with a wrong
+  base key the update's own tables still read fine and the fault would only show in the running game.
+- The log's first lines say what is being read: `title: version 1.1.1 (control.nacp)` and `RomFS: NSP <package>
+  (read in place, 6123.9 MB, the update applied over the game, decrypted with prod.keys)`.
+
+Two runtime gaps that the titles hit, outside the package work, fixed because they stopped the boot:
+
+- **GPU addresses were checked as CPU addresses** (`runtime/gpu.c`, `gmem_read / gmem_write / gmem_ptr`). A
+  Switch 1 program has a GPU address space of its own; Arceus maps its command buffers at GPU addresses where the
+  CPU has no memory, so every command list was dropped (`dropping unreadable GPFIFO entry`) and the game stood at
+  frame 1. A range is now also accepted when the memory mapped behind it is readable or writable.
+- **`btm:u` (Bluetooth LE)** handed out no interface: Violet 4.0.0 opens it at start and aborted in
+  `nn::diag::detail::Abort` after 4 s. Command 0 now returns `IBtmUserCore`, whose four `Acquire...Event` commands
+  return an event that never fires.
+
+### 8.2 The titles
+
+Built with the engine CLI and the launcher's arguments (`--jobs 4`, `-O 2`) into the library's build folders,
+`<dump folder>\SwitchRecomp Builds\<name>`. Runs with `tools/plza_probe.py`, renderer `vulkan` as the launcher
+sets it; evidence in `build/evidence/combined-nsp/` of the main checkout.
+
+| | Pokémon Legends: Arceus `(1G+1U)` | Pokémon Violet `(1G+1U+1D)` |
+|---|---|---|
+| build | 561 C units, 33 min; ExeFS 46 MB staged, nothing else copied | 526 C units, 34 min |
+| version | `Package: game with its update 1.1.1 (v262144)`, `title: version 1.1.1` | `4.0.0 (v786432)`, `title: version 4.0.0` |
+| RomFS | 6,123.9 MB composed from the 6.55 GB package | 9,465.4 MB composed from the 11.97 GB package |
+| DLC | none in the package | `01008f6008c5f001` installed by `--sync-dlc` from the same package (0.6 KB image); the game lists it (`ListAddOnContent ... -> 1`) and reads its storage at 3.4 s |
+| reached | language selection (`0005`), the opening with Arceus (`0009`), "What is thy name?" and the text box (`0016`), the portrait confirmation (`0026`), loading, and the first scene in the Obsidian Fieldlands with Professor Laventon in full 3D (`0064`). 12,001 frames in 600 s, 30 FPS, no crash | language selection (`0004`), "Choose a look for yourself" (`0017`), the name box, the real-time opening in the academy (`0037`, `0050`, `0056`). 8,300 frames, 30 FPS while it ran |
+| stops at | not reached in the 600 s run: free movement (the run ended in the first dialogue) | **a crash at 444 s, at the end of the opening**: null pointer (`access to 8`) in `nn::audio::VoiceInfoManager::AcquireVoiceInfo(int, int)+0x58`, inside the SDK's audio renderer client. An audio runtime gap, not a data one |
+| run | `20261118-031020-pla-vulkan2` | `20261118-033257-violet-boot2` |
+
+The earlier runs in that folder are the faults of 8.1 as they were found: `pla-boot` (package "missing"),
+`pla-boot2` (one frame, GPFIFO entries dropped), `pla-vulkan` (black, shaders in the mis-named folder),
+`violet-boot` (`svcBreak` at 4 s).
+
+### 8.3 Open
+
+- **Violet's audio crash** (8.2) blocks its gameplay. `bt` command 9 (`RegisterBleEvent`) still answers without an
+  event; the game went on regardless.
+- **Non-ASCII characters in the build folder's own path** (the dump folder, not the name the build gives itself)
+  still break the Vulkan shader translator, and the NUP marker (`romfs.nup`) is still opened in the ANSI code page.
+- **The game's own package as `.nsz` / `.xci`**, an **update in a separate file** from its base, and **sparse or
+  compressed Program NCAs** are not built; the last two are refused with the reason.
+- **DLC with an encrypted RomFS** is still unpacked once into `romfs.bin` (docs/DLC.md); the version 2 marker could
+  serve it in place as well.
+- No save was written in either run, so saving and loading are untested for both titles.
