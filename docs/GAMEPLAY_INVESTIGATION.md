@@ -832,6 +832,137 @@ Run folders and the saves copied aside before the runs: `build/evidence/oot/` of
 | `tools/plza_probe.py start --as-launcher` | the game started as RecompLauncher's Play starts it |
 | log lines `audio: output, last 5 s`, `audren: update sections`, `audio: mix section`, `audio: splitter destinations of`, `audio: voice N names no mix` | the mixed output's level; what an update holds; the routing |
 
+## 9. Fifth round (2026-11-18): Ocarina of Time's first scene, Pokemon Legends Z-A at 60
+
+State at the end of this round, in one paragraph: **Ocarina of Time is still not playable.** Its first scene after the opening (the Great
+Deku Tree, the fairy) is on screen now, recognisable, at 27 to 50 FPS, where it was black at 1 to 5 FPS and stopped with the device lost.
+About 200 s into that cutscene the game slows to frames of 5 to 24 s and crashes near 630 s with its heap full; controllable gameplay was
+not reached. Pokemon Legends Z-A runs at 60 FPS. The pacing line is time based. Donkey Kong Bananza, Mario Kart World, Mario Kart 8 Deluxe,
+Pokemon Violet and Pokemon Legends Arceus were not worked on beyond regression runs and one look at Violet's crash; their open points stand.
+
+### Ocarina of Time: what the black scene was
+
+Each of these is a general fix in `runtime/nvn`.
+
+1. **The 1 to 5 FPS.** The game's thread sat in `nvnSyncWait` behind another queue's parked submission. A frame of this game is about 20
+   NVN events that order work across its queues; our queue published finished ops in submission order, resumed a parked submission unmet
+   at the next present, and gave a wait up after 250 ms. Now an unmet GPU event wait parks its NVN queue and only that queue, a fence is its
+   own queue's last op, 32 fibers hold parked submissions, and a CPU `nvnEventSignal` wakes the translation thread (`hle_nvn.c` `aq_pick`,
+   `aq_fence_of`, `aq_wait_fenced`; nxnative `docs/reference/nvn-objects.md`, "GPU event waits order work across queues").
+   `NXRT_AQ_FORCE=1` is the old rule; the wait limit `NXRT_VK_WAIT_EVENT_MS` is 2000 by default. The log says how long submissions park.
+2. **The stop near frame 11627** was `VK_ERROR_DEVICE_LOST`. Fifty of the scene's shaders index the game's whole texture and sampler pools
+   (arrays of 1,048,576). Those arrays were allocated per draw and never written, and a staging list that overflowed leaked a 32 MB buffer
+   per request (24 GB of device memory in 90 s). The pools are one descriptor set now (set 5, update-after-bind, written as the game
+   registers textures: `vk_shader.c` `vksh_pool_dsl`, `vk_replay.c` `pool_set`; `NXRT_VK_POOLS=0` off), and a submission's staging
+   allocations are one list entry (`vk_mem.c`).
+3. `nvnCommandBufferDrawMeshTasksIndirect` was a stub: the terrain and the foliage (`vk_replay.c` `mesh_ind`).
+4. The frame's last compute passes write an RGB9E5 texture, which cannot be a storage image: an R11G11B10F image stands in (`vk_tex.c`).
+5. agl's NDSR networks (anti-aliasing and upscaling, 37 compute kernels of the `vr` packs) gave coloured noise and cost 29 ms of GPU time a
+   frame: they are skipped and the frame is copied, as `nn::ndve`'s movie network is (`ndsr_host`; `NXRT_VK_NDSR=0` runs the game's
+   kernels). With the newer translator (below) the game's own kernels may work; not tried.
+6. **The shader translator** in `tools/nxshader/xlate_bin` is nxnative's of 2026-11-07 (commit 1a410e6e5; `BUILD.txt` there says how it
+   was built and the one change kept on top): float atomic adds, `ATOMG.CAS`, the 8192-entry memory pool table. The cache key changes with
+   the translator, so **every game translates its shaders again on its first run after this update**: the live translator takes 48
+   shaders in 4 to 5 s and a draw waits up to 3 s for its shaders, so the first minutes of that first run show frames of seconds (Mario
+   Kart World: 3224 shaders, about 5 minutes). The second run is as before.
+7. Shaders that load through raw pointers (agl's probe analysis) read pools no draw binds, whose pages were never sent to the device:
+   while such shaders draw, every page the game wrote goes up once a frame (`gfx_vk.c`, `NXRT_VK_SYNC=use` off, `=all` always).
+8. A block-compressed texture as a render target (a 64x64x64 BC4 volume the game fills on the GPU through an RGBA16UI view) is drawn into
+   through a stand-in whose texel is a block, copied in at the pass's end (`vk_replay.c` `cz_get`; `NXRT_VK_CZ=0` off). The shader that
+   writes it got no integer-output variant because its module declares the integer types after the output; the variant moves them now.
+
+### Ocarina of Time: what is open, in the order to take it
+
+- **The slowdown and the crash.** From about 450 s after the start (some 200 s into the first scene, with A pressed every 25 s) frames take
+  2 to 24 s, with none of the slow-frame line's categories (sparse binds, GPU waits, uploads, pipelines, pool copies) holding the time,
+  and near 630 s the game crashes on a NULL pointer with `heap 6316 MB ... used 8628 MB of 9216 MB`. In every stall dump the main thread is
+  running game code at `main+0x40cd90` (guest 0x842dd90, called from 0xb48d78c), no host wait. Run `-162145-g4-r17` (alone on the machine;
+  `-053444-g4-r16` shows the same but another game was running). Not yet known: whether the heap grows because something of ours never
+  finishes (a resource the game frees when the GPU is done with it), or the scene's loading is this slow here. Next step: disassemble that
+  function (`gamectl peek 0x842dd00 80` while it runs) and count what it walks.
+- **The picture.** With `NXRT_VK_TO_GPU=0` (the default now) the scene looks right in shape and too dark: the two 256x256 RGBA16F sky
+  tables (ser 4144 / 4150, drawn each frame by fragment shader `7f9331c268da06e7` from a CPU-written 256x32x16 table, then summed into
+  the ambient light by compute `21d9f83e6027c565`) are read from guest memory, so the draws into them are lost and the ambient is 0.
+  With `NXRT_VK_TO_GPU=1` they are drawn (means 1.9 / 1.4 / 1.0, ambient sums 0.41 / 0.53 / 0.81) and the picture is white with a blue
+  veil; hiding the full-screen pass of fragment shader `397d2f2824fbf39c` (39 instances, the lit fog) gives a plausible dark scene, so the
+  excess comes through that pass's light. nxnative's note for this game names the exposure read back from float atomic sums as the cause
+  of "too bright, a pale veil". The sums do reach guest memory here (`gamectl peek 0x22fc1e000 8`: 78.8 / 63.8 / 52.3 / 67.0 in 10 of 14
+  samples, 0 in 4, the CPU clears them each frame); whether the game reads them before our copy back lands is the open question
+  (`vk_mem.c` keeps the CPU's word when both wrote it: the line `kept for the CPU`).
+- Red lines left: `a 3D texture read as another type` (texture 258, a 4x4 dummy), `nvnCommandBufferSetComputeWorkloadPriority` (a hint),
+  `attachment-less pass at the viewport's size 1x1`.
+- First-visit cost: the first frame of the scene compiles pipelines for 38 to 94 s, the first pool pass writes 730,000 descriptors.
+- Not done: the opening voices' mix route, gameplay input, the launcher-style fullscreen check of the scene.
+
+### Pokemon Legends Z-A: 60 FPS
+
+The game sets the present interval to 2 itself: `main+0x1B296D8` loads the base frame rate from byte 0x20 of its settings object (an enum,
+0 = 60, 1 = 30, 2 = 20, 3 = 15, 4 = 12) and the package's configuration leaves it at 1. `SWR_NVN_INTERVAL_BT=1` prints the guest stack of
+`nvnWindowSetPresentInterval`, which is how it was found. A built-in patch in `nxloader.py` (`BUILTIN_PATCHES`, build id
+`B1F12FD9...`, `ldrsb w20, [x9, #0x20]` to `mov w20, wzr`) makes it 60. The game's logic is time based: the scenario reaches the same
+places at the same wall times as at 30 FPS (`-031349-g4-plza-60test/compare.jpg`). Numbers below. Not looked at: whether animations or
+physics tied to the frame count differ anywhere later in the game. A different build id (an update of the game) is not patched and runs at
+30 as before.
+
+### The pacing line
+
+`[vk] pacing:` closes its window at 300 intervals or after 5 s, whichever comes first, so a stall shows within 5 s.
+
+### Pokemon Violet's crash (not fixed)
+
+`nn::audio::VoiceInfoManager::AcquireVoiceInfo` at 444 s (`build/evidence/combined-nsp/20261118-033257-violet-boot2`): the manager at
+0x5e4fe9000 passes its count checks and its free list's head (+0x28) is NULL, so the walk reads address 8. The list head was zeroed while
+its counters were not; `audren_update` writes only inside the output buffer's size. Not reproduced in this round: run `-052858-g4-v1`
+stopped at "Choose a look" (the left stick is needed there: `stick-left.txt` with `action replay`); run `-172311-g4-v3` chose a look, pressed A
+and showed no new image from 148 s to its end at 580 s (`warning: 15 s without a new image`, GPU submits 0; the stall dumps are in the run
+folder), where the run of the combined-NSP work went on to the name and the opening. So two different stops in three runs of this build,
+neither understood. The memory line of the crash, `used 3578 MB of 3285 MB`, says the game was over its limit; `memory_gb=6` was not tried.
+
+### Regression checks of this round
+
+The library builds of Donkey Kong Bananza, Mario Kart World, Pokemon Legends Z-A and Ocarina of Time were rebuilt through the engine CLI
+into their `buildDir` with the final runtime and run with `tools/play_scenario.py`, one game at a time. Saves were copied aside first and
+put back after each run, checked against their hashes (`build/evidence/gameplay4/save-backups`).
+
+**The frame rates of Donkey Kong Bananza and Mario Kart World below are not comparable with section 8.** Another agent was compiling on
+the machine during every one of these runs (4 compiler processes, the machine's CPU at 91 to 94 %), and these frames are CPU bound
+(Donkey Kong Bananza: about 1 ms of GPU time a frame). Under the same load, Donkey Kong Bananza gave 49.6 FPS with the defaults and 44.6
+FPS with the old rules switched back on (`NXRT_AQ_FORCE=1 NXRT_VK_SYNC=use NXRT_VK_POOLS=0`; runs `-171617-g4-ab-def`, `-g4-ab-old`),
+so the new scheduler and the pool set are not what lowers it. A measurement on an idle machine is still to be done.
+
+| game | run | result |
+|---|---|---|
+| Pokemon Legends Z-A | `-170708-g4-reg2-plza` | title, the station, two walks, pictures right: **59.5 FPS** over 45 to 84 s, present interval p50 16.75 / p95 17.73 / p99 29.59 ms, longest 82 ms, 5 intervals over 50 ms (30.0 FPS, 33.3 / 34.0 / 34.6 before) |
+| Donkey Kong Bananza | `-171236-g4-reg3-dkb`, `-171617-g4-ab-def` | title, Continue, walk, punch, walk: 0 black cells in every screenshot, pictures right; 42.7 and 49.6 FPS over 100 to 150 s, p50 18.9 / p95 27.9 / p99 35.4 and 18.5 / 29.3 / 36.1 ms, one stop of 6.6 s in the first (55.2 FPS in section 8, see above) |
+| Mario Kart World | `-170924-g4-reg3-mkw` | to a race, two drives, 0 black cells: 52.5 FPS over 150 to 185 s, p50 17.9 / p95 22.9 / p99 36.2 ms, longest 300 ms (58.4 FPS in section 8, see above). Its first two runs after the translator change were 0.3 and 16 FPS while 3224 shaders were translated again |
+| Ocarina of Time | `-162145-g4-r17` | title and movies as before; the first scene on screen (above); slowdown and crash at 630 s |
+
+Mario Kart 8 Deluxe was not rerun (its save was written by someone else at 12:34 during this round and was left alone). Pokemon Violet
+and Pokemon Legends Arceus were run as the combined-NSP work built them (turbo 51ea340's runtime), not rebuilt. **Pokemon Legends Arceus**
+(`-173323-g4-a1`, a new save, A through the opening, then three stick walks): free roaming works, the character walks across the first
+field, pictures right, 30.0 FPS (the game's own interval of 2) with p95 34.0 ms, and four windows at 25 to 29 FPS around hitches of 0.3 to 1.9 s while walking (the largest 1944 ms; the rest were
+1176, 886 and 317 ms). Both games' save folders were empty before and are empty again.
+
+Tests: `tests/test_n*.py`, `tests/test_controllers.py`, `tests/test_mkw_runtime.py`, `tests/test_mkw_perf.py`, `tests/test_av1.py`,
+`tests/test_opus.py` pass on Windows; the NVN archive and the Linux runtime build in WSL.
+
+### Switches added
+
+| switch | what |
+|---|---|
+| `NXRT_AQ_FORCE=1` | the old queue rule: a present or the queue's next submission resumes a parked one unmet |
+| `NXRT_VK_WAIT_EVENT_MS` (2000) | how long an event wait may stay unmet before it is given up |
+| `NXRT_VK_POOLS=0` | no texture / sampler pool set |
+| `NXRT_VK_NDSR=0` | the game's own NDSR kernels instead of the host's copy |
+| `NXRT_VK_TO_GPU=1` | a texture read from its storage becomes a GPU texture when the game draws into it (off by default, above) |
+| `NXRT_VK_SYNC=all` / `use` | every written page to the device each frame always / never (default: while raw-pointer shaders draw) |
+| `NXRT_VK_CZ=0` | draws into block-compressed textures are lost again |
+| `NXRT_VK_TD_RAW=1` | `texdump` also writes each texture's raw texels (`<file>.raw`) |
+| `SWR_NVN_INTERVAL_BT=1` | the guest stack of each `nvnWindowSetPresentInterval` call (Windows) |
+
+Evidence of this round: `build/evidence/gameplay4/` of the main checkout (not in git): run folders, the patch scripts, `r12-pd.txt` (a
+pass dump of the scene), `hide-sheet.jpg`, the saves copied aside before the runs and their hashes.
+
 ## Instrumentation and switches added in this round
 
 | switch | what |

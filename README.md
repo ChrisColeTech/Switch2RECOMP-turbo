@@ -15,10 +15,11 @@ It is a recompiler, not an emulator: the game's code is translated once, ahead o
 | | |
 | --- | --- |
 | **Mario Kart World**<br>![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>Plays at about 58–59 FPS, with occasional stutters | **Mario Kart 8 Deluxe**<br>![Mario Kart 8 Deluxe at Paris Promenade](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>Plays at 60 FPS, including Booster Course Pass DLC |
-| **Donkey Kong Bananza**<br>![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>Plays at 52–60 FPS, with some slowdowns and stutters | **Pokémon Legends: Z-A**<br>![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>Plays, but held at 30 FPS |
-| **The Legend of Zelda: Ocarina of Time**<br>![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>Title screen and opening movie work; gameplay doesn't yet | |
+| **Donkey Kong Bananza**<br>![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>Plays at 52–60 FPS, with some slowdowns and stutters | **Pokémon Legends: Z-A**<br>![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>Plays at 60 FPS |
+| **The Legend of Zelda: Ocarina of Time**<br>![The Legend of Zelda: Ocarina of Time, the Great Deku Tree cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>Title screen, opening movie and the first cutscene work; it then slows down and stops, so it can't be played yet | **Pokémon Legends: Arceus**<br>![Pokémon Legends: Arceus, walking in the first field](docs/images/screenshots/pokemon-legends-arceus.jpg)<br>Plays at 30 FPS, the speed the game itself runs at; tested up to walking around the first field |
+| **Pokémon Violet**<br>![Pokémon Violet opening cutscene](docs/images/screenshots/pokemon-violet.jpg)<br>Starts and shows its opening at 30 FPS; it has stopped before gameplay in testing, so it can't be played yet | |
 
-60 FPS is the goal, not yet a guarantee. Measured numbers are in the [technical details](docs/TECHNICAL.md#measured-performance).
+60 FPS is the goal, not yet a guarantee. After an update, a game can stutter for the first few minutes of its first run while it prepares its graphics again. Measured numbers are in the [technical details](docs/TECHNICAL.md#measured-performance).
 
 ## What's different in Turbo
 

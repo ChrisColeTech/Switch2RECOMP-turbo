@@ -26,7 +26,7 @@ program. The runtime supplies the Horizon OS services and graphics the game expe
 
 ## Measured performance
 
-Frame rates come from the runtime's `[vk] pacing:` log lines, one for every 300 frames shown. Each launch overwrites
+Frame rates come from the runtime's `[vk] pacing:` log lines, one for every 300 frames shown or every 5 seconds, whichever comes first. Each launch overwrites
 the game's `.log`, so read it right after closing the game. Measured with the Vulkan renderer, runtime 0.4.1,
 Windows, on a 60 Hz display, 2026-11-18:
 
@@ -35,8 +35,10 @@ Windows, on a 60 Hz display, 2026-11-18:
 | Mario Kart World | 22–45 | 57–59 | 17–21 ms | 230–810 ms | Hitches remain, mostly texture transcodes ([details](MKW_PERFORMANCE_INVESTIGATION.md)) |
 | Donkey Kong Bananza | 55 | 52–60 (dips to 45) | 17–29 ms | 130–1420 ms | Stretches where every frame takes about 19 ms (about 55 FPS), plus hitches |
 | Mario Kart 8 Deluxe | 56 | 60.0 | 17.1 ms | 31 ms | 22-second run, through to a race |
-| Pokémon Legends: Z-A | 30.0 | 30.0 | 34 ms | 42–240 ms | Held at exactly 30; whether 60 is possible is still being investigated |
-| The Legend of Zelda: Ocarina of Time | none | none | none | none | Stalls at the opening before 300 frames are shown, so no line was logged |
+| Pokémon Legends: Z-A | 55–60 | 59.5 | 17.7 ms (p50 16.8, p99 29.6) | 82 ms | 60 FPS since the base-frame-rate patch (the game asks for 30 by itself); measured while another build was running on the machine |
+| The Legend of Zelda: Ocarina of Time | 60 (title, movies) | 27–50 in the first scene | 30–50 ms | seconds | Not playable: the first scene after the opening shows, then the game slows to frames of seconds and crashes about 10 minutes in; first-visit pipeline compiles take 40–90 s |
+| Pokémon Legends: Arceus | not measured | 25–30 | 34 ms | 34–1944 ms | The game's own 30 FPS; walking around the first field works (10-minute run from a new save) |
+| Pokémon Violet | not measured | 30.0 | 34 ms | 75 ms | Menus and opening at 30 FPS; crashed once at the end of the opening (audio voice list), not reproduced or fixed |
 
 Stable minimum 60 FPS has not been achieved in every game. The ongoing investigation is in
 [GAMEPLAY_INVESTIGATION.md](GAMEPLAY_INVESTIGATION.md) and [NXNATIVE_GAP_ANALYSIS.md](NXNATIVE_GAP_ANALYSIS.md).
