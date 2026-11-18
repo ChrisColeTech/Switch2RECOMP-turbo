@@ -758,7 +758,9 @@ static VkImageView img_view(int tid, const vks_bind *b) {   // a storage image: 
     { void nvn_pool_gpu_written(const void *pool); nvn_pool_gpu_written(r.t.pool); }
     vkt_image *im = vkt_resolve(&r.t);
     if (!im) return VK_NULL_HANDLE;
-    if (!(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { RED_ONCE(32, "image binding of texture ID %d (format %#x) whose image has no storage use: writes are lost", tid, r.t.d.format); return VK_NULL_HANDLE; }
+    if (!(im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && vkt_want_image(&r.t)) im = vkt_resolve(&r.t);   // bound as an image without the IMAGE flag: an image with storage use from here on (vk_tex.c)
+    if (!im) return VK_NULL_HANDLE;
+    if (!(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { RED_ONCE(32, "image binding of texture ID %d (ser %llu, %ux%u, format %#x, flags %#x, %s) whose image has no storage use: writes are lost", tid, (unsigned long long)r.t.serial, r.t.d.width, r.t.d.height, r.t.d.format, r.t.d.flags, im->cls == VKT_STORAGE ? "read from guest memory" : "a GPU texture"); return VK_NULL_HANDLE; }
     uint32_t level = r.has_view && r.v.set_levels ? r.v.base_level : 0, b0 = r.has_view && r.v.set_layers ? r.v.min_layer : 0;
     VkFormat f = vkf_unorm_of(vkf_view_format(r.t.d.format, r.has_view && r.v.set_format ? r.v.format : r.t.d.format));
     VkImageViewType vt = b->vtype;

@@ -68,6 +68,21 @@ static int from_storage(const tex_t *t) {
     return fi && (fi->flags & VKF_COMPRESSED) && pool_cpu_writable(t->pool) && t->d.samples <= 1 &&
            !(t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE));
 }
+// Image use without NVN_TEXTURE_FLAGS_IMAGE. Ocarina of Time's movie network (nn::ndve) writes its picture, by image store, into an RGBA8 1920x1080 texture it made with
+// flags 0 and registered as an image; the console takes that. Here the image had no storage use, the binding was refused ("writes are lost") and the title and opening movies
+// stayed black behind decoded pictures. The storage of a texture registered or bound as an image is remembered, and every image made over it has storage use, as with the flag:
+// the same key for each texture over that storage, so the one that samples it sees what was written (nxnative upgrades the Metal texture in place, "texture upgraded to allow
+// image writes"). Caller holds g_lk
+static vk_hmap g_img_mem = {8};
+// The format an image with storage use is made in: the texture's own when it allows storage, the UNORM twin of an sRGB one (Vulkan has no sRGB storage images; the image
+// store writes the bytes as they are, and the sRGB view the texture is sampled and drawn through is one more view of the same image: MUTABLE_FORMAT), else none
+static VkFormat storage_format(const vkf_info *fi) {
+    if (fi->feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) return fi->vk;
+    VkFormat un = vkf_unorm_of(fi->vk); if (un == fi->vk || fi->conv != VKF_COPY) return VK_FORMAT_UNDEFINED;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, un, &fp);
+    return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? un : VK_FORMAT_UNDEFINED;
+}
+static int img_wanted(const tex_t *t) { uint64_t k = (uint64_t)(uintptr_t)t->mem; return t->mem && g_img_mem.cap && vk_hm_get(&g_img_mem, &k) != NULL; }
 static void key_of(const tex_t *t, int cls, skey *k) {
     memset(k, 0, sizeof *k);
     k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->pool ? t->off : (int64_t)(uintptr_t)t->mem;
@@ -78,7 +93,7 @@ static void key_of(const tex_t *t, int cls, skey *k) {
       const vkf_info *fi = on && cls == VKT_GPU ? vkf_get(t->d.format) : NULL;
       if (fi && fi->conv == VKF_COPY && !(fi->flags & (VKF_COMPRESSED | VKF_DEPTH | VKF_STENCIL))) k->format = 0x10000 + (int)vkf_unorm_of(fi->vk); }
     k->samples = t->d.samples > 1 ? t->d.samples : 1; k->cls = cls;
-    k->storage_img = (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !vkf_is_compressed(t->d.format);   // IMAGE adds storage use; it changes nothing for BC / ASTC
+    k->storage_img = ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) || img_wanted(t)) && !vkf_is_compressed(t->d.format);   // IMAGE adds storage use; it changes nothing for BC / ASTC
     k->pkg_bh = t->has_layout ? t->d.pkg_block_h : 0;
     k->w = t->d.width; k->h = t->d.height; k->d = t->d.depth; k->levels = t->d.levels ? t->d.levels : 1; k->stride = t->d.stride;
     k->layout_flags = t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE);
@@ -251,11 +266,13 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
     im->samples = t->d.samples > 1 ? (VkSampleCountFlagBits)t->d.samples : VK_SAMPLE_COUNT_1_BIT;
     im->aspect = vkf_aspect(fi->vk);
     VkImageUsageFlags u = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkFormat img_fmt = fi->vk;   // the image's own format: fi->vk, but the UNORM twin for an sRGB texture used as an image (storage_format)
     int depth = (fi->flags & (VKF_DEPTH | VKF_STENCIL)) != 0;
     if (cls == VKT_GPU && !(fi->flags & VKF_COMPRESSED)) {   // NVN has no flag for "render target": every uncompressed GPU texture may be one
         if (depth && (fi->feat & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         if (!depth && (fi->feat & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fi->feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!(u & VK_IMAGE_USAGE_STORAGE_BIT) && img_wanted(t) && (img_fmt = storage_format(fi)) != VK_FORMAT_UNDEFINED) u |= VK_IMAGE_USAGE_STORAGE_BIT; else img_fmt = fi->vk;
     }
     // A square 2D array of six layers or more may be viewed as a cube: Pokemon Legends Z-A keeps its environment maps (64x64x6, 128x128x6) as 2D arrays and its
     // lighting samples them through cube views; viewed as 2D arrays instead the cube lookup's direction was read as (u, v, layer)
@@ -267,12 +284,12 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
     // drop what this format cannot have in this combination (storage on an sRGB format, a sample count)
     for (int pass = 0; pass < 3; pass++) {
         VkImageFormatProperties ip;
-        if (vkGetPhysicalDeviceImageFormatProperties(g_vk.pd, fi->vk, type, VK_IMAGE_TILING_OPTIMAL, u, cf, &ip) == VK_SUCCESS && (ip.sampleCounts & im->samples)) break;
-        if (pass == 0) u &= ~VK_IMAGE_USAGE_STORAGE_BIT; else if (pass == 1) u &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+        if (vkGetPhysicalDeviceImageFormatProperties(g_vk.pd, img_fmt, type, VK_IMAGE_TILING_OPTIMAL, u, cf, &ip) == VK_SUCCESS && (ip.sampleCounts & im->samples)) break;
+        if (pass == 0) { u &= ~VK_IMAGE_USAGE_STORAGE_BIT; img_fmt = fi->vk; } else if (pass == 1) u &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     }
     im->usage = u;
     im->rest = (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, cf, type, fi->vk, {im->w, im->h, im->depth}, im->levels, im->layers, im->samples,
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, cf, type, img_fmt, {im->w, im->h, im->depth}, im->levels, im->layers, im->samples,
                             VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     vkt_sparse *sp = sparse_want(t, fi, type, u, cf, im->levels, im->layers);
     im->opaque = 1;
@@ -870,7 +887,20 @@ static void prefetch_add(const tex_t *t) {
     if (!started) { started = 1; for (int k = 0; k < 2; k++) CloseHandle((HANDLE)_beginthreadex(NULL, 256 << 10, pf_worker, NULL, 0, NULL)); }
     ReleaseSRWLockExclusive(&g_pf_lk); WakeConditionVariable(&g_pf_cv);
 }
+// 1: the texture's storage is new to the set, so its next resolve makes an image with storage use (the registrations' generation moves: memoized views go)
+// Off unless NXRT_VK_IMAGE_NOFLAG=1 (gamectl set image_noflag 1): the network's kernels do not compute its picture yet (its first image holds zeros, its last one noise;
+// its tensors go through raw global memory), and noise behind the title is worse than the black the lost writes leave. To be turned on with the network (docs/AV1_DECODER.md)
+int vkt_want_image(const tex_t *t) {
+    { static int on = -1; if (on < 0) on = vkc_int("image_noflag", 0); if (!on) return 0; }
+    if (!t || !t->mem || (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) || t->d.target == NVN_TEXTURE_TARGET_BUFFER || vkf_is_compressed(t->d.format)) return 0;
+    const vkf_info *fi = vkf_get(t->d.format); if (!fi || (fi->flags & (VKF_DEPTH | VKF_STENCIL)) || storage_format(fi) == VK_FORMAT_UNDEFINED) return 0;
+    uint64_t k = (uint64_t)(uintptr_t)t->mem;
+    AcquireSRWLockExclusive(&g_lk); int fresh = !vk_hm_put(&g_img_mem, &k, (void *)1); ReleaseSRWLockExclusive(&g_lk);
+    if (fresh) { InterlockedIncrement(&g_vkt_reg_gen); static int n; if (n++ < 8) VKLOG("texture ser=%llu %ux%u format %#x flags %#x is used as an image without the IMAGE flag: its image gets storage use", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.flags); }
+    return fresh;
+}
 void vkt_reg_tex(int id, const tex_t *t, const view_t *v, int image) {
+    if (image) vkt_want_image(t);
     if (id < 0 || id > (1 << 20)) return;
     InterlockedIncrement(&g_vkt_reg_gen);
     AcquireSRWLockExclusive(&g_lk);

@@ -12,3 +12,4 @@ tests/** linguist-documentation
 *.bat linguist-detectable=false
 *.cpp linguist-detectable=false
 tests/*.zbic binary
+runtime/av1/** linguist-vendored
