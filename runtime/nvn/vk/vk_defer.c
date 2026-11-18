@@ -26,7 +26,7 @@ enum {
     D_BARRIER2, D_COPY_BUF, D_COPY_B2I, D_COPY_I2B, D_COPY_IMG, D_BLIT, D_FILL, D_UPDATE_BUF, D_CLEAR_COLOR, D_CLEAR_DS, D_BEGIN_RENDERING, D_END_RENDERING,
     D_BIND_PIPE, D_SET_VP, D_SET_SC, D_DRAW, D_PUSH, D_BIND_SETS, D_BIND_VB2, D_BIND_IB, D_DRAW_IDX, D_DRAW_IND, D_DRAW_IDX_IND, D_DRAW_IND_CNT, D_DRAW_IDX_IND_CNT,
     D_DISPATCH, D_DISPATCH_IND, D_CLEAR_ATT, D_RESOLVE, D_BEGIN_Q, D_END_Q, D_RESET_QP, D_VP_CNT, D_SC_CNT, D_LINE_W, D_DEPTH_BIAS, D_BLEND_CONST,
-    D_ST_CMASK, D_ST_WMASK, D_ST_REF, D_CULL, D_FRONT, D_TOPO, D_DT, D_DW, D_DCMP, D_DBT, D_ST_TEST, D_ST_OP, D_RD, D_BIAS_EN, D_RESTART, D_TS2, D_MESH,
+    D_ST_CMASK, D_ST_WMASK, D_ST_REF, D_CULL, D_FRONT, D_TOPO, D_DT, D_DW, D_DCMP, D_DBT, D_ST_TEST, D_ST_OP, D_RD, D_BIAS_EN, D_RESTART, D_TS2, D_MESH, D_MESH_IND,
     D_VERTEX_INPUT, D_BLEND_EN, D_BLEND_EQ, D_WMASK, D_LOGIC_EN, D_LOGIC, D_A2C, D_POLY, D_DCLAMP, D_PATCH, D_CHECKPOINT,
 };
 
@@ -42,7 +42,7 @@ static struct {
     R_DEF(vkCmdSetLineWidth) R_DEF(vkCmdSetDepthBias) R_DEF(vkCmdSetBlendConstants) R_DEF(vkCmdSetStencilCompareMask) R_DEF(vkCmdSetStencilWriteMask)
     R_DEF(vkCmdSetStencilReference) R_DEF(vkCmdSetCullMode) R_DEF(vkCmdSetFrontFace) R_DEF(vkCmdSetPrimitiveTopology) R_DEF(vkCmdSetDepthTestEnable)
     R_DEF(vkCmdSetDepthWriteEnable) R_DEF(vkCmdSetDepthCompareOp) R_DEF(vkCmdSetDepthBoundsTestEnable) R_DEF(vkCmdSetStencilTestEnable) R_DEF(vkCmdSetStencilOp)
-    R_DEF(vkCmdSetRasterizerDiscardEnable) R_DEF(vkCmdSetDepthBiasEnable) R_DEF(vkCmdSetPrimitiveRestartEnable) R_DEF(vkCmdWriteTimestamp2) R_DEF(vkCmdDrawMeshTasksEXT)
+    R_DEF(vkCmdSetRasterizerDiscardEnable) R_DEF(vkCmdSetDepthBiasEnable) R_DEF(vkCmdSetPrimitiveRestartEnable) R_DEF(vkCmdWriteTimestamp2) R_DEF(vkCmdDrawMeshTasksEXT) R_DEF(vkCmdDrawMeshTasksIndirectEXT)
     R_DEF(vkCmdSetVertexInputEXT) R_DEF(vkCmdSetColorBlendEnableEXT) R_DEF(vkCmdSetColorBlendEquationEXT) R_DEF(vkCmdSetColorWriteMaskEXT) R_DEF(vkCmdSetLogicOpEnableEXT)
     R_DEF(vkCmdSetLogicOpEXT) R_DEF(vkCmdSetAlphaToCoverageEnableEXT) R_DEF(vkCmdSetPolygonModeEXT) R_DEF(vkCmdSetDepthClampEnableEXT) R_DEF(vkCmdSetPatchControlPointsEXT)
     R_DEF(vkCmdSetCheckpointNV) R_DEF(vkUpdateDescriptorSets) R_DEF(vkEndCommandBuffer)
@@ -152,6 +152,7 @@ TH1(vkCmdSetDepthBiasEnable, D_BIAS_EN, VkBool32)
 TH1(vkCmdSetPrimitiveRestartEnable, D_RESTART, VkBool32)
 TH3(vkCmdWriteTimestamp2, D_TS2, VkPipelineStageFlags2, VkQueryPool, uint32_t)
 TH3(vkCmdDrawMeshTasksEXT, D_MESH, uint32_t, uint32_t, uint32_t)
+TH4(vkCmdDrawMeshTasksIndirectEXT, D_MESH_IND, VkBuffer, VkDeviceSize, uint32_t, uint32_t)
 TH1(vkCmdSetLogicOpEnableEXT, D_LOGIC_EN, VkBool32)
 TH1(vkCmdSetLogicOpEXT, D_LOGIC, VkLogicOp)
 TH1(vkCmdSetAlphaToCoverageEnableEXT, D_A2C, VkBool32)
@@ -362,6 +363,7 @@ static void run(uint32_t id, uint8_t *p) {
     case D_RESTART: { GET(p, VkBool32, v); R.vkCmdSetPrimitiveRestartEnable(cb, v); break; }
     case D_TS2: { GET(p, VkPipelineStageFlags2, s); GET(p, VkQueryPool, qp); GET(p, uint32_t, q); R.vkCmdWriteTimestamp2(cb, s, qp, q); break; }
     case D_MESH: { GET(p, uint32_t, x); GET(p, uint32_t, y); GET(p, uint32_t, z); R.vkCmdDrawMeshTasksEXT(cb, x, y, z); break; }
+    case D_MESH_IND: { GET(p, VkBuffer, b); GET(p, VkDeviceSize, o); GET(p, uint32_t, n); GET(p, uint32_t, s); R.vkCmdDrawMeshTasksIndirectEXT(cb, b, o, n, s); break; }
     case D_VERTEX_INPUT: { GET(p, uint32_t, nb); GET(p, uint32_t, na); const VkVertexInputBindingDescription2EXT *b = (const VkVertexInputBindingDescription2EXT *)p; p += SZN(VkVertexInputBindingDescription2EXT, nb);
         R.vkCmdSetVertexInputEXT(cb, nb, b, na, (const VkVertexInputAttributeDescription2EXT *)p); break; }
     case D_BLEND_EN: { GET(p, uint32_t, f); GET(p, uint32_t, n); R.vkCmdSetColorBlendEnableEXT(cb, f, n, (const VkBool32 *)p); break; }
@@ -420,7 +422,7 @@ void vkd_install(void) {   // after the device entry points are loaded: NXRT_VK_
     SWAP(vkCmdSetLineWidth) SWAP(vkCmdSetDepthBias) SWAP(vkCmdSetBlendConstants) SWAP(vkCmdSetStencilCompareMask) SWAP(vkCmdSetStencilWriteMask)
     SWAP(vkCmdSetStencilReference) SWAP(vkCmdSetCullMode) SWAP(vkCmdSetFrontFace) SWAP(vkCmdSetPrimitiveTopology) SWAP(vkCmdSetDepthTestEnable)
     SWAP(vkCmdSetDepthWriteEnable) SWAP(vkCmdSetDepthCompareOp) SWAP(vkCmdSetDepthBoundsTestEnable) SWAP(vkCmdSetStencilTestEnable) SWAP(vkCmdSetStencilOp)
-    SWAP(vkCmdSetRasterizerDiscardEnable) SWAP(vkCmdSetDepthBiasEnable) SWAP(vkCmdSetPrimitiveRestartEnable) SWAP(vkCmdWriteTimestamp2) SWAP(vkCmdDrawMeshTasksEXT)
+    SWAP(vkCmdSetRasterizerDiscardEnable) SWAP(vkCmdSetDepthBiasEnable) SWAP(vkCmdSetPrimitiveRestartEnable) SWAP(vkCmdWriteTimestamp2) SWAP(vkCmdDrawMeshTasksEXT) SWAP(vkCmdDrawMeshTasksIndirectEXT)
     SWAP(vkCmdSetVertexInputEXT) SWAP(vkCmdSetColorBlendEnableEXT) SWAP(vkCmdSetColorBlendEquationEXT) SWAP(vkCmdSetColorWriteMaskEXT) SWAP(vkCmdSetLogicOpEnableEXT)
     SWAP(vkCmdSetLogicOpEXT) SWAP(vkCmdSetAlphaToCoverageEnableEXT) SWAP(vkCmdSetPolygonModeEXT) SWAP(vkCmdSetDepthClampEnableEXT) SWAP(vkCmdSetPatchControlPointsEXT)
     SWAP(vkCmdSetCheckpointNV) SWAP(vkUpdateDescriptorSets)

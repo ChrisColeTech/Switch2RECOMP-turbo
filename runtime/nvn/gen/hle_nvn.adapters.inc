@@ -1393,6 +1393,13 @@ NXRT_API void adapter_nvnCommandBufferDrawMeshTasks(NxwGuestCpu *cpu) {
     h_nvnCommandBufferDrawMeshTasks(a0, a1, a2);
 }
 
+NXRT_API void adapter_nvnCommandBufferDrawMeshTasksIndirect(NxwGuestCpu *cpu) {
+    uint64_t *x = cpu->x; (void)x;
+    NVNcommandBuffer * a0 = (NVNcommandBuffer *)(uintptr_t)x[0];
+    NVNbufferAddress a1 = (NVNbufferAddress)x[1];
+    h_nvnCommandBufferDrawMeshTasksIndirect(a0, a1);
+}
+
 NXRT_API void adapter_nvnCommandBufferDrawArrays(NxwGuestCpu *cpu) {
     uint64_t *x = cpu->x; (void)x;
     NVNcommandBuffer * a0 = (NVNcommandBuffer *)(uintptr_t)x[0];

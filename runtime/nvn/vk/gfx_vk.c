@@ -47,7 +47,12 @@ static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *c) {
     if ((e = getenv("NXRT_VK_PRESENT"))) mode = !strcmp(e, "mailbox") ? VKP_MAILBOX : !strcmp(e, "immediate") ? VKP_IMMEDIATE : VKP_FIFO;
     int w = 1280, h = 720;
     if ((e = getenv("NXRT_VK_WINDOW"))) sscanf(e, "%dx%d", &w, &h);
-    if ((e = getenv("NXRT_VK_SYNC"))) g_sync_all = !strcmp(e, "all");   // per use is the default: the replay brings every range it binds up to date
+    // Per use: the replay brings every range it binds up to date. A shader that loads through pointers it read from memory (raw global memory) reaches pools
+    // nothing binds, so while such shaders draw, every page the game wrote goes to the device once a frame as well (auto, the default). Ocarina of Time's probe
+    // analysis reads its probes that way: their memory was never uploaded, the analysis found nothing, and the game's exposure left the picture white.
+    // NXRT_VK_SYNC=all: always; NXRT_VK_SYNC=use: never
+    g_sync_all = 2;
+    if ((e = getenv("NXRT_VK_SYNC"))) g_sync_all = !strcmp(e, "all") ? 1 : !strcmp(e, "use") ? 0 : 2;
     g_cpu_effects = (e = getenv("NXRT_VK_CPU_EFFECTS")) && atoi(e);
     uint32_t nx = 0; const char *const *ex = NULL;
     if (!headless) {
@@ -66,7 +71,7 @@ static BOOL CALLBACK start(PINIT_ONCE o, PVOID p, PVOID *c) {
     vks_shot_init();
     dm_gfx_ctl = (dm_gfx_ctl_ops){vks_shot_request, ctl_texdump, ctl_passdump};
     VKLOG("backend up: %s; pool sync %s; the NVN command streams are replayed",
-          g_window ? "window" : "headless", g_sync_all ? "every written page each frame within the budget (NXRT_VK_SYNC=all)" : "per use (each range as the replay binds it)");
+          g_window ? "window" : "headless", g_sync_all == 1 ? "every written page each frame within the budget (NXRT_VK_SYNC=all)" : g_sync_all ? "per use, and every written page each frame while shaders load through raw pointers" : "per use (each range as the replay binds it)");
     return TRUE;
 }
 static void up(void) { InitOnceExecuteOnce(&g_once, start, NULL, NULL); }
@@ -128,7 +133,9 @@ void gfx_sub_counter(uint64_t addr, uint32_t type) { vks_post_counter(addr, type
 uint64_t gfx_sub_commit(void) {
     static uint64_t synced_frame = ~0ull;   // once a frame: until the replay asks for ranges as it uses them (vkm_use)
     vkr_sub_end();
-    if (g_sync_all && synced_frame != g_frame) { synced_frame = g_frame; vkm_sync_all(); }
+    { int vkr_gmem_loads(void);
+      if ((g_sync_all == 1 || (g_sync_all == 2 && vkr_gmem_loads())) && synced_frame != g_frame) { synced_frame = g_frame; vkm_sync_all();
+          static int said; if (g_sync_all == 2 && !said++) VKLOG("raw global memory: shaders load through pointers they read from memory; from here on every page the game writes goes to the device once a frame (NXRT_VK_SYNC=use: only what is bound)"); } }
     uint64_t v = vks_commit();
     for (int i = 0; i < g_nsync; i++) { g_syncs[i]->fence = v; g_syncs[i]->fenced = 1; }
     g_nsync = 0;

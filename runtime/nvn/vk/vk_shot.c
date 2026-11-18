@@ -225,7 +225,11 @@ int vks_dump_image(vkt_image *im, unsigned layer, const char *path) {
     NVNcopyRegion r = {0, 0, im->vtype == VK_IMAGE_VIEW_TYPE_3D ? (int)layer : 0, (int)im->w, (int)im->h, 1};
     size_t n = (size_t)im->w * im->h, bytes = n * im->fi->vbpb;
     uint8_t *raw = malloc(bytes), *out = malloc(n * 4); int rc = -1;
-    if (raw && out && !vkt_readback_region(im, 0, im->vtype == VK_IMAGE_VIEW_TYPE_3D ? 0 : layer, &r, raw, bytes) && !vks_to_rgba8(im->fi->vk, raw, n, out)) rc = vks_png_write(path, out, (int)im->w, (int)im->h);
+    if (raw && out && !vkt_readback_region(im, 0, im->vtype == VK_IMAGE_VIEW_TYPE_3D ? 0 : layer, &r, raw, bytes)) {
+        if (!vks_to_rgba8(im->fi->vk, raw, n, out)) rc = vks_png_write(path, out, (int)im->w, (int)im->h);
+        // NXRT_VK_TD_RAW=1 (gamectl set td_raw 1): the texels as they are in <path>.raw too. A PNG holds 0..1: a float target far over 1 (an exposure gone wrong) is plain white in it
+        { int vkc_int(const char *name, int def); if (vkc_int("td_raw", 0)) { char p2[1300]; snprintf(p2, sizeof p2, "%s.raw", path); FILE *fr = fopen(p2, "wb"); if (fr) { fwrite(raw, 1, bytes, fr); fclose(fr); } } }
+    }
     free(raw); free(out);
     return rc;
 }

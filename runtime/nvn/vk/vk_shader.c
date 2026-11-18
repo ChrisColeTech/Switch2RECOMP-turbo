@@ -25,6 +25,54 @@ VkShaderStageFlagBits vksh_vk_stage(int stage) {
     }
 }
 VkDescriptorSetLayout vksh_empty_dsl(void) { return g_empty; }
+// ---------- The pool set (vk_shader.h) ----------
+// A shader that reads a texture handle from memory (Ocarina of Time's materials: 43 pixel and 7 vertex shaders) indexes the game's whole texture pool by the handle's
+// texture ID and its sampler pool by the sampler ID. The translator declares them as arrays of 1,048,576 sampled images and 4,096 samplers in the shader's own set.
+// Such a set was allocated for every draw and left unwritten (2 million descriptors a draw, and whatever the shader then sampled: the GPU faulted, "invalid read",
+// device lost some seconds into Ocarina's first scene). Here those arrays are one set of this layer's, moved to set VKSH_POOL_SET in the module (vksh_load), written
+// as the game registers textures and samplers and updated after it is bound (vk_replay.c pool_set). nxnative does the same with a buffer of resource IDs
+// (nvn_mtl.m pool_gpu; MIT, (c) seedds). The layout holds fewer images than the shader's array declares (the device's limit over the four view types); IDs past it read nothing
+static VkDescriptorSetLayout g_pool_dsl; static uint32_t g_pool_nimg; static int g_pool_state;   // 0 not tried, 1 ready, 2 unavailable
+static const VkImageViewType g_pool_vt[VKSH_POOL_TYPES] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_VIEW_TYPE_3D};
+int vksh_pool_binding(VkImageViewType vt) { for (int i = 0; i < VKSH_POOL_TYPES; i++) if (g_pool_vt[i] == vt) return 1 + i; return -1; }
+uint32_t vksh_pool_images(void) { return g_pool_nimg; }
+VkDescriptorSetLayout vksh_pool_dsl(void) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lk);
+    if (!g_pool_state) {
+        g_pool_state = 2;
+        if (!g_vk.f12.descriptorBindingSampledImageUpdateAfterBind || !g_vk.f12.descriptorBindingPartiallyBound || !g_vk.f12.descriptorBindingUpdateUnusedWhilePending)
+            VKRED("texture pools: the device cannot update a bound descriptor set (descriptor indexing): shaders that index the game's texture pool are not drawn");
+        else {
+            VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+            vkGetPhysicalDeviceProperties2(g_vk.pd, &p2);
+            uint32_t lim = p12.maxDescriptorSetUpdateAfterBindSampledImages < p12.maxPerStageDescriptorUpdateAfterBindSampledImages ? p12.maxDescriptorSetUpdateAfterBindSampledImages : p12.maxPerStageDescriptorUpdateAfterBindSampledImages;
+            uint32_t n = 1u << 18; while (n > 1024 && (uint64_t)n * VKSH_POOL_TYPES > lim) n >>= 1;
+            VkDescriptorSetLayoutBinding b[1 + VKSH_POOL_TYPES]; VkDescriptorBindingFlags bf[1 + VKSH_POOL_TYPES];
+            b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_SAMPLER, VKSH_POOL_SAMPLERS, VK_SHADER_STAGE_ALL, NULL};
+            for (int i = 0; i < VKSH_POOL_TYPES; i++) b[1 + i] = (VkDescriptorSetLayoutBinding){(uint32_t)(1 + i), VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, n, VK_SHADER_STAGE_ALL, NULL};
+            for (int i = 0; i < 1 + VKSH_POOL_TYPES; i++) bf[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+            VkDescriptorSetLayoutBindingFlagsCreateInfo fci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, NULL, 1 + VKSH_POOL_TYPES, bf};
+            VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &fci, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT, 1 + VKSH_POOL_TYPES, b};
+            if (vkCreateDescriptorSetLayout(g_vk.dev, &dci, NULL, &g_pool_dsl) == VK_SUCCESS) { g_pool_state = 1; g_pool_nimg = n;
+                VKLOG("texture pools: shaders that index the game's texture and sampler pools share one descriptor set (%u textures in each of %d view types, %d samplers)", n, VKSH_POOL_TYPES, VKSH_POOL_SAMPLERS); }
+            else VKRED("texture pools: the pool set's layout could not be made (%u textures in each of %d view types)", n, VKSH_POOL_TYPES);
+        }
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_pool_state == 1 ? g_pool_dsl : VK_NULL_HANDLE;
+}
+static uint32_t spv_var_of_binding(const uint32_t *w, size_t n, uint32_t binding) {
+    for (size_t i = 5; i < n; ) { uint32_t wc = w[i] >> 16, op = w[i] & 0xffff; if (!wc || i + wc > n) return 0;
+        if (op == 71 && wc >= 4 && w[i + 2] == 33 && w[i + 3] == binding) return w[i + 1];
+        i += wc; }
+    return 0;
+}
+static void spv_move_var(uint32_t *w, size_t n, uint32_t var, uint32_t set, uint32_t binding) {   // OpDecorate var Binding / DescriptorSet
+    for (size_t i = 5; i < n; ) { uint32_t wc = w[i] >> 16, op = w[i] & 0xffff; if (!wc || i + wc > n) return;
+        if (op == 71 && wc >= 4 && w[i + 1] == var) { if (w[i + 2] == 33) w[i + 3] = binding; else if (w[i + 2] == 34) w[i + 3] = set; }
+        i += wc; }
+}
 void vksh_stats(uint64_t *loaded, uint64_t *failed) { *loaded = g_loaded; *failed = g_failed; }
 
 // ---------- SPIR-V ----------
@@ -1026,6 +1074,7 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
     const vj *bs = vj_get(j, "bindings");
     s->nb = bs ? bs->n : 0; s->b = calloc(s->nb ? s->nb : 1, sizeof *s->b);
     VkDescriptorSetLayoutBinding *lb = calloc(s->nb ? s->nb : 1, sizeof *lb);
+    int nlb = 0, npoolv = 0; uint32_t poolv[8], poolb[8];
     for (int i = 0; i < s->nb; i++) {
         const vj *e = vj_at(bs, i), *nv = vj_get(e, "nvn"); vks_bind *b = &s->b[i];
         b->binding = (uint32_t)vj_int(vj_get(e, "binding"), 0); b->count = (uint32_t)vj_int(vj_get(e, "count"), 1);
@@ -1036,7 +1085,8 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
         b->reg = (int16_t)vj_int(vj_get(nv, "reg"), 0); b->bank = (uint8_t)vj_int(vj_get(nv, "bank"), 0);
         b->kind = !strcmp(k, "support") ? VKB_SUPPORT : !strcmp(k, "cbuf") ? VKB_CBUF : !strcmp(k, "c1") ? VKB_C1 : !strcmp(k, "drvcb") ? VKB_DRV : !strcmp(k, "sbuf") ? VKB_SBUF :
                   !strcmp(k, "tex") ? VKB_TEX : !strcmp(k, "tbuf") ? VKB_TBUF : !strcmp(k, "img") ? VKB_IMG : !strcmp(k, "ubo_ptr") ? VKB_UBOP : !strcmp(k, "sbuf_ubo") ? VKB_SBUF_UBO :
-                  !strcmp(k, DMSH_KIND_GMEM_MAP) ? VKB_GMEM_MAP : !strcmp(k, DMSH_KIND_GMEM_LOG) ? VKB_GMEM_LOG : VKB_UNKNOWN;
+                  !strcmp(k, DMSH_KIND_GMEM_MAP) ? VKB_GMEM_MAP : !strcmp(k, DMSH_KIND_GMEM_LOG) ? VKB_GMEM_LOG :
+                  !strcmp(k, DMSH_KIND_TEX_POOL) ? VKB_TEX_POOL : !strcmp(k, DMSH_KIND_SAMP_POOL) ? VKB_SAMP_POOL : VKB_UNKNOWN;
         // Reflections made before nxs_refl.py named them: the translator's sentinel uniform slot (DMSH_GMEM_MAP_CB_SLOT) read as a storage buffer kept in uniform slot 252
         if (b->kind == VKB_SBUF_UBO && b->reg == DMSH_GMEM_MAP_CB_SLOT - 3) b->kind = vj_int(vj_get(nv, "off"), 0) == DMSH_GMEM_LOG_CB_OFFSET * 4 ? VKB_GMEM_LOG : VKB_GMEM_MAP;
         if (b->kind == VKB_UNKNOWN) { static int n; if (n++ < 16) VKRED("shader %s binding %u: kind %s is not replayed yet (bound as empty)", key, b->binding, k); }
@@ -1048,8 +1098,15 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
         else if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) { b->samp_kind = VKB_SAMP_TEX; b->samp_reg = b->reg; }
         vkspv_img im; b->vtype = VK_IMAGE_VIEW_TYPE_2D;
         if (!vkspv_image_of(w, nw, b->binding, &im) && im.is_image) { b->dim = im.dim; b->vtype = view_type(im.dim, im.arrayed); b->ct = im.ct; b->depth = im.depth; b->ms = im.ms; b->dref = im.dref; b->plain = im.plain; }
-        lb[i] = (VkDescriptorSetLayoutBinding){b->binding, b->type, b->count, (VkShaderStageFlags)vksh_stage_bit(s), NULL};
+        if (b->kind == VKB_TEX_POOL || b->kind == VKB_SAMP_POOL) {   // into the pool set (above), out of this shader's own
+            int pb = b->kind == VKB_SAMP_POOL ? 0 : vksh_pool_binding(b->vtype); uint32_t var = spv_var_of_binding(w, nw, b->binding);
+            if (pb < 0 || !var || npoolv == 8 || !vksh_pool_dsl()) { *why = pb < 0 ? "a texture pool of a view type the pool set has not" : "a texture pool binding that cannot be served"; free(w); free(lb); goto fail; }
+            poolv[npoolv] = var; poolb[npoolv++] = (uint32_t)pb; s->pool = 1;
+            continue;
+        }
+        lb[nlb++] = (VkDescriptorSetLayoutBinding){b->binding, b->type, b->count, (VkShaderStageFlags)vksh_stage_bit(s), NULL};
     }
+    for (int i = 0; i < npoolv; i++) spv_move_var(w, nw, poolv[i], VKSH_POOL_SET, poolb[i]);
     // interface
     const vj *in = vj_get(j, "inputs");
     for (int i = 0; in && i < in->n && s->stage == VKS_VS && s->nin < 32; i++) {
@@ -1062,6 +1119,8 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
         const vj *e = vj_at(out, i); int l = vj_int(vj_get(e, "location"), -1);
         if (l >= 0 && l < 8) { s->out_mask |= 1u << l; s->out_ct[l] = (uint8_t)ct_of(vj_str(vj_get(e, "type"), "float")); }
     }
+    { const vj *nt = vj_get(vj_get(j, "translator"), "notes");   // the translator's note of a load at an address the shader read from memory
+      for (int i = 0; nt && i < nt->n && !s->gmem_load; i++) { const char *t = vj_str(vj_at(nt, i), ""); if (strstr(t, "\"Load\" traced to no storage buffer")) s->gmem_load = 1; } }
     const vj *ls = vj_get(j, "local_size");
     for (int i = 0; i < 3; i++) s->local[i] = (uint32_t)vj_int(vj_at(ls, i), 1);
     const vj *dr = vj_get(j, "drv_reads");
@@ -1104,7 +1163,7 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
     VkResult r = vk_module(&mci, &s->mod, s->key, "base");
     if (s->stage == VKS_VS || s->stage == VKS_FS) { s->words = w; s->nwords = nw; } else free(w);   // the sources of their variants
     if (r != VK_SUCCESS) { free(lb); *why = "vkCreateShaderModule failed"; goto fail; }
-    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)s->nb, lb};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nlb, lb};
     r = vkCreateDescriptorSetLayout(g_vk.dev, &dci, NULL, &s->dsl);
     free(lb);
     if (r != VK_SUCCESS) { *why = "vkCreateDescriptorSetLayout failed"; goto fail; }
@@ -1125,7 +1184,7 @@ static vks_shader *get_l(const nxs_shader *n) {   // g_shl held
         g_loaded++;
         vk_hm_put(&g_sh, n->key, s);
         { char k[128]; int o = 0; int cnt[VKB_UNKNOWN + 1] = {0}; for (int i = 0; i < s->nb; i++) cnt[s->b[i].kind]++;
-          static const char *nm[] = {"", "support", "cbuf", "c1", "drv", "sbuf", "tex", "tbuf", "img", "ubop", "sbuf_ubo", "gmem_map", "gmem_log", "?"};
+          static const char *nm[] = {"", "support", "cbuf", "c1", "drv", "sbuf", "tex", "tbuf", "img", "ubop", "sbuf_ubo", "gmem_map", "gmem_log", "tex_pool", "samp_pool", "?"};
           for (int i = 1; i <= VKB_UNKNOWN; i++) if (cnt[i]) o += snprintf(k + o, sizeof k - o, " %s %d", nm[i], cnt[i]);
           VKLOG("shader %s (%s):%s%s%s", n->key, s->stage == VKS_VS ? "vertex" : s->stage == VKS_FS ? "fragment" : s->stage == VKS_CS ? "compute" : s->stage == VKS_GS ? "geometry" : "tessellation", k,
                 s->drv_read[0] || s->drv_read[2] ? " (reads driver segments)" : "", s->s2cs ? " (Switch 2 compute bank)" : ""); }

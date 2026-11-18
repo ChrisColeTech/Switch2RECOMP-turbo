@@ -11,7 +11,7 @@ void vkpc_note_created(int n);
 const wchar_t *vkpc_path(void);
 
 vkp_dyn g_vkp_dyn;
-static vk_hmap g_layouts = {sizeof(VkDescriptorSetLayout) * 6}, g_gfx = {sizeof(vkp_gkey)}, g_cs = {sizeof(void *)}, g_cs_layouts = {sizeof(VkDescriptorSetLayout)};
+static vk_hmap g_layouts = {sizeof(VkDescriptorSetLayout) * 7}, g_gfx = {sizeof(vkp_gkey)}, g_cs = {sizeof(void *)}, g_cs_layouts = {sizeof(VkDescriptorSetLayout)};
 static vkp_stats_t g_st;
 static int g_failed_mark;
 #define PIPE_FAILED ((void *)&g_failed_mark)
@@ -177,11 +177,11 @@ VkFormat vkp_vertex_format_natural(int f, int *ct) {
 
 // ---------- Layouts ----------
 VkPipelineLayout vkp_layout(const vks_shader *const sh[5]) {
-    VkDescriptorSetLayout s[6];   // the sets, then whether the fragment stage takes the alpha test's push constants (M6 phase B)
-    for (int i = 0; i < 5; i++) s[i] = vksh_empty_dsl();
+    VkDescriptorSetLayout s[7];   // the stages' sets, the pool set (vksh_pool_dsl) when a stage indexes the game's pools, then whether the fragment stage takes the alpha test's push constants (M6 phase B)
+    for (int i = 0; i < 6; i++) s[i] = vksh_empty_dsl();
     int nset = 1;
-    for (int i = 0; i < 5; i++) if (sh[i]) { int set = vksh_set_of(sh[i]->stage); s[set] = sh[i]->dsl; if (set + 1 > nset) nset = set + 1; }
-    int pc = sh[1] && sh[1]->alpha; s[5] = (VkDescriptorSetLayout)(uintptr_t)pc;
+    for (int i = 0; i < 5; i++) if (sh[i]) { int set = vksh_set_of(sh[i]->stage); s[set] = sh[i]->dsl; if (set + 1 > nset) nset = set + 1; if (sh[i]->pool) { s[VKSH_POOL_SET] = vksh_pool_dsl(); nset = VKSH_POOL_SET + 1; } }
+    int pc = sh[1] && sh[1]->alpha; s[6] = (VkDescriptorSetLayout)(uintptr_t)pc;
     AcquireSRWLockExclusive(&g_pl);
     VkPipelineLayout l = (VkPipelineLayout)vk_hm_get(&g_layouts, s);
     if (l) { ReleaseSRWLockExclusive(&g_pl); return l; }
@@ -196,7 +196,9 @@ VkPipelineLayout vkp_layout_cs(const vks_shader *cs) {
     AcquireSRWLockExclusive(&g_pl);
     VkPipelineLayout l = (VkPipelineLayout)vk_hm_get(&g_cs_layouts, &cs->dsl);
     if (!l) {
-        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &cs->dsl, 0, NULL};
+        VkDescriptorSetLayout s[VKSH_POOL_SET + 1]; for (int i = 0; i <= VKSH_POOL_SET; i++) s[i] = vksh_empty_dsl();
+        s[0] = cs->dsl; if (cs->pool) s[VKSH_POOL_SET] = vksh_pool_dsl();
+        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, cs->pool ? VKSH_POOL_SET + 1u : 1u, s, 0, NULL};
         if (vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l) != VK_SUCCESS) l = VK_NULL_HANDLE;
         else { vk_hm_put(&g_cs_layouts, &cs->dsl, (void *)l); g_st.layouts++; }
     }

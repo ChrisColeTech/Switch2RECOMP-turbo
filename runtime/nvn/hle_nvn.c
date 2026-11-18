@@ -76,7 +76,8 @@ HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with
 #include "nvn_obj.h"
 #include <process.h>
 // Asynchronous submission (aq_*, defined with nvnQueueSubmitCommands below)
-static int aq_on(void); static void aq_drain(void); static uint64_t aq_fence_now(void); static int aq_resolve(uint64_t *fence, uint64_t timeout); static int aq_busy(void);
+static int aq_on(void); static void aq_drain(void); static uint64_t aq_fence_of(uint64_t seq); static uint64_t aq_fence_present(void); static int aq_resolve(uint64_t *fence, uint64_t timeout); static int aq_busy(void);
+static int aq_wait_seq(uint64_t seq, uint64_t timeout); static void aq_wake(void); static void aq_wait_fenced(const sync_t *o, uint64_t timeout);
 // DM_NVN_CAPTURE (nxnative's nvn_capture.inc) is not ported
 #define nvn_cap_submit(n, h) ((void)0)
 #define nvn_cap_present(t, crop) ((void)0)
@@ -717,7 +718,7 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit (with asynchronous submission, possibly still
 // a queued submission's sequence number, resolved when it is waited on)
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fence = aq_fence_now(); ((sync_t *)s)->fenced = 1; }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)c; (void)f; ((sync_t *)s)->fence = aq_fence_of(((const queue_t *)q)->last_seq); ((sync_t *)s)->fenced = 1; }   // its own queue's last op: another queue's parked submission is not waited for
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
 NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; { static long n; if (!(n++ & 1023)) LOG("[nvn] QueueWaitSync call %ld", n); } static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
@@ -731,7 +732,7 @@ extern volatile int g_swr_trace_on; unsigned long long swr_trace_ts(void); void 
 static _Atomic uint64_t g_sync_ns;   // time game threads spent blocked in nvnSyncWait (waiting for the GPU), in the frame statistics
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     sync_t *o = (sync_t *)s;
-    if (!o->fenced && timeout && aq_busy()) aq_drain();   // a fence inside a command buffer still queued for translation (OP_FENCE_SYNC): it is set once that is translated
+    if (!o->fenced && timeout && aq_busy()) aq_wait_fenced(o, timeout);   // a fence inside a command buffer still queued for translation (OP_FENCE_SYNC): it is set once that is translated
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? gfx_wait_acq : gfx_wait;
     uint64_t fv = o->fence;
@@ -751,7 +752,7 @@ NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
-NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
+NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); aq_wake(); }
 
 // ---------- Queue ----------
 #define QB(b) ((queue_builder_t *)(b))
@@ -788,7 +789,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; TRS0(); aq_drain(); gfx_finish(); TRS1("nvnQueueFinish"); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { TRS0(); if (aq_on() && ((const queue_t *)q)->last_seq) aq_wait_seq(((const queue_t *)q)->last_seq, UINT64_MAX); gfx_finish(); TRS1("nvnQueueFinish"); }   // its own queue's work
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1115,6 +1116,9 @@ NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, 
 }
 // NVN2 mesh shading: count task workgroups from first, or mesh workgroups in a program with no task shader
 NVN_NOPROTO(nvnCommandBufferDrawMeshTasks, void, NVNcommandBuffer *c, int first, int count) { rec_draw(c, (p_draw){DM_PRIM_MESH_TASKS, first, count, 1, 0, 0}); }
+// The record at ind is {count, first}, written by the game's culling dispatch earlier in the same submission: the GPU reads it (vk_replay.c mesh_ind). A stub until
+// 2026-11-18: Ocarina of Time's terrain and foliage were not drawn (nxnative, hle_nvn.c; MIT, (c) seedds)
+NVN_NOPROTO(nvnCommandBufferDrawMeshTasksIndirect, void, NVNcommandBuffer *c, NVNbufferAddress ind) { rec_draw(c, (p_draw){DM_PRIM_MESH_TASKS, 0, 0, 1, 0, ind}); }
 NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { rec_draw(c, (p_draw){pr, first, n, 1, 0, 0}); }
 // Indirect: the {count, instances, first, base instance} record at ind is usually written by the GPU earlier in the frame (Hyrule Warriors: Age of Calamity's first battle), so the replay
 // issues a Metal indirect draw from the pool buffer instead of reading it at record or replay time (nvn_mtl.m draw)
@@ -1297,9 +1301,10 @@ static void submit_now(uint64_t serial, int origin_ll, int n, const uint64_t *h)
 // What the replay reads from guest memory it reads later than before, as the console's GPU does. At most AQ_PRESENTS presents wait in the queue (the frames in flight)
 enum { AQ_N = 64, AQ_PRESENTS = 2, AQ_FN = 1024 };
 #define AQ_SEQ (1ull << 62)
-typedef struct { int kind; uint64_t seq, serial; int origin_ll, n; uint64_t *h; win_t *w; int idx; const tex_t *t; int crop[4]; double period; } aop_t;   // kind 1 submit, 2 present
-static aop_t g_aq[AQ_N]; static uint64_t g_aq_tail, g_aq_npres;   // g_aq_tail: sequence number of the last queued op (op seq goes to slot seq % AQ_N)
-static _Atomic uint64_t g_aq_done, g_aq_head;   // the last op finished; the last op taken
+typedef struct { int kind; uint64_t seq, serial; int origin_ll, n; uint64_t *h; win_t *w; int idx; const tex_t *t; int crop[4]; double period; } aop_t;   // kind 1 submit, 2 present; serial: its NVN queue
+static aop_t g_aq[AQ_N]; static uint64_t g_aq_tail, g_aq_npres, g_aq_last_present;   // g_aq_tail: sequence number of the last queued op (op seq goes to slot seq % AQ_N); the last present queued
+static uint8_t g_aq_st[AQ_N];   // per slot: 0 free, 1 queued, 2 taken (being translated, or parked at an event wait), 3 finished and not yet passed by g_aq_done
+static _Atomic uint64_t g_aq_done;   // every op up to this one has finished
 static struct { uint64_t seq, fence; } g_aq_f[AQ_FN];   // the timeline value after op seq (its fence)
 static pthread_mutex_t g_aq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_aq_cv = PTHREAD_COND_INITIALIZER, g_aq_done_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_aq_ns, g_aq_cyc;   // the translation thread's time in its ops (frame statistics)
@@ -1307,66 +1312,92 @@ static int g_aq_on = -1;
 static int aq_on(void) { if (g_aq_on < 0) { const char *e = getenv("SWR_ASYNC_SUBMIT"); g_aq_on = e ? atoi(e) > 0 : 1;   // on by default: synchronous replay took ~27 ms of a 34 ms MKW race frame on the game's own thread
     if (g_aq_on) LOG("[nvn] asynchronous submission: submits and presents are translated on a thread of their own (SWR_ASYNC_SUBMIT=0 restores the old synchronous replay)"); } return g_aq_on; }
 static int aq_busy(void) { return aq_on() && atomic_load(&g_aq_done) < g_aq_tail; }
+static int aq_finished(uint64_t seq) { return atomic_load(&g_aq_done) >= seq || g_aq_st[seq % AQ_N] == 3; }   // under g_aq_mu (a slot is reused only once g_aq_done has passed it)
 // ---------- Submissions parked at a GPU event wait ----------
-// A game with two NVN queues hands work between them with events: one queue's commands wait (nvnCommandBufferWaitEvent) for a value the other queue's commands signal.
-// Donkey Kong Bananza's frame: main queue Signal(E0=0), depth pre-pass, Wait(E1==1), ..., Signal(E0=2), Wait(E1==3), shading; second queue Wait(E0==0), Signal(E1=1),
-// Wait(E0==2), a dispatch over the depth buffer, Signal(E1=3). Replayed whole in submit order, the second queue's dispatch ran before the main queue's pre-pass (on last
-// frame's depth) and its first wait timed out. As nxnative's nvn_queue.inc parks a queue at an unresolved wait and replays another queue's continuation
-// (docs/reference/nvn-objects.md "GPU event waits order work across queues"; MIT, (c) seedds), each submission is translated on a fiber of the translation thread: at a
-// wait no recorded signal meets, what is recorded so far is committed and the fiber is left (nvn_aq_park, called by the replay); the thread goes on with the next
-// queued submission of another queue and comes back when a signal that meets the wait has been recorded, or after the wait's time limit. A submission of the same
-// queue, or a present, never overtakes a parked one: the parked one is resumed first. Fibers on Windows, ucontext on Linux (host/linux/windows.h); NXRT_AQ_PARK=0: waits are waited out in place, as before
+// A game with several NVN queues hands work between them with events: one queue's commands wait (nvnCommandBufferWaitEvent) for a value another queue's commands, or the
+// CPU (nvnEventSignal), signal. Donkey Kong Bananza's frame: main queue Signal(E0=0), depth pre-pass, Wait(E1==1), ..., Signal(E0=2), Wait(E1==3), shading; second queue
+// Wait(E0==0), Signal(E1=1), Wait(E0==2), a dispatch over the depth buffer, Signal(E1=3). Ocarina of Time's frame is a graph of about twenty such events, each with a
+// value of its own every frame: three submissions that start with a wait for the frame's last event, which a fourth, submitted after them, signals.
+// The rule is nxnative's (nvn_queue.inc; docs/reference/nvn-objects.md "GPU event waits order work across queues"; MIT, (c) seedds): an unmet wait parks its NVN queue
+// and only that queue. Each submission is translated on a fiber of the translation thread; at a wait no recorded signal meets, what is recorded so far is committed
+// and the fiber is left (nvn_aq_park, called by the replay). The thread goes on with the oldest queued op of a queue that has nothing parked and nothing queued before
+// it, and comes back to the parked one when its wait is met. A queue's own order is kept: its next submission and its presents stay behind what it has parked.
+// What a game can observe is per queue as well: a fence (nvnQueueFenceSync, nvnQueueFinish) is its queue's last op, and it is done when that op is, whatever another
+// queue has parked. Until 2026-11-18 ops were published done in submission order, a present or the queue's next submission resumed a parked one unmet, and a wait
+// gave up after 250 ms: Ocarina of Time's game thread sat in nvnSyncWait behind another queue's parked submission, 1 to 5 frames a second in its first scene.
+// A wait nothing meets is given up after NXRT_VK_WAIT_EVENT_MS (2 s) with a red line, so that a signal this layer loses shows as a slow game and not as a hang.
+// NXRT_AQ_FORCE=1: a present, or its queue's next submission, resumes a parked submission unmet, as before. Fibers on Windows, ucontext on Linux (host/linux/windows.h);
+// NXRT_AQ_PARK=0: waits are waited out in place
 #if (defined(_WIN32) || defined(__linux__)) && defined(NXRT_GFX_VK)
 #define AQ_PARK 1
 int vkr_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t v);
 int nvn_sub_resuming;   // gfx_sub_begin is the rest of a parked submission (vk_replay.c vkr_sub_begin keeps the queue's render condition)
-enum { AQF_N = 8 };
+enum { AQF_N = 32 };
 typedef struct { void *fiber; int state; aop_t op; uint64_t seq, t_park; volatile uint32_t *val; uint32_t mode, v; int max_ms; } aqf_t;   // state: 0 free, 1 running, 2 parked, 3 finished
-static aqf_t g_aqf[AQF_N]; static void *g_aq_sched; static aqf_t *g_aqf_cur; static uint64_t g_aq_parks, g_aq_forced;
+static aqf_t g_aqf[AQF_N]; static void *g_aq_sched; static aqf_t *g_aqf_cur; static uint64_t g_aq_parks, g_aq_forced, g_aq_park_ns, g_aq_park_max;
 static void CALLBACK aqf_main(void *arg) { aqf_t *f = arg; for (;;) { submit_now(f->op.serial, f->op.origin_ll, f->op.n, f->op.h); free(f->op.h); f->state = 3; SwitchToFiber(g_aq_sched); } }
 int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) {   // 1: the submission was parked and is being translated again (in a new slot); 0: not possible here
     aqf_t *f = g_aqf_cur; if (!f) return 0;
     gfx_sub_commit(); pthread_mutex_unlock(&g_sub_mu); gfx_leave();
     f->val = val; f->mode = mode; f->v = v; f->max_ms = max_ms; f->t_park = now_ns(); f->state = 2; g_aq_parks++;
     SwitchToFiber(g_aq_sched);
+    { uint64_t d = now_ns() - f->t_park; g_aq_park_ns += d; if (d > g_aq_park_max) g_aq_park_max = d; }
     dm_host_mutex_lock(&g_sub_mu); gfx_enter();
     gfx_queue_activate(f->op.serial); gfx_set_queue_origin_lower_left(f->op.origin_ll);
     nvn_sub_resuming = 1; gfx_sub_begin(); nvn_sub_resuming = 0;
     return 1;
 }
-static uint8_t g_aq_fin[AQ_N];
 #else
 int nvn_sub_resuming;
 int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) { (void)val; (void)mode; (void)v; (void)max_ms; return 0; }
 #endif
-static void aq_op_done(uint64_t seq, int kind) {   // ops are published done in order: one that finished while an earlier one was parked waits for it
+static void aq_op_done(uint64_t seq, int kind) {   // an op is done when it is: a fence of its queue does not wait for another queue's parked submission. g_aq_done follows in order
     pthread_mutex_lock(&g_aq_mu);
     g_aq_f[seq % AQ_FN].fence = gfx_last_fence(); g_aq_f[seq % AQ_FN].seq = seq;
     if (kind == 2) g_aq_npres--;
-#ifdef AQ_PARK
-    g_aq_fin[seq % AQ_N] = 1;
-    uint64_t d = atomic_load(&g_aq_done), h = atomic_load(&g_aq_head);
-    while (d < h && g_aq_fin[(d + 1) % AQ_N]) { d++; g_aq_fin[d % AQ_N] = 0; if (d != seq) { g_aq_f[d % AQ_FN].fence = gfx_last_fence(); g_aq_f[d % AQ_FN].seq = d; } }
+    g_aq_st[seq % AQ_N] = 3;
+    uint64_t d = atomic_load(&g_aq_done);
+    while (d < g_aq_tail && g_aq_st[(d + 1) % AQ_N] == 3) { d++; g_aq_st[d % AQ_N] = 0; }
     atomic_store(&g_aq_done, d);
-#else
-    atomic_store(&g_aq_done, seq);
-#endif
     pthread_cond_broadcast(&g_aq_done_cv);
     pthread_mutex_unlock(&g_aq_mu);
 }
+// The oldest queued op whose queue has nothing parked and nothing queued before it (under g_aq_mu); 0 = none. With force, an op behind its queue's parked submission
+// (or a present behind any) has that submission resumed unmet instead (NXRT_AQ_FORCE=1, the rule before)
+static uint64_t aq_pick(int force) {
+    uint64_t held[AQ_N]; int nheld = 0, any_parked = 0;
+    for (uint64_t s = atomic_load(&g_aq_done) + 1; s <= g_aq_tail; s++) {
+        const aop_t *o = &g_aq[s % AQ_N]; int st = g_aq_st[s % AQ_N];
+        if (st == 3) continue;
+        int blocked = 0; for (int i = 0; i < nheld && !blocked; i++) blocked = held[i] == o->serial;
+        if (st == 2) { any_parked = 1; if (!blocked) held[nheld++] = o->serial; continue; }
+#ifdef AQ_PARK
+        if (force && (blocked || (o->kind == 2 && any_parked))) {
+            for (int i = 0; i < AQF_N; i++) if (g_aqf[i].state == 2 && (o->kind == 2 || g_aqf[i].op.serial == o->serial)) { g_aqf[i].max_ms = 0; g_aq_forced++; }
+            return 0; }
+#else
+        (void)force; (void)any_parked;
+#endif
+        if (!blocked) return s;
+        held[nheld++] = o->serial;
+    }
+    return 0;
+}
 static unsigned __stdcall aq_main(void *arg) {
     (void)arg; SetThreadDescription(GetCurrentThread(), L"nvn translation"); SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    int force = 0;
 #ifdef AQ_PARK
     { const char *e = getenv("NXRT_AQ_PARK"); if (!(e && *e == '0')) g_aq_sched = ConvertThreadToFiber(NULL);
-      if (g_aq_sched) LOG("[nvn] submissions are parked at GPU event waits another queue's commands signal (NXRT_AQ_PARK=0: waited out in place)"); }
+      e = getenv("NXRT_AQ_FORCE"); force = e && *e == '1';
+      if (g_aq_sched) LOG("[nvn] a submission at a GPU event wait that is not met parks its NVN queue, the other queues go on (NXRT_AQ_PARK=0: waited out in place%s)", force ? "; NXRT_AQ_FORCE=1: a present or its queue's next submission resumes it unmet" : ""); }
 #endif
     for (;;) {
-#ifdef AQ_PARK
         int nparked = 0;
+#ifdef AQ_PARK
         if (g_aq_sched) {   // a parked submission whose wait a recorded signal meets, or whose time is up: the oldest first
             aqf_t *r = NULL; uint64_t now = now_ns();
             for (int i = 0; i < AQF_N; i++) { aqf_t *f = &g_aqf[i]; if (f->state != 2) continue; nparked++;
-                if ((vkr_event_ready(f->val, f->mode, f->v) || now - f->t_park >= (uint64_t)f->max_ms * 1000000ull) && (!r || f->t_park < r->t_park)) r = f; }
+                if ((vkr_event_ready(f->val, f->mode, f->v) || now - f->t_park >= (uint64_t)f->max_ms * 1000000ull) && (!r || f->seq < r->seq)) r = f; }
             if (r) {
                 uint64_t t0 = now_ns(), c0 = thread_cyc();
                 g_aqf_cur = r; r->state = 1; SwitchToFiber(r->fiber); g_aqf_cur = NULL;
@@ -1377,21 +1408,14 @@ static unsigned __stdcall aq_main(void *arg) {
         }
 #endif
         pthread_mutex_lock(&g_aq_mu);
-#ifdef AQ_PARK
-        if (nparked) {   // something is parked: look for new work for a millisecond at a time, the parked waits' limits run meanwhile
-            if (atomic_load(&g_aq_head) == g_aq_tail) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 1000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        uint64_t seq = aq_pick(force);
+        if (!seq) {   // nothing to take: wait for an op, or, with something parked, a millisecond (a CPU signal wakes this thread; the waits' limits run meanwhile)
+            if (nparked) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 1000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
                 pthread_cond_timedwait(&g_aq_cv, &g_aq_mu, &ts); }
-            if (atomic_load(&g_aq_head) == g_aq_tail) { pthread_mutex_unlock(&g_aq_mu); continue; }
-            const aop_t *nx = &g_aq[(atomic_load(&g_aq_head) + 1) % AQ_N]; int conflict = nx->kind == 2;
-            for (int i = 0; i < AQF_N && !conflict; i++) if (g_aqf[i].state == 2 && g_aqf[i].op.serial == nx->serial) conflict = 1;
-            if (conflict) {   // a present, or the same queue's next submission: what is parked goes first, met or not
-                for (int i = 0; i < AQF_N; i++) if (g_aqf[i].state == 2 && (nx->kind == 2 || g_aqf[i].op.serial == nx->serial)) { g_aqf[i].max_ms = 0; g_aq_forced++; }
-                pthread_mutex_unlock(&g_aq_mu); continue;
-            }
-        } else
-#endif
-        while (atomic_load(&g_aq_head) == g_aq_tail) pthread_cond_wait(&g_aq_cv, &g_aq_mu);
-        uint64_t seq = atomic_load(&g_aq_head) + 1; aop_t op = g_aq[seq % AQ_N]; atomic_store(&g_aq_head, seq);
+            else pthread_cond_wait(&g_aq_cv, &g_aq_mu);
+            pthread_mutex_unlock(&g_aq_mu); continue;
+        }
+        aop_t op = g_aq[seq % AQ_N]; g_aq_st[seq % AQ_N] = 2;
         pthread_mutex_unlock(&g_aq_mu);
         uint64_t t0 = now_ns(), c0 = thread_cyc();
         int done = 1;
@@ -1408,7 +1432,9 @@ static unsigned __stdcall aq_main(void *arg) {
         atomic_fetch_add(&g_aq_ns, now_ns() - t0); atomic_fetch_add(&g_aq_cyc, thread_cyc() - c0);
         if (done) aq_op_done(seq, op.kind);
 #ifdef AQ_PARK
-        { static uint64_t last; if (g_aq_parks && now_ns() - last > 30000000000ull) { last = now_ns(); LOG("[nvn] submissions parked at event waits so far: %llu (%llu resumed unmet, ahead of a present or of their queue's next submission)", (unsigned long long)g_aq_parks, (unsigned long long)g_aq_forced); } }
+        { static uint64_t last, lp, lns; if (g_aq_parks && now_ns() - last > 30000000000ull) { last = now_ns();
+            LOG("[nvn] submissions parked at event waits so far: %llu (%llu resumed unmet); since the last line %.2f ms parked each on average, the longest so far %.1f ms", (unsigned long long)g_aq_parks, (unsigned long long)g_aq_forced,
+                g_aq_parks > lp ? (g_aq_park_ns - lns) / 1e6 / (double)(g_aq_parks - lp) : 0.0, g_aq_park_max / 1e6); lp = g_aq_parks; lns = g_aq_park_ns; } }
 #endif
     }
     return 0;
@@ -1417,10 +1443,10 @@ static uint64_t aq_push(const aop_t *op) {   // queues op (waiting while the que
     static int started; pthread_mutex_lock(&g_aq_mu);
     if (!started) { started = 1; uintptr_t th = _beginthreadex(NULL, 0, aq_main, NULL, 0, NULL); if (!th) die("cannot start the NVN translation thread"); CloseHandle((HANDLE)th); }
     dm_host_work++;
-    while (g_aq_tail - atomic_load(&g_aq_head) >= AQ_N - 1 || (op->kind == 2 && g_aq_npres >= AQ_PRESENTS)) pthread_cond_wait(&g_aq_done_cv, &g_aq_mu);
+    while (g_aq_tail - atomic_load(&g_aq_done) >= AQ_N - 1 || (op->kind == 2 && g_aq_npres >= AQ_PRESENTS)) pthread_cond_wait(&g_aq_done_cv, &g_aq_mu);
     dm_host_work--;
-    uint64_t seq = ++g_aq_tail; g_aq[seq % AQ_N] = *op; g_aq[seq % AQ_N].seq = seq;
-    if (op->kind == 2) { g_aq_npres++;
+    uint64_t seq = ++g_aq_tail; g_aq[seq % AQ_N] = *op; g_aq[seq % AQ_N].seq = seq; g_aq_st[seq % AQ_N] = 1;
+    if (op->kind == 2) { g_aq_npres++; g_aq_last_present = seq;
         // The window's ticket of this present, while the translation thread cannot have taken the op yet (it takes it under this mutex). Written by the caller after
         // the push, it could land after the translation thread had put the present's real ticket there: the next acquire of that texture then waited for a present
         // numbered by the queued marker, for ever. Seen once the frames got cheap (Ocarina of Time's movies at 60 FPS: a stop a few minutes in, nothing waiting on the GPU)
@@ -1431,23 +1457,32 @@ static uint64_t aq_push(const aop_t *op) {   // queues op (waiting while the que
 }
 static int aq_wait_seq(uint64_t seq, uint64_t timeout) {   // 1 once op seq is done; timeout in ns (0 = only look)
     if (atomic_load(&g_aq_done) >= seq) return 1;
-    if (!timeout) return 0;
     uint64_t t0 = now_ns(); int ok = 1;
     dm_host_work++; pthread_mutex_lock(&g_aq_mu);
-    while (atomic_load(&g_aq_done) < seq) {
-        if (timeout != UINT64_MAX && now_ns() - t0 >= timeout) { ok = 0; break; }
+    while (!aq_finished(seq)) {
+        if (!timeout || (timeout != UINT64_MAX && now_ns() - t0 >= timeout)) { ok = 0; break; }
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 2000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
         pthread_cond_timedwait(&g_aq_done_cv, &g_aq_mu, &ts);
     }
     pthread_mutex_unlock(&g_aq_mu); dm_host_work--;
     return ok;
 }
-static void aq_drain(void) { if (aq_on()) aq_wait_seq(g_aq_tail, UINT64_MAX); }
-static uint64_t aq_fence_now(void) {   // the fence of everything queued so far
-    if (!aq_on()) return gfx_last_fence();
-    pthread_mutex_lock(&g_aq_mu); uint64_t t = g_aq_tail, d = atomic_load(&g_aq_done); pthread_mutex_unlock(&g_aq_mu);
-    return t > d ? AQ_SEQ | t : gfx_last_fence();
+static void aq_drain(void) {   // everything queued, whatever its queue
+    if (!aq_on()) return;
+    pthread_mutex_lock(&g_aq_mu); uint64_t t = g_aq_tail; pthread_mutex_unlock(&g_aq_mu);
+    dm_host_work++; pthread_mutex_lock(&g_aq_mu);
+    while (atomic_load(&g_aq_done) < t) pthread_cond_wait(&g_aq_done_cv, &g_aq_mu);
+    pthread_mutex_unlock(&g_aq_mu); dm_host_work--;
 }
+// The fence of op seq (0 = none queued yet): its timeline value if it is done, else the op itself (AQ_SEQ), resolved when it is waited on
+static uint64_t aq_fence_of(uint64_t seq) {
+    if (!aq_on() || !seq) return gfx_last_fence();
+    pthread_mutex_lock(&g_aq_mu);
+    uint64_t f = !aq_finished(seq) ? AQ_SEQ | seq : g_aq_f[seq % AQ_FN].seq == seq ? g_aq_f[seq % AQ_FN].fence : gfx_last_fence();   // long done (its entry reused): any later value is complete no sooner
+    pthread_mutex_unlock(&g_aq_mu);
+    return f;
+}
+static uint64_t aq_fence_present(void) { return aq_fence_of(g_aq_last_present); }   // an acquire's sync: the texture is free once the last present queued, and what its queue did before it, is done
 static int aq_resolve(uint64_t *fence, uint64_t timeout) {   // a queued fence (AQ_SEQ) becomes its timeline value once translated; 0 = not translated within timeout
     if (!(*fence & AQ_SEQ)) return 1;
     uint64_t seq = *fence & ~AQ_SEQ;
@@ -1457,6 +1492,18 @@ static int aq_resolve(uint64_t *fence, uint64_t timeout) {   // a queued fence (
     pthread_mutex_unlock(&g_aq_mu);
     return 1;
 }
+// A sync a command buffer fences (OP_FENCE_SYNC) is fenced once its submission is translated: wait for that, or for the queue to run dry, not for every queue's parked work
+static void aq_wait_fenced(const sync_t *o, uint64_t timeout) {
+    if (!aq_on()) return;
+    uint64_t t0 = now_ns();
+    dm_host_work++; pthread_mutex_lock(&g_aq_mu);
+    while (!o->fenced && atomic_load(&g_aq_done) < g_aq_tail && (timeout == UINT64_MAX || now_ns() - t0 < timeout)) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 2000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&g_aq_done_cv, &g_aq_mu, &ts);
+    }
+    pthread_mutex_unlock(&g_aq_mu); dm_host_work--;
+}
+static void aq_wake(void) { if (g_aq_on > 0) pthread_cond_signal(&g_aq_cv); }   // a CPU event signal: a parked wait may be met now
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     TRS0();
     uint64_t t0 = now_ns(), c0 = thread_cyc();
@@ -1466,7 +1513,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         aop_t op = {1, 0, ((const queue_t *)q)->serial, ((const queue_t *)q)->origin_ll, n, malloc((size_t)(n ? n : 1) * sizeof(uint64_t))};
         if (!op.h) die("asynchronous submission: out of memory");
         memcpy(op.h, h, (size_t)n * sizeof(uint64_t));
-        aq_push(&op);
+        ((queue_t *)q)->last_seq = aq_push(&op);
     } else submit_now(((const queue_t *)q)->serial, ((const queue_t *)q)->origin_ll, n, (const uint64_t *)h);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0); atomic_fetch_add(&g_nvn_cyc, thread_cyc() - c0);
     TRS1("nvnQueueSubmitCommands");
@@ -1518,6 +1565,13 @@ NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t
 volatile int g_nvn_present_interval = 1;   // the game's current present interval (vblanks a frame): the present pacing reads it (svc_ns2.c swr_present_pace)
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
     static long n; if (((win_t *)w)->interval != v && n++ < 64) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v);   // it flips every few frames in its dynamic mode
+    // SWR_NVN_INTERVAL_BT=1: who asks (the return addresses up the game's frame chain), to find what a game's frame rate choice hangs on
+#ifdef _WIN32
+    { static int bt = -1; if (bt < 0) { const char *e = getenv("SWR_NVN_INTERVAL_BT"); bt = e && *e == '1'; }
+      if (bt && ((win_t *)w)->interval != v && n < 8) { char line[512]; int o = 0; const uint64_t *fp = (const uint64_t *)(uintptr_t)DM_GUEST_FP();
+          for (int i = 0; i < 16 && fp && !((uintptr_t)fp & 7) && !IsBadReadPtr(fp, 16); i++) { o += snprintf(line + o, sizeof line - (size_t)o, " %#llx", (unsigned long long)fp[1]); const uint64_t *nx = (const uint64_t *)(uintptr_t)fp[0]; if (nx <= fp) break; fp = nx; }
+          LOG("[nvn] present interval %d asked from:%s", v, line); } }
+#endif
     ((win_t *)w)->interval = v; g_nvn_present_interval = v;
 }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
@@ -1588,7 +1642,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) gfx_present_wait(tk);
     uint64_t waited = now_ns() - t0; if (waited > 50000) atomic_fetch_add(&g_acq_wait_ns, waited);
-    if (s) { ((sync_t *)s)->fence = aq_fence_now(); ((sync_t *)s)->fenced = 2; }   // the texture is free once the submissions before this point have completed (fenced 2: an acquire's sync)
+    if (s) { ((sync_t *)s)->fence = aq_fence_present(); ((sync_t *)s)->fenced = 2; }   // the texture is free once the submissions before this point have completed (fenced 2: an acquire's sync)
     if (!atomic_fetch_add(&g_acquires, 1)) frame_request("WindowAcquireTexture", *idx);
     TRS1("nvnWindowAcquireTexture");
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
@@ -1665,8 +1719,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         nvn_cap_present(t, crop);
         if (aq_on()) {
-            aop_t op = {2}; op.w = o; op.idx = idx; op.t = t; memcpy(op.crop, crop, sizeof op.crop); op.period = present_period(o) / 1e9;
-            gfx_leave(); aq_push(&op); gfx_enter();   // queued: the gate is the translation thread's to pass
+            aop_t op = {2}; op.serial = ((const queue_t *)q)->serial; op.w = o; op.idx = idx; op.t = t; memcpy(op.crop, crop, sizeof op.crop); op.period = present_period(o) / 1e9;
+            gfx_leave(); ((queue_t *)q)->last_seq = aq_push(&op); gfx_enter();   // queued: the gate is the translation thread's to pass
         } else o->ticket[idx] = gfx_present(t, present_period(o) / 1e9, crop);
     }
     gfx_leave();

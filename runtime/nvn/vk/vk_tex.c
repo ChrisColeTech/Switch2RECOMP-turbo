@@ -78,6 +78,11 @@ static vk_hmap g_img_mem = {8};
 // store writes the bytes as they are, and the sRGB view the texture is sampled and drawn through is one more view of the same image: MUTABLE_FORMAT), else none
 static VkFormat storage_format(const vkf_info *fi) {
     if (fi->feat & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) return fi->vk;
+    // RGB9E5: the console's GPU stores into it, Vulkan has no device that does (nor one that draws into it). Such a texture, once a shader binds it as an image, is
+    // an R11G11B10F image: three floats without sign or alpha as well, the same 32 bits a texel, and every view of it takes that format (vkt_view_raw_). Ocarina of
+    // Time's last compute passes write the finished picture into one: without this the picture was lost and the game black from its first scene on
+    if (fi->vk == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &fp);
+        return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_UNDEFINED; }
     VkFormat un = vkf_unorm_of(fi->vk); if (un == fi->vk || fi->conv != VKF_COPY) return VK_FORMAT_UNDEFINED;
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_vk.pd, un, &fp);
     return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? un : VK_FORMAT_UNDEFINED;
@@ -114,6 +119,7 @@ static void shape(const nvn_texdesc *d, VkImageType *type, VkImageViewType *vt, 
 }
 
 static VkImageView make_view(vkt_image *im, VkFormat f, VkImageViewType vt, VkComponentMapping swz, uint32_t base_level, uint32_t nlevels, uint32_t base_layer, uint32_t nlayers, VkImageAspectFlags aspect) {
+    if (f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && im->real_fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) f = im->real_fmt;   // an RGB9E5 texture kept as R11G11B10F (storage_format)
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im->img, vt, f, swz, {aspect, base_level, nlevels, base_layer, nlayers}};
     // A view in a format the image's storage use does not allow (an sRGB view of an RGBA8 image that compute shaders write: VUID-VkImageViewCreateInfo-usage-02275,
     // seen in gameplay) leaves storage out of the view's usage
@@ -189,6 +195,29 @@ static void image_free(vkt_image *im) {
     free(im);
 }
 static void image_free_cb(void *a) { image_free(a); }
+// An image leaves (evicted, superseded, its pool finalized): freed behind the GPU. What holds its views beyond a submission (the pool set, vk_replay.c pool_set) looks again
+volatile LONG g_vkt_free_gen, g_vkt_samp_gen;
+static vkt_image *g_ret[512]; static int g_nret, g_ret_all;   // the images that left since vkt_retired was last asked (under g_lk, as every caller of image_retire holds it)
+static void image_retire(vkt_image *o) { InterlockedIncrement(&g_vkt_free_gen); if (g_nret < 512) g_ret[g_nret++] = o; else g_ret_all = 1; vk_retire(image_free_cb, o); }
+int vkt_retired(vkt_image **out, int max, int *all) {
+    AcquireSRWLockExclusive(&g_lk);
+    int n = g_nret; *all = g_ret_all || n > max; if (n > max) n = max;
+    memcpy(out, g_ret, (size_t)n * sizeof *out); g_nret = 0; g_ret_all = 0;
+    ReleaseSRWLockExclusive(&g_lk);
+    return n;
+}
+uint64_t vkt_frame_no(void) { return g_frame; }
+void vkt_touch(vkt_image *im) { im->last_frame = g_frame; }
+// The texture IDs registered, marked gone or dropped since the last call (under g_lk); *all when there were more than the list holds
+static int g_chg[8192], g_nchg, g_chg_all;
+static void chg_note(int id) { if (g_nchg < 8192) g_chg[g_nchg++] = id; else g_chg_all = 1; }
+int vkt_reg_changes(int *ids, int max, int *all) {
+    AcquireSRWLockExclusive(&g_lk);
+    int n = g_nchg; *all = g_chg_all || n > max; if (n > max) n = max;
+    memcpy(ids, g_chg, (size_t)n * sizeof *ids); g_nchg = 0; g_chg_all = 0;
+    ReleaseSRWLockExclusive(&g_lk);
+    return n;
+}
 
 // ---------- Opaque ASTC as BC1 (NXRT_VK_BC1_OPAQUE=1: on; off by default, see the bug note at image_create_) ----------
 // ASTC becomes BC3 (vk_astc.cpp): 8 bits a texel, 2.25 times the console's 6x6 ASTC. MKW's textures then took ~10 GB, over a 4 GB card's budget, and the driver
@@ -303,6 +332,7 @@ static vkt_image *image_create_(const tex_t *t, int cls, int no_bc1) {
     else if (vk_rt_alloc = (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) != 0, vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &im->alloc)) { vk_rt_alloc = 0; VKC(VKC_TEX_NOMEM); VKRED("no device memory for a %ux%u %s texture (%llu bytes)", im->w, im->h, fi->name, (unsigned long long)mr.size); vkDestroyImage(g_vk.dev, im->img, NULL); free(im); return NULL; }
     vk_rt_alloc = 0;
     if (!sp) vkBindImageMemory(g_vk.dev, im->img, im->alloc.mem, im->alloc.off);
+    im->real_fmt = ci.format;
     im->view = make_view(im, fi->vk, im->vtype, fi->swz, 0, im->levels, 0, im->layers, im->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT ? im->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : im->aspect);
     VkFormat pf = vkf_unorm_of(fi->vk);
     im->present_view = pf != fi->vk ? make_view(im, pf, VK_IMAGE_VIEW_TYPE_2D, (VkComponentMapping){0}, 0, 1, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT) : VK_NULL_HANDLE;
@@ -551,7 +581,7 @@ static void evict_old(void) {
           skey ok; memcpy(&ok, g_share.keys + (size_t)i * g_share.klen, sizeof ok);
           vk_hm_del(&g_share, &ok); i--;
           for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == o) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
-          fr += o->alloc.size; cnt++; vk_retire(image_free_cb, o); atomic_fetch_add(&s_evicted, 1); InterlockedIncrement(&g_vkt_reg_gen);
+          fr += o->alloc.size; cnt++; image_retire(o); atomic_fetch_add(&s_evicted, 1); InterlockedIncrement(&g_vkt_reg_gen);
       }
       static uint64_t tf, tc; tf += fr; tc += cnt; static uint64_t nl; if (cnt && (nl++ % 16) == 0) VKLOG("superseded render targets freed: %llu, %llu MB so far", (unsigned long long)tc, (unsigned long long)(tf >> 20)); }
     static int mode = -1; if (mode < 0) { const char *e = getenv("NXRT_VK_EVICT"); mode = e ? atoi(e) : 1; } if (!mode) return;
@@ -577,7 +607,7 @@ static void evict_old(void) {
             for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == o) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
             { uint64_t ek = (uint64_t)(uintptr_t)o->mem; vk_hm_put(&g_evicted, &ek, (void *)1); }
             prefetch_forget(o);
-            if (!o->alloc.sys || mode == 1) freed += o->alloc.size; n++; vk_retire(image_free_cb, o); atomic_fetch_add(&s_evicted, 1);
+            if (!o->alloc.sys || mode == 1) freed += o->alloc.size; n++; image_retire(o); atomic_fetch_add(&s_evicted, 1);
         }
     static uint64_t logged; if (n && logged++ < 20) VKLOG("texture eviction: %llu images, %llu MB, device memory %llu of %llu MB", (unsigned long long)n, (unsigned long long)(freed >> 20), (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20));
 }
@@ -588,6 +618,7 @@ static void evict_old(void) {
 extern volatile int nvn_pool_gpuw_new;
 static int cpu_content(const tex_t *t) {
     if (!t->mem || !t->pool || t->has_layout || t->d.samples > 1) return 0;
+    if (vk_hm_get(&g_unc_drop, &t->serial)) return 0;   // it left its storage (cpu_unc_drop, vkt_to_gpu): a GPU texture, filled from what the storage holds
     const vkf_info *fi = vkf_get(t->d.format); if (!fi) return 0;
     int unc = !(fi->flags & VKF_COMPRESSED) && t->d.target != NVN_TEXTURE_TARGET_3D;
     if (unc && (t->pool->gpu_written || (fi->flags & (VKF_DEPTH | VKF_STENCIL)) || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)))) return 0;
@@ -621,7 +652,7 @@ vkt_image *vkt_resolve(const tex_t *t) {
     if (im && im->bc1 && im->bc1_bad && (!im->as || (!im->as->pending && !im->as->done))) {   // a level applied later was not opaque: as BC3 from here on
         opaque_note(t, 0); vk_hm_del(&g_share, &k);
         for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == im) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
-        vk_retire(image_free_cb, im); atomic_fetch_add(&s_bc1_redo, 1); InterlockedIncrement(&g_vkt_reg_gen); im = NULL; }
+        image_retire(im); atomic_fetch_add(&s_bc1_redo, 1); InterlockedIncrement(&g_vkt_reg_gen); im = NULL; }
     if (im && im->d.format != t->d.format) { static int n; if (n++ < 12) VKLOG("one image for two formats: ser=%llu format %#x on the image of ser=%llu format %#x, %ux%u", (unsigned long long)t->serial, t->d.format, (unsigned long long)im->serial, im->d.format, t->d.width, t->d.height); }
     if (!im) {
         // a new texture over storage: entries of the same pool overlapping it under another description go, unless used in the last 16 frames (nxnative's alias_take_over)
@@ -633,7 +664,7 @@ vkt_image *vkt_resolve(const tex_t *t) {
             skey ok; memcpy(&ok, g_share.keys + (size_t)i * g_share.klen, sizeof ok);
             vk_hm_del(&g_share, &ok); i--; InterlockedIncrement(&g_vkt_reg_gen);   // the deletion shifted entries: look at this slot again
             for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == o) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
-            vk_retire(image_free_cb, o); atomic_fetch_add(&s_evicted, 1);
+            image_retire(o); atomic_fetch_add(&s_evicted, 1);
         }
         if (!(im = image_create(t, cls))) { ReleaseSRWLockExclusive(&g_lk); return NULL; }
         { uint64_t ek = (uint64_t)(uintptr_t)t->mem; if (vk_hm_get(&g_evicted, &ek)) { atomic_fetch_add(&s_ev_back, 1); atomic_fetch_add(&s_ev_back_b, im->alloc.size); } }
@@ -645,7 +676,7 @@ vkt_image *vkt_resolve(const tex_t *t) {
             if (f && u >= 0 && im->fi->conv == VKF_ASTC_BC7 && idle) opaque_note(t, im->opaque && !im->bc1_bad);
             if (im->bc1_bad && idle) {   // not opaque after all: the same texture as BC3, uploaded again (the BC1 image goes behind the GPU)
                 vkt_image *im3 = image_create_(t, cls, 1);
-                if (im3) { vk_hm_put(&g_share, &k, im3); vk_retire(image_free_cb, im); atomic_fetch_add(&s_bc1_redo, 1); im = im3;
+                if (im3) { vk_hm_put(&g_share, &k, im3); image_retire(im); atomic_fetch_add(&s_bc1_redo, 1); im = im3;
                            f = init_fill(t, im); u = f ? upload(im, t, cb) : -9; if (!f || u < 0) clear_new(im, cb); } }
             cb_put(cb, once);
             if (getenv("NXRT_VK_LOGNEW") && (im->fi->flags & VKF_COMPRESSED)) { static int nl; uint64_t w0 = 0, w1 = 0; if (t->mem) { memcpy(&w0, t->mem, 8); memcpy(&w1, t->mem + 8, 8); } if (nl++ < 200) VKLOG("new compressed GPU image ser=%llu %ux%ux%u fmt %#x flags %#x pool flags %#x gpuw %d fill %d upload %d any %d first %llx %llx", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.flags, t->pool ? t->pool->flags : 0, t->pool ? t->pool->gpu_written : -1, f, u, t->mem ? mem_any(t->mem, t->L.size) : -1, (unsigned long long)w0, (unsigned long long)w1); } } }
@@ -665,7 +696,7 @@ vkt_image *vkt_resolve(const tex_t *t) {
         if (im->bc1 && im->bc1_bad && (!im->as || (!im->as->pending && !im->as->done))) {   // not opaque after all: the same texture as BC3, uploaded again now
             vkt_image *im3 = image_create_(t, cls, 1);
             if (im3) { vk_hm_put(&g_share, &k, im3); vk_hm_put(&g_serial, &t->serial, im3); im3->last_frame = g_frame; im3->serial = t->serial;
-                       vk_retire(image_free_cb, im); atomic_fetch_add(&s_bc1_redo, 1); InterlockedIncrement(&g_vkt_reg_gen); im = im3; refresh(im, t); }
+                       image_retire(im); atomic_fetch_add(&s_bc1_redo, 1); InterlockedIncrement(&g_vkt_reg_gen); im = im3; refresh(im, t); }
         }
     }
     ReleaseSRWLockExclusive(&g_lk);
@@ -723,6 +754,7 @@ VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz) 
 // A view of exact parameters (attachments, storage images, views the shader's declaration asks for), cached with the image's views
 VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_t bl, uint32_t nl, uint32_t b0, uint32_t nly, VkImageAspectFlags asp, const VkComponentMapping *mp) {
     VkComponentMapping m = mp ? *mp : (VkComponentMapping){0};
+    if (f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && im->real_fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) f = im->real_fmt;   // an RGB9E5 texture kept as R11G11B10F (storage_format)
     if (bl >= im->levels) bl = im->levels - 1; if (!nl || bl + nl > im->levels) nl = im->levels - bl;
     if (im->vtype == VK_IMAGE_VIEW_TYPE_3D && vt != VK_IMAGE_VIEW_TYPE_3D) {
         if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) { VKC(VKC_VIEW_FAIL); VKRED("invalid 3D slice view type %d, ser%llu", (int)vt, (unsigned long long)im->serial); return VK_NULL_HANDLE; }
@@ -789,6 +821,29 @@ void vkt_tex_release(const tex_t *t) { InterlockedIncrement(&g_vkt_reg_gen);   /
     if (!t->serial) return;
     AcquireSRWLockExclusive(&g_lk); vk_hm_del(&g_live, &t->serial); vk_hm_del(&g_serial, &t->serial); ReleaseSRWLockExclusive(&g_lk);
 }
+// A texture taken from its storage (the CPU had written it before its first use) that the game now draws into: a GPU texture from here on, filled once more from
+// what its storage holds. 1 when its next resolve gives such an image. Ocarina of Time samples two 256x256 RGBA16F textures before it first renders them; as images
+// read from guest memory they could not be attachments and every draw into them was lost. With the pool set (vk_replay.c) every registered texture is looked at
+// before the game uses it, so more of them start that way
+int vkt_to_gpu(const tex_t *t) {
+    if (!t || !t->serial || t->has_layout) return 0;
+    { static int on = -1; if (on < 0) on = vkc_int("to_gpu", 1); if (!on) return 0; }   // NXRT_VK_TO_GPU=0: as before, the draws are lost
+    const vkf_info *fi = vkf_get(t->d.format); if (!fi || (fi->flags & VKF_COMPRESSED)) return 0;
+    AcquireSRWLockExclusive(&g_lk);
+    int was = vk_hm_get(&g_cpu, &t->serial) != NULL;
+    if (was) {
+        skey k; key_of(t, VKT_STORAGE, &k); vkt_image *o = vk_hm_get(&g_share, &k);
+        uint64_t s = t->serial; vk_hm_del(&g_cpu, &s); vk_hm_del(&g_cpu_unc, &s); vk_hm_put(&g_unc_drop, &s, (void *)1);
+        if (o) { vk_hm_del(&g_share, &k);
+            for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == o) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
+            for (int u = 0; u < g_nupg; ) if (g_upg[u].im == o) g_upg[u] = g_upg[--g_nupg]; else u++;
+            image_retire(o); }
+        InterlockedIncrement(&g_vkt_reg_gen);
+        static int n; if (n++ < 8) VKLOG("texture ser=%llu %ux%u format %#x was read from its storage and is drawn into now: a GPU texture from here on", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+    }
+    ReleaseSRWLockExclusive(&g_lk);
+    return was;
+}
 void vkt_tex_cpu_written(const tex_t *t) {
     if (!t->serial) return;
     AcquireSRWLockExclusive(&g_lk);
@@ -814,9 +869,11 @@ void vkt_drop_pool(const void *pool) { InterlockedIncrement(&g_vkt_reg_gen);
         vk_hm_del(&g_share, &ok); i--;
         for (uint32_t j = 0; j < g_serial.cap; j++) if (g_serial.vals[j] == o) { uint64_t sk; memcpy(&sk, g_serial.keys + (size_t)j * 8, 8); vk_hm_del(&g_serial, &sk); j--; }
         for (int u = 0; u < g_nupg; ) if (g_upg[u].im == o) g_upg[u] = g_upg[--g_nupg]; else u++;
-        vk_retire(image_free_cb, o); atomic_fetch_add(&s_evicted, 1);
+        image_retire(o); atomic_fetch_add(&s_evicted, 1);
     }
     for (uint32_t i = 0; i < g_cpu.cap; i++) if (g_cpu.vals[i] == pool) { uint64_t sk; memcpy(&sk, g_cpu.keys + (size_t)i * 8, 8); vk_hm_del(&g_cpu, &sk); i--; }
+    // the texture IDs registered from this pool name memory that is gone: nothing may read their storage again (the pool set resolves every registered ID, not only bound ones)
+    for (int i = 0; i < g_nreg; i++) if (g_reg[i].live && !g_reg[i].gone && g_reg[i].t.pool == pool) { g_reg[i].gone = 1; chg_note(i); }
     ReleaseSRWLockExclusive(&g_lk);
 }
 // Bumped by every change to the texture / sampler registrations or the images behind them: the replay's per-submission memo of
@@ -905,7 +962,7 @@ void vkt_reg_tex(int id, const tex_t *t, const view_t *v, int image) {
     InterlockedIncrement(&g_vkt_reg_gen);
     AcquireSRWLockExclusive(&g_lk);
     if (id >= g_nreg) { int n = id + 1024; g_reg = realloc(g_reg, (size_t)n * sizeof *g_reg); memset(g_reg + g_nreg, 0, (size_t)(n - g_nreg) * sizeof *g_reg); g_nreg = n; }
-    vkt_reg *r = &g_reg[id]; r->t = *t; r->has_view = v != NULL; if (v) r->v = *v; r->image = image; r->live = 1; r->gone = 0;
+    vkt_reg *r = &g_reg[id]; r->t = *t; r->has_view = v != NULL; if (v) r->v = *v; r->image = image; r->live = 1; r->gone = 0; chg_note(id);
     int known = t->serial && vk_hm_get(&g_serial, &t->serial) != NULL;
     ReleaseSRWLockExclusive(&g_lk);
     static _Atomic uint64_t s_reg_known, s_reg_img; if (known) atomic_fetch_add(&s_reg_known, 1); if (image) atomic_fetch_add(&s_reg_img, 1);
@@ -913,14 +970,16 @@ void vkt_reg_tex(int id, const tex_t *t, const view_t *v, int image) {
           (unsigned long long)n, (unsigned long long)s_reg_known, (unsigned long long)s_reg_img, (unsigned long long)s_pf_why[0], (unsigned long long)s_pf_why[1], (unsigned long long)s_pf_why[2], (unsigned long long)s_pf_why[3], (unsigned long long)s_pf_why[4], (unsigned long long)s_pf_why[5]); }
     if (!known && !image) prefetch_add(t);
 }
-void vkt_reg_tex_gone(int id) { InterlockedIncrement(&g_vkt_reg_gen); AcquireSRWLockExclusive(&g_lk); if (id >= 0 && id < g_nreg) g_reg[id].gone = 1; ReleaseSRWLockExclusive(&g_lk); }
+void vkt_reg_tex_gone(int id) { InterlockedIncrement(&g_vkt_reg_gen); AcquireSRWLockExclusive(&g_lk); if (id >= 0 && id < g_nreg) { g_reg[id].gone = 1; chg_note(id); } ReleaseSRWLockExclusive(&g_lk); }
+int vkt_reg_n(void) { return g_nreg; }
+int vkt_sreg_n(void) { return g_nsreg; }
 const vkt_reg *vkt_reg_get(int id) { return id >= 0 && id < g_nreg && g_reg[id].live ? &g_reg[id] : NULL; }
 void vkt_reg_samp(int id, const samp_par *p) {
     if (id < 0 || id > (1 << 20)) return;
     InterlockedIncrement(&g_vkt_reg_gen);
     AcquireSRWLockExclusive(&g_lk);
     if (id >= g_nsreg) { int n = id + 256; g_sreg = realloc(g_sreg, (size_t)n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, (size_t)n); memset(g_sreg_ok + g_nsreg, 0, (size_t)(n - g_nsreg)); g_nsreg = n; }
-    g_sreg[id] = *p; g_sreg_ok[id] = 1;
+    g_sreg[id] = *p; g_sreg_ok[id] = 1; InterlockedIncrement(&g_vkt_samp_gen);
     ReleaseSRWLockExclusive(&g_lk);
 }
 const samp_par *vkt_samp_get(int id) { return id >= 0 && id < g_nsreg && g_sreg_ok[id] ? &g_sreg[id] : NULL; }

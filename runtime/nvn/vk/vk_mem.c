@@ -113,7 +113,8 @@ static void st_reclaim(void) {   // caller holds g_st.lk
         unsigned i = g_st.qt % 4096;
         if (!g_st.q[i].value || g_st.q[i].value > done) break;
         if (g_st.q[i].ovf) { vkDestroyBuffer(g_vk.dev, g_st.q[i].ovf, NULL); vk_free_mem(&g_st.q[i].ovf_mem); g_st.q[i].ovf = VK_NULL_HANDLE; }
-        else g_st.tail = g_st.q[i].end;
+        else { if (g_st.q[i].end < g_st.tail) g_st.wrapped = 0;   // the first allocation made after the wrap is gone: what is in use is one run again, [tail, head). Left set, the ring gave nothing more until it was empty
+               g_st.tail = g_st.q[i].end; }
         g_st.qt++;
     }
     if (g_st.qt == g_st.qh) { g_st.head = g_st.tail = 0; g_st.wrapped = 0; }
@@ -136,8 +137,18 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
     AcquireSRWLockExclusive(&g_st.lk);
     for (int attempt = 0; attempt < 64; attempt++) {
         st_reclaim();
-        if (g_st.qh - g_st.qt >= 4095) goto wait;
         VkDeviceSize a = (g_st.head + align - 1) / align * align;
+        // One entry for a submission's run of allocations: each had its own, and a submission with more than 4095 of them (Ocarina of Time's first scene: a thousand
+        // descriptor sets a frame, each with its uniform blocks) filled the list. From there every request took a 32 MB buffer of its own and its entry was written over
+        // a live one: 100 to 400 MB of device memory lost a second, 24 GB in a minute and a half, and ring space handed out again while the GPU still read it
+        if (g_st.qh != g_st.qt) { unsigned l = (g_st.qh - 1) % 4096;
+            if (!g_st.q[l].value && g_st.q[l].owner == owner && !g_st.q[l].ovf && g_st.q[l].end == g_st.head && (g_st.wrapped ? a + n <= g_st.tail : a + n <= g_st.size)) {
+                g_st.q[l].end = a + n; g_st.head = a + n;
+                ReleaseSRWLockExclusive(&g_st.lk);
+                atomic_fetch_add(&s_st_bytes, n);
+                *buf = g_st.buf; *off = a; return g_st.map + a;
+            } }
+        if (g_st.qh - g_st.qt >= 4095) goto wait;
         int ok = 0;
         if (!g_st.wrapped) {   // free space: [head, size) then [0, tail)
             if (a + n <= g_st.size) ok = 1;
@@ -168,6 +179,12 @@ void *vkm_staging(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSiz
         VkDeviceSize a2 = (oc.used + align - 1) / align * align;
         if (a2 + n <= oc.size) { oc.used = a2 + n; ReleaseSRWLockExclusive(&g_st.lk); atomic_fetch_add(&s_st_bytes, n); *buf = oc.b; *off = a2; return oc.map + a2; }
     }
+    { static uint64_t said; uint64_t tn = GetTickCount64(); if (tn - said > 2000) { said = tn; unsigned i0 = g_st.qt % 4096; uint64_t held = 0; unsigned novf = 0;
+        for (unsigned k = g_st.qt; k != g_st.qh; k++) if (g_st.q[k % 4096].ovf) { novf++; held += g_st.q[k % 4096].ovf_mem.size; }
+        VKLOG("staging overflow: %llu bytes asked by slot %d; the ring holds %u allocations (%u overflow buffers, %llu MB), head %llu tail %llu%s; the oldest: slot %d value %llu (GPU done %llu, assigned %llu)", (unsigned long long)n, owner, g_st.qh - g_st.qt, novf,
+              (unsigned long long)(held >> 20), (unsigned long long)g_st.head, (unsigned long long)g_st.tail, g_st.wrapped ? " wrapped" : "", g_st.qt != g_st.qh ? g_st.q[i0].owner : -1, g_st.qt != g_st.qh ? (unsigned long long)g_st.q[i0].value : 0ull,
+              (unsigned long long)atomic_load(&g_vk.tl_done), (unsigned long long)atomic_load(&g_vk.tl_assigned)); } }
+    if (g_st.qh - g_st.qt >= 4095) { ReleaseSRWLockExclusive(&g_st.lk); VKRED("staging: the list of allocations is full (%u, all of submissions not yet done): %llu bytes are not given", g_st.qh - g_st.qt, (unsigned long long)n); return NULL; }
     VkDeviceSize chunk = n > (32u << 20) ? n : (32u << 20);
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkBuffer b = VK_NULL_HANDLE; vk_alloc m;
@@ -1010,7 +1027,7 @@ void vkm_lazy_stats(uint64_t *pages, uint64_t *set, uint64_t *in, uint64_t *skip
 // A shader that reads or writes memory at an address it loaded from memory (not at a bound buffer's) cannot be given a buffer for it: the translator (nxnative's
 // GlobalToStorage.TryGenerateRawStorageOp, docs/reference/shaders.md "Global memory at an address loaded from memory"; MIT, (c) seedds) makes such an access look the
 // address up in a table of the memory pools the host binds as a storage buffer, add that pool's delta and go through a physical storage buffer pointer. The table
-// (dmsh_abi.h DMSH_GMEM_MAP_*): 4096 entries of {start, end, delta, padding}, 64 bits each, sorted by start; entry 0 is empty and unused entries start at ~0. Here the
+// (dmsh_abi.h DMSH_GMEM_MAP_*): 8192 entries of {start, end, delta, hint}, 64 bits each, sorted by start; entry 0 is empty and unused entries start at ~0. Here the
 // delta is the pool mirror's device address minus the guest address. Donkey Kong Bananza's terrain depends on it: gsys's vertex shader c9a56f796ea4a4cd writes
 // {count 0, 1 instance} every frame into each chunk's indirect draw record, whose address it reads from a list (docs/NXNATIVE_GAP_ANALYSIS.md).
 // A pool is listed once its buffer has memory (sparse: always; the unbacked parts read undefined and drop writes, as Vulkan defines). The table is written anew when
@@ -1066,6 +1083,12 @@ VkBuffer vkm_gmem_table(VkDeviceSize *size) {
     }
     ReleaseSRWLockShared(&g_lk);
     for (uint32_t i = n; i < DMSH_GMEM_MAP_ENTRIES; i++) { t[4 * i] = ~0ull; t[4 * i + 1] = 0; t[4 * i + 2] = 0; t[4 * i + 3] = 0; }
+    // The hints (dmsh_abi.h DMSH_GMEM_HINT_SHIFT; nxnative nvn_mtl.m gmem_map, MIT, (c) seedds): a 2 MiB guest chunk wholly inside an entry is named in the hint word of
+    // entry (chunk & mask), so a shader finds its pool with one load instead of the search's thirteen. A chunk whose place is taken, or an address past the tag's reach, searches
+    for (uint32_t i = 1; i < n; i++) {
+        uint64_t c0 = (t[4 * i] + ((1ull << DMSH_GMEM_HINT_SHIFT) - 1)) >> DMSH_GMEM_HINT_SHIFT, c1 = t[4 * i + 1] >> DMSH_GMEM_HINT_SHIFT;
+        for (uint64_t c = c0; c < c1 && c < (1ull << 19); c++) { uint64_t *h = &t[4 * (c & (DMSH_GMEM_MAP_ENTRIES - 1)) + 3]; if (!(uint32_t)*h) *h = (c * DMSH_GMEM_MAP_ENTRIES | i) & 0xffffffffu; }
+    }
     VkBufferCopy c = {so, 0, GM_BYTES}; vkCmdCopyBuffer(up, sb, g_gm.buf[nx], 1, &c);
     if (left) { static int said; if (!said++) VKRED("raw global memory: %u more memory pools than the table's %d entries; reads through loaded pointers into them give 0 (missing geometry)", left, DMSH_GMEM_MAP_ENTRIES); }
     { static int said; if (!said++) VKLOG("raw global memory: a shader reads or writes through pointers it loaded from memory; the memory pool table has %u ranges (written again when pools change)", n - 1); }

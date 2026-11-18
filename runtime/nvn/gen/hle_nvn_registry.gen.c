@@ -120,8 +120,6 @@ NXRT_API void adapter_nvnProgramInitialize(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnProgramFinalize(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnProgramSetShaders(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnSyncInitialize(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnMemoryPoolBuilderSetNativeHandleNVX(NxwGuestCpu *cpu);
-NXRT_API void adapter_nvnSyncInitializeFromNvRmSyncNVX(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnSyncFinalize(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnSyncSetDebugLabel(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnQueueFenceSync(NxwGuestCpu *cpu);
@@ -197,6 +195,9 @@ NXRT_API void adapter_nvnCommandBufferSetStencilMask(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferSetStencilRef(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferSetPolygonOffsetClamp(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferDrawMeshTasks(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnCommandBufferDrawMeshTasksIndirect(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnMemoryPoolBuilderSetNativeHandleNVX(NxwGuestCpu *cpu);
+NXRT_API void adapter_nvnSyncInitializeFromNvRmSyncNVX(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferDrawArrays(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferDrawArraysIndirect(NxwGuestCpu *cpu);
 NXRT_API void adapter_nvnCommandBufferDrawElementsInstanced(NxwGuestCpu *cpu);
@@ -1033,11 +1034,6 @@ NXRT_API void adapter_nvnCommandBufferDrawMeshTasks3D(NxwGuestCpu *cpu) {
 
 NXRT_API void adapter_nvnCommandBufferDrawMeshTasks3DIndirect(NxwGuestCpu *cpu) {
     static uint8_t seen; nxrt_stub_log("nvnCommandBufferDrawMeshTasks3DIndirect", "names.txt", &seen, cpu);
-    cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);
-}
-
-NXRT_API void adapter_nvnCommandBufferDrawMeshTasksIndirect(NxwGuestCpu *cpu) {
-    static uint8_t seen; nxrt_stub_log("nvnCommandBufferDrawMeshTasksIndirect", "names.txt", &seen, cpu);
     cpu->x[0] = cpu->x[1] = 0; memset(cpu->q, 0, 4 * 16);
 }
 
@@ -2102,6 +2098,7 @@ const nxrt_hle_entry nxrt_hle_table[] = {
     {"nvnCommandBufferSetStencilRef", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferSetStencilRef},
     {"nvnCommandBufferSetPolygonOffsetClamp", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferSetPolygonOffsetClamp},
     {"nvnCommandBufferDrawMeshTasks", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferDrawMeshTasks},
+    {"nvnCommandBufferDrawMeshTasksIndirect", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferDrawMeshTasksIndirect},
     {"nvnCommandBufferDrawArrays", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferDrawArrays},
     {"nvnCommandBufferDrawArraysIndirect", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferDrawArraysIndirect},
     {"nvnCommandBufferDrawElementsInstanced", NXRT_HLE_NVN, 1, "hle_nvn.c", NULL, adapter_nvnCommandBufferDrawElementsInstanced},
@@ -2489,7 +2486,6 @@ const nxrt_hle_entry nxrt_hle_table[] = {
     {"nvnCommandBufferDispatchRaysIndirect", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferDispatchRaysIndirect},
     {"nvnCommandBufferDrawMeshTasks3D", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferDrawMeshTasks3D},
     {"nvnCommandBufferDrawMeshTasks3DIndirect", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferDrawMeshTasks3DIndirect},
-    {"nvnCommandBufferDrawMeshTasksIndirect", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferDrawMeshTasksIndirect},
     {"nvnCommandBufferEnableExclusiveScissor", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferEnableExclusiveScissor},
     {"nvnCommandBufferEndDeviceCommands", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferEndDeviceCommands},
     {"nvnCommandBufferEvaluateDlss", NXRT_HLE_NVN, 0, "names.txt", NULL, adapter_nvnCommandBufferEvaluateDlss},

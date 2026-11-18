@@ -21,7 +21,7 @@ typedef struct vkt_image {
     uint8_t cube_ok;      // created cube compatible (a cube map, or a square 2D array of six layers or more): cube views of it are valid
     uint8_t superseded;   // a newer texture sits over the same storage: freed once idle (a change of the game's dynamic resolution)
     uint32_t min_lod;   // levels under this one have no memory: its views never reach them (vk_sparse.inc)
-    const vkf_info *fi; VkImage img; vk_alloc alloc; VkImageViewType vtype; VkImageAspectFlags aspect;
+    const vkf_info *fi; VkImage img; vk_alloc alloc; VkImageViewType vtype; VkImageAspectFlags aspect; VkFormat real_fmt;   // real_fmt: the format the image was made with (fi->vk, or what stands in for it)
     uint32_t w, h, depth, layers, levels; VkSampleCountFlagBits samples;
     VkImageUsageFlags usage; VkImageLayout rest;   // the layout it is left in between submissions
     VkImageView view;                    // all levels and layers, the format's base mapping
@@ -54,10 +54,16 @@ void vkt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // The replay's side (M5-C). vkt_resolve: the host image of a texture, created, uploaded or uploaded again as needed (inside a submission the uploads go into
 // its upload command buffer; outside one they are submitted and waited for)
 vkt_image *vkt_resolve(const tex_t *t);
+int vkt_to_gpu(const tex_t *t);       // a texture read from its storage that is drawn into now: 1 when its next resolve gives a GPU image
 int vkt_want_image(const tex_t *t);   // a texture used as an image without NVN_TEXTURE_FLAGS_IMAGE: 1 when its next resolve gives an image with storage use
 VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz);   // NULL view = the default; fallbacks apply (vkf_view_format)
 VkSampler vkt_sampler(const samp_par *p);
 typedef struct { tex_t t; view_t v; uint8_t has_view, image, live, gone; } vkt_reg;
+int vkt_reg_n(void); int vkt_sreg_n(void);                // texture and sampler IDs the registries hold (IDs below these)
+int vkt_retired(vkt_image **out, int max, int *all);     // the images that left (evicted, superseded, their pool finalized) since the last call: pointers to compare, not to follow
+int vkt_reg_changes(int *ids, int max, int *all);         // the texture IDs registered or gone since the last call
+uint64_t vkt_frame_no(void); void vkt_touch(vkt_image *im);   // the frame count images are aged by; an image in use this frame
+extern volatile LONG g_vkt_free_gen, g_vkt_samp_gen;      // move when an image leaves / a sampler is registered
 // The replay's views of exact parameters: identity swizzle unless m is given (attachments and storage images must have it), cached with the image's views
 VkImageView vkt_view_raw_(vkt_image *im, VkFormat f, VkImageViewType vt, uint32_t base_level, uint32_t nlevels, uint32_t base_layer, uint32_t nlayers, VkImageAspectFlags aspect, const VkComponentMapping *m);
 int vkt_reg_copy(int id, vkt_reg *out);          // a registration copied under the table's lock (the game thread may grow the table meanwhile); 0 when none
