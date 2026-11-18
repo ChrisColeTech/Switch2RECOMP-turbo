@@ -54,6 +54,7 @@ void vkt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 // The replay's side (M5-C). vkt_resolve: the host image of a texture, created, uploaded or uploaded again as needed (inside a submission the uploads go into
 // its upload command buffer; outside one they are submitted and waited for)
 vkt_image *vkt_resolve(const tex_t *t);
+int vkt_want_image(const tex_t *t);   // a texture used as an image without NVN_TEXTURE_FLAGS_IMAGE: 1 when its next resolve gives an image with storage use
 VkImageView vkt_view(vkt_image *im, const view_t *v, int set_swz, uint16_t swz);   // NULL view = the default; fallbacks apply (vkf_view_format)
 VkSampler vkt_sampler(const samp_par *p);
 typedef struct { tex_t t; view_t v; uint8_t has_view, image, live, gone; } vkt_reg;

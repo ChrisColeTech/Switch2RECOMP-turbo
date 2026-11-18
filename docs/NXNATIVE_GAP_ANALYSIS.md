@@ -50,7 +50,7 @@ applies any ini option for one run, a GPU wait that runs out is logged with what
 
 | Rank | Feature | nxnative reference | Games | State here | Symptom |
 |---|---|---|---|---|---|
-| 1 | AV1 movies | movies.md "`nn::codec` video decoders taken over"; Ocarina README, Files | Ocarina of Time | in work on the branch `av1-dav1d` (a dav1d decoder in `svc_ns2.c`); until it lands AV1 is accepted and gives black pictures | Ocarina's title and opening movies are black |
+| 1 | Ocarina's movies on screen: `nn::ndve`'s movie network has to compute | shaders.md "The NDVE movie network by the host", "`nn::ndve`'s movie enhancement file"; movies.md "`nn::codec` video decoders taken over" | Ocarina of Time | the AV1 decoder is done (`AV1_DECODER.md`: dav1d 1.5.5 in `runtime/av1`, `av1video.inc`, `svc_ns2.c`; the decoded pictures reach the game's plane textures). Missing: the network between those textures and the screen. Its kernels' tensors go through raw global memory (rank 2 below: raw loads through pointers) and give zeros; its image stores go into textures made without the IMAGE flag (`vk_tex.c` `vkt_want_image`, `NXRT_VK_IMAGE_NOFLAG=1`, off by default: with it the output is zeros, then noise). To do: make the network compute (the raw loads first; `AV1_DECODER.md` has a hunch about pages written through loaded pointers and uploaded over later), then turn `NXRT_VK_IMAGE_NOFLAG` on by default. nxnative runs the network as host kernels | Ocarina's title and opening movies are still black on screen, behind decoded pictures; the title runs at 27 FPS in the network's dispatches |
 | 2 | Current translator chain | shaders.md "Raw global memory through a pointer read when the draw is bound", "128-bit raw global loads...", "Early fragment tests from the control section", "Bindless constant buffer handles..." | Ocarina of Time (foliage: 2,241 shaders with raw loads; pools reached only through pointers), DKB (2,855 pixel shaders with the NVN2 early-test flag) | missing: `xlate_bin` has none of `FindPointerSite`, `GenerateRawVectorLoad`, `ABindlessConstant`, `F2ip`; `nxs_front.py` reads the early-test flag at +0x718 only; the pool table has 4,096 entries (nxnative 8,192: Ocarina holds about 4,170 ranges). Blocked on a build of nxnative's translator: it needs the .NET 10 SDK (this machine has 6, 7 and 9), nxnative's patched Ryujinx sources built with it, the chain's Python front end (`nxs_front.py`, `nxs_refl.py`, `dmsh_abi.h`) moved to the new ABI, and every game's shader cache made again | missing foliage and moss in Ocarina; depth-tested-late storage writes |
 | 3 | First-use texture work spread over frames (not an nxnative item: its answer is Metal's placement sparse textures) | frame-rate.md | Mario Kart World | missing: a burst of new ASTC textures is transcoded and uploaded on the translation thread in the frame that first uses them (`vk_tex.c`); the prefetch (`NXRT_VK_TEX_PREFETCH`) showed no gain | 4 to 8 frames of 60-180 ms when a new part of the course streams in (GAMEPLAY_INVESTIGATION.md section 7) |
 | 4 | Passthrough geometry draws gathered into one dispatch | shaders.md "Mesh geometry draws gathered into one dispatch", "Passthrough geometry shaders drawn by the vertex shader" | DKB (630 culling draws a frame) | the geometry shaders run natively (`VK_NV_geometry_shader_passthrough`), one draw each; their write-backs are gone (item 12) | translation thread time: DKB at 57 FPS, not a flat 60 |
@@ -73,10 +73,13 @@ cuts of SDK functions (this engine runs the SDK against its own services).
 
 ## Next, in order
 
-1. The AV1 decoder (rank 1) lands from its branch.
+1. Ocarina's movies on screen (rank 1, with rank 2): the `nn::ndve` network's compute kernels read their tensors through raw global memory.
+   First the hunch of `AV1_DECODER.md` (a page written through a loaded pointer and never copied back is uploaded from guest memory later,
+   zeros over the result; write-back on demand now keeps such pages on the device once they are handed over, so look again), then the raw
+   loads of the newer translator, then `NXRT_VK_IMAGE_NOFLAG` on by default.
 2. First-use texture work over frames (rank 3): the small levels of a new texture now, the large ones in later frames, sampled through
    `VK_EXT_image_view_min_lod` so that a shader's size queries do not change; the view made again when the texture is whole. Mario Kart World's
    long frames.
-3. A newer translator (rank 2): install the .NET 10 SDK, build nxnative's chain, move the Python front end with it, make every game's shader
+3. A newer translator (rank 2, which rank 1 waits for): install the .NET 10 SDK, build nxnative's chain, move the Python front end with it, make every game's shader
    cache again. With it, pointer sites so that raw loads find current memory (Ocarina's culling), and the 8,192-entry table.
 4. DKB's culling draws in one dispatch (rank 4), then the idle time between submissions in report spans (rank 9).
