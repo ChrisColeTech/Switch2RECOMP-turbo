@@ -212,6 +212,16 @@ The earlier runs in that folder are the faults of 8.1 as they were found: `pla-b
 `pla-boot2` (one frame, GPFIFO entries dropped), `pla-vulkan` (black, shaders in the mis-named folder),
 `violet-boot` (`svcBreak` at 4 s).
 
+Regression, the same runtime in every game (the runtime's hash equals each game's executable):
+
+- **Mario Kart World** (NUP, Switch 2) rebuilt into its library folder, 460 C units: title screen and the main menu
+  (Grand Prix, Knockout Tour, ...) at 57 FPS, `20261118-040715-mkw-regress`. Its save was backed up before and is
+  byte-identical after.
+- No plaintext NSP is left in the library to rebuild (the Mario Kart World 1.8.0 package is gone); that path is
+  covered by `tests/test_nsp.py`, and `nsp.load` still hands a package the keys cannot open to the old reader.
+- A fourth real package, a Switch 1 game on its own (encrypted, no update), opens with the new reader and passes
+  the IVFC check of section 1.2 (302 blocks, 0 mismatches): the "encrypted game alone" case on real data.
+
 ### 8.3 Open
 
 - **Violet's audio crash** (8.2) blocks its gameplay. `bt` command 9 (`RegisterBleEvent`) still answers without an
