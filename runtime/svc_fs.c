@@ -393,21 +393,65 @@ static const u8 k_ng1_version[]={0,0,0,0x20}, k_ng2_version[]={0,0,0,0x1A};
 
 static const u8 k_ng2_ac[]={0x1F,0x8B,0x08,0x08,0x00,0x00,0x00,0x00,0x02,0xFF,0x61,0x63,0x72,0x61,0x77,0x00,0x63,0x60,0x18,0xD9,0x00,0x00,0x58,0x85,0x96,0x0D,0x00,0x01,0x00,0x00};
 
-/* MiiModel (0802), the textures and shapes of nn::mii's renderer. yuzu makes up its six files as the NFTR / NFSR
-   headers alone (file_sys/system_archive/mii_model.cpp) and the parts tables after them then read as zeros past the
-   end. here the game reads those tables out of its heap buffer: shape parts of 0x58 bytes at up to ~0x12000 in,
-   texture parts of 0x1C at up to ~0x3000, each valid when its size (+4) isn't 0. so the files carry the tables,
-   all zero: every part has size 0 and the renderer skips it (Miis draw without their face). Mario Kart 8 Deluxe
-   took heap garbage for sizes from the empty archive, mapped a memory pool it had never created and crashed */
-static u8 g_mii_tex[0x10000], g_mii_shape[0x20000];
+/* MiiModel (0802), the textures and shapes of nn::mii's renderer (Mario Kart 8 Deluxe links it in main and reads
+   NXTexture{Low,Mid}{Linear,SRGB}.dat and Shape{Mid,High}.dat whole). The firmware's files aren't ours to ship, so
+   the runtime writes files of the same layout in which every part is blank. Ported from nxnative's stand-in writer
+   (dm/host/hle_mii.c, MIT); docs/MK8D_BOOT_INVESTIGATION.md section 5 has the format.
+   - texture file: +0x0C u32 largest decompressed size of each of the 11 part kinds, +0x38 their alignments, then
+     from +0x64 one 0x1C entry per part (u32 offset, u32 size, u32 stored size, zlib params, u16 width / height at
+     +0x14, format index / mips / tile index at +0x18): 132, 62, 24, 2, 12, 12, 20, 2, 37, 6, 18 = 327 entries.
+   - shape file: +0x0C the 12 largest sizes, +0x3C their alignments, from +0x6C one 0x58 entry per part (offset,
+     size, stored size, zlib params, five attribute offsets then five sizes, index offset and size, bounding box):
+     4, 12, 12, 132 x6, 1, 18, 18 = 857 entries; then the hair (132 x 0x48) and faceline (12 x 0x24) transforms.
+   Parts can't be absent: a part of size 0 is skipped, but the renderer still hands out its (NULL) texture and
+   draws the faceline without a check (MK8D crashed in vkt_reg_tex, then in its Mii drawing code). So every
+   entry is valid and points at one shared payload: 0x20 zero bytes as a zlib stored block, which inflate
+   (nn::util::DecompressZlib) into an 8x4 R8_UNORM texture (palette index 0, one level, tile 0) or a mesh of one
+   8-byte f16 vertex at the origin and the u16 triangle (0, 0, 0) at +0x10. Heads build and draw nothing.
+   The largest sizes size the model's decompress pool and the first alignment is that pool's alignment, so
+   they're one page each. Transforms stay zero (float-only consumers). The first 12 bytes aren't read; they
+   keep yuzu's NFTR / NFSR magic and version 1 */
+enum { MII_TEX_PARTS=327, MII_TEX_TABLES=0x64+0x1C*MII_TEX_PARTS, MII_SHAPE_PARTS=857,
+       MII_SHAPE_TABLES=0x6C+0x58*MII_SHAPE_PARTS+0x48*132+0x24*12, MII_MESH_AT=0x14DE0, MII_BLANK=0x20,
+       MII_TEXELS_AT=0x2430, MII_TEX_W=8, MII_TEX_H=4 };
+_Static_assert(MII_TEX_TABLES==0x2428 && MII_SHAPE_TABLES==0x14DD4 && MII_TEXELS_AT>=MII_TEX_TABLES &&
+               MII_MESH_AT>=MII_SHAPE_TABLES && MII_TEX_W*MII_TEX_H==MII_BLANK, "MiiModel stand-in layout");
+/* zlib header 78 01, one final stored block of 0x20 bytes (LEN, NLEN), the zeros, Adler-32 of 32 zeros (0x00200001) */
+static const u8 k_mii_blank_z[7+MII_BLANK+4]={0x78,0x01,0x01,MII_BLANK,0x00,(u8)~MII_BLANK,0xFF,
+  [7+MII_BLANK]=0x00,0x20,0x00,0x01};
+enum { MII_TEX_SIZE=MII_TEXELS_AT+sizeof k_mii_blank_z, MII_SHAPE_SIZE=MII_MESH_AT+sizeof k_mii_blank_z };
+static u8 g_mii_tex[MII_TEX_SIZE], g_mii_shape[MII_SHAPE_SIZE];
+
+static void mii_header(u8* b, const char* magic, int kinds){
+  memcpy(b,magic,4); b[4]=1;
+  for(int i=0;i<kinds;i++){ u32 page=0x1000; memcpy(b+0xC+4*i,&page,4); memcpy(b+0xC+4*kinds+4*i,&page,4); } }
+
+static void mii_model_init(void){ static int done; if(done) return; done=1;
+  u8* t=g_mii_tex; mii_header(t,"NFTR",11);
+  for(int i=0;i<MII_TEX_PARTS;i++){ u8* e=t+0x64+0x1C*i;
+    u32 at=MII_TEXELS_AT, size=MII_BLANK, stored=sizeof k_mii_blank_z; u16 w=MII_TEX_W, h=MII_TEX_H;
+    memcpy(e,&at,4); memcpy(e+4,&size,4); memcpy(e+8,&stored,4);
+    memcpy(e+0x14,&w,2); memcpy(e+0x16,&h,2); e[0x18]=0; e[0x19]=1; e[0x1A]=0; }
+  memcpy(t+MII_TEXELS_AT,k_mii_blank_z,sizeof k_mii_blank_z);
+  u8* s=g_mii_shape; mii_header(s,"NFSR",12);
+  for(int i=0;i<MII_SHAPE_PARTS;i++){ u32 e[22]={0};
+    e[0]=MII_MESH_AT; e[1]=MII_BLANK; e[2]=sizeof k_mii_blank_z;   /* payload offset, inflated size, stored size */
+    e[4+5]=8;                                                       /* attribute 0 (offset 0): one 8-byte vertex */
+    e[14]=0x10; e[15]=6;                                            /* index offset and size: three u16 indices */
+    memcpy(s+0x6C+0x58*i,e,0x58); }
+  memcpy(s+MII_MESH_AT,k_mii_blank_z,sizeof k_mii_blank_z); }
 
 /* NULL when there is no synthetic version of that archive */
 static SvcObj* sysdata_open(u64 id){
   static char names[64][24]; SynFile f[64]; int n=0, k=0;
-  if(id==0x0100000000000802ull){
-    memcpy(g_mii_tex,"NFTR\1",5); memcpy(g_mii_shape,"NFSR\1",5);
-    static const char* const tex[4]={"NXTextureLowLinear.dat","NXTextureLowSRGB.dat","NXTextureMidLinear.dat","NXTextureMidSRGB.dat"};
-    for(int i=0;i<4;i++) f[n++]=(SynFile){tex[i],g_mii_tex,sizeof g_mii_tex};
+  if(id==0x0100000000000802ull || id==0x0400000000000849ull){
+    /* the Switch 2's MiiResource (0849) has the same layout plus its own texture sets (nxnative: Nintendo Switch
+       Sports Resort's accessors); a game reads only the files it names */
+    mii_model_init();
+    static const char* const tex[10]={"NXTextureLowLinear.dat","NXTextureLowSRGB.dat","NXTextureMidLinear.dat","NXTextureMidSRGB.dat",
+      "OunceTextureLowLinear.dat","OunceTextureLowSRGB.dat","OunceTextureMidLinear.dat","OunceTextureMidSRGB.dat",
+      "OunceTextureHighLinear.dat","OunceTextureHighSRGB.dat"};
+    for(int i=0;i<(id==0x0100000000000802ull? 4 : 10);i++) f[n++]=(SynFile){tex[i],g_mii_tex,sizeof g_mii_tex};
     f[n++]=(SynFile){"ShapeHigh.dat",g_mii_shape,sizeof g_mii_shape}; f[n++]=(SynFile){"ShapeMid.dat",g_mii_shape,sizeof g_mii_shape}; }
   else if(id==0x0100000000000806ull){
     for(int i=0;i<16;i++){ snprintf(names[k],24,"%d.txt",i); f[n++]=(SynFile){names[k++],k_ng_word_txt,sizeof k_ng_word_txt}; }
