@@ -272,12 +272,12 @@ class CombinedTest(unittest.TestCase):
         self.assertEqual(switchrecomp.output_name('Game v1.0 [0100]'), 'Game v10 0100')
         self.assertEqual(switchrecomp.output_name('ゼルダ'), 'Game')
 
-    def runtime(self, parts, expected):
+    def runtime(self, parts, expected, update=None):
         target_win = sys.platform == 'win32'
         cc = os.environ.get('CC') or switchrecomp.find_cc(None, target_win)
         if not cc or switchrecomp.is_tcc(cc): self.skipTest('no GCC or Clang to compile the runtime test with')
         self.write(*parts)
-        package = nsp.load(self.package, self.keys)
+        package = nsp.load(self.package, self.keys, update=update)
         marker = self.root / 'romfs.nsp'; marker.write_text(package.marker(), encoding='utf-8', newline='\n')
         image = self.root / 'expected.bin'; image.write_bytes(expected)
         exe = self.root / ('nsp_runtime' + ('.exe' if target_win else ''))
@@ -309,6 +309,143 @@ class CombinedTest(unittest.TestCase):
     def test_runtime_reads_an_encrypted_game(self):
         ran = self.runtime([self.fixture.base()], self.fixture.base_image)('auto')
         self.assertEqual(ran.returncode, 0, ran.stdout); self.assertIn('PASS', ran.stdout)
+
+
+class SeparateUpdateTest(CombinedTest):
+    """the update in a package of its own (docs/UPDATES.md): Package(game, update=...)"""
+    test_aes_engines_agree = test_output_name_is_ascii = None      # the parent's cases are not run twice
+    test_game_with_update_and_dlc = test_encrypted_game_alone = test_refusals = test_build_stages_the_update = None
+    test_runtime_reads_the_patched_romfs = test_runtime_reads_an_encrypted_game = None
+
+    def separate(self, update_name='Game [UPD] [v262144].nsp', container=pfs):
+        self.write(self.fixture.base(), self.fixture.addon())
+        update = self.root / update_name; update.write_bytes(container(self.fixture.update()))
+        return update
+
+    def test_update_of_its_own_package(self):
+        update = self.separate()
+        alone = nsp.load(self.package, self.keys)
+        self.assertEqual((alone.version, alone.display_version, alone.update), (0, '1.0.0', None))
+        package = nsp.load(self.package, self.keys, update=update)
+        entries = {name: reader() for name, _, reader in package.exefs()}
+        self.assertEqual((entries['main'], entries['main.npdm']), (self.fixture.update_main, b'npdm2'))
+        self.assertEqual(self.files(package), {'keep.bin': SHARED, 'file.bin': b'patched!', 'new.bin': bytes(range(256)) * 9})
+        self.assertEqual((package.title_id, package.version, package.display_version), (GAME, 262144, '1.2.3'))
+        self.assertEqual(package.addons, [GAME + 0x1001])                 # the DLC hint still comes from the game's package
+        marker = package.marker().splitlines()
+        self.assertEqual(marker[:3], ['SWRNSP2', str(self.package), 'keys ' + str(self.keys)])
+        self.assertEqual([row.split()[0] for row in marker[3:]], ['romfs', 'base', 'update', 'patch'])
+        self.assertEqual(marker[5], 'update ' + str(update))
+        for secret in (self.fixture.base_key, self.fixture.update_key, TITLEKEK, AREA_KEK):
+            self.assertNotIn(secret.hex(), package.marker())
+
+    def test_combined_package_without_its_update_and_with_another(self):
+        self.write(self.fixture.base(), self.fixture.update())
+        base = nsp.load(self.package, self.keys, embedded=False)
+        self.assertIsNone(base.update); self.assertIsNotNone(base.embedded_update)
+        self.assertEqual((base.version, base.display_version), (0, '1.0.0'))
+        self.assertEqual({name: reader() for name, _, reader in base.exefs()}['main'], self.fixture.base_main)
+        self.assertEqual(self.files(base)['gone.bin'], b'removed by the update')
+        self.assertEqual([row.split()[0] for row in base.marker().splitlines()[3:]], ['romfs', 'base'])
+        # an update of its own package wins over the one inside the game's package
+        update = self.root / 'other update.nsp'; update.write_bytes(pfs(self.fixture.update()))
+        package = nsp.load(self.package, self.keys, update=update)
+        self.assertEqual(package.update_path, str(update)); self.assertEqual(package.update.path, str(update))
+        self.assertEqual(self.files(package)['file.bin'], b'patched!')
+
+    def test_card_image_and_bare_nca(self):
+        from test_nsp_dlc import xci
+        update = self.separate('update.xci', xci)
+        self.assertEqual(self.files(nsp.load(self.package, self.keys, update=update))['file.bin'], b'patched!')
+        bare = self.root / 'bare' / 'patch.nca'; bare.parent.mkdir()
+        bare.write_bytes(self.fixture.update()['ba' * 16 + '.nca'])
+        package = nsp.load(self.package, self.keys, update=bare)
+        self.assertEqual(self.files(package)['file.bin'], b'patched!')
+        self.assertEqual((package.version, package.display_version), (0, '1.0.0'))      # a bare NCA brings no metadata: the game's shows
+
+    def test_refusals_of_updates(self):
+        update = self.separate()
+        other = Fixture(); other_files = other.update()
+        # an update of another game
+        saved = GAME; globals()['GAME'] = saved + 0x10000
+        try: (self.root / 'other.nsp').write_bytes(pfs(Fixture().update()))
+        finally: globals()['GAME'] = saved
+        with self.assertRaisesRegex(nsp.Error, 'not for this game'): nsp.load(self.package, self.keys, update=self.root / 'other.nsp')
+        (self.root / 'game.nsp').write_bytes(pfs(self.fixture.base()))
+        with self.assertRaisesRegex(nsp.Error, 'holds no game update'): nsp.load(self.package, self.keys, update=self.root / 'game.nsp')
+        with self.assertRaisesRegex(nsp.Error, 'missing'): nsp.load(self.package, self.keys, update=self.root / 'nowhere.nsp')
+        files = dict(other_files); files['ba' * 16 + '.ncz'] = files.pop('ba' * 16 + '.nca')
+        (self.root / 'packed.nsz').write_bytes(pfs(files))
+        with self.assertRaisesRegex(nsp.Error, 'compressed package'): nsp.load(self.package, self.keys, update=self.root / 'packed.nsz')
+        # the update as the source, with or without another update
+        with self.assertRaisesRegex(nsp.Error, 'update without its game|update on its own'): nsp.load(update, self.keys)
+        with self.assertRaisesRegex(nsp.Error, 'update on its own'): nsp.load(update, self.keys, update=update)
+        import nxloader
+        folder = self.root / 'dump' / 'exefs'; folder.mkdir(parents=True); (folder / 'main').write_bytes(minimal_nso())
+        with self.assertRaisesRegex(ValueError, 'needs the game as an NSP'): nxloader.load_program(str(folder.parent), update=str(update))
+
+    def test_update_info(self):
+        update = self.separate()
+        self.assertEqual(nca.update_info(update, self.keys), {'title_id': GAME, 'version': 262144, 'display': '1.2.3'})
+        self.assertEqual(nca.update_info(update, self.keys, game=self.package)['version'], 262144)
+        with self.assertRaisesRegex(nsp.Error, 'holds no game update'): nca.update_info(self.package, self.keys)
+        with self.assertRaisesRegex(nsp.Error, 'needs the game as an NSP'): nca.update_info(update, self.keys, game=self.root)
+        env = dict(os.environ, SWR_PROD_KEYS=str(self.keys), PYTHONUTF8='1')
+        run = lambda *args: subprocess.run([sys.executable, str(ROOT / 'switchrecomp.py')] + [str(arg) for arg in args], env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8')
+        good = run(self.package, '--update-info', update)
+        self.assertEqual(good.returncode, 0, good.stdout)
+        self.assertEqual(good.stdout.strip().split('\t'), ['UPDATE', str(update), '%016x' % GAME, '262144', '1.2.3'])
+        bad = run(self.package, '--update-info', update, self.package)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn('UPDATE\t', bad.stdout); self.assertIn('UPDATE error: ', bad.stdout); self.assertIn('holds no game update', bad.stdout)
+
+    def test_build_stages_the_update_and_takes_it_back(self):
+        """copy_data with the update, then without: code, marker, version and the modules only one version has"""
+        update = self.separate()
+        data = self.root / 'Game_data'; said = []
+        package = nsp.load(self.package, self.keys, update=update)
+        switchrecomp.copy_data([], b'', nsp.romfs_of(package), str(self.package), str(data), said.append)
+        self.assertEqual((data / 'exefs' / 'main.npdm').read_bytes(), b'npdm2')
+        self.assertIn('update ' + str(update), (data / 'romfs.nsp').read_text(encoding='utf-8'))
+        self.assertEqual((data / 'control.nacp').read_bytes()[0x3060:0x3065], b'1.2.3')
+        self.assertTrue(any('1.2.3 (v262144)' in line and str(update) in line for line in said), said)
+        (data / 'exefs' / 'subsdk9').write_bytes(b'a module of the other version')
+        package = nsp.load(self.package, self.keys)
+        switchrecomp.copy_data([], b'', nsp.romfs_of(package), str(self.package), str(data), said.append)
+        self.assertEqual((data / 'exefs' / 'main.npdm').read_bytes(), b'npdm')
+        self.assertFalse((data / 'exefs' / 'subsdk9').exists())
+        self.assertNotIn('update ', (data / 'romfs.nsp').read_text(encoding='utf-8'))
+        self.assertEqual((data / 'control.nacp').read_bytes()[0x3060:0x3065], b'1.0.0')
+
+    def test_hints_stay_with_their_program(self):
+        from types import SimpleNamespace
+        one = [SimpleNamespace(build_id=b'A' * 32)]; two = [SimpleNamespace(build_id=b'B' * 32)]
+        hints = self.root / 'Game.hints'; said = []
+        switchrecomp.program_hints(str(hints), one, said.append)            # first build: nothing to keep
+        self.assertFalse(hints.exists()); self.assertEqual(said, [])
+        hints.write_text('8001820\n')                                       # the game ran
+        switchrecomp.program_hints(str(hints), one, said.append); self.assertEqual(hints.read_text(), '8001820\n')
+        switchrecomp.program_hints(str(hints), two, said.append)            # the update is applied: another program
+        self.assertFalse(hints.exists()); self.assertEqual(len(said), 1)
+        hints.write_text('8046820\n')
+        switchrecomp.program_hints(str(hints), one, said.append)            # and taken back
+        self.assertEqual(hints.read_text(), '8001820\n')
+        switchrecomp.program_hints(str(hints), two, said.append); self.assertEqual(hints.read_text(), '8046820\n')
+        # a hints file from before the stamp existed is taken as the current program's
+        (self.root / 'Game.hints.for').unlink()
+        switchrecomp.program_hints(str(hints), two, said.append); self.assertEqual(hints.read_text(), '8046820\n')
+
+    def test_runtime_reads_the_update_from_its_own_package(self):
+        update = self.root / 'Upd\u00e4te.nsp'; update.write_bytes(pfs(self.fixture.update()))
+        run = self.runtime([self.fixture.base()], self.fixture.new_image, update=update)
+        for mode in ('auto', 'portable'):
+            ran = run(mode)
+            self.assertEqual(ran.returncode, 0, ran.stdout); self.assertIn('PASS', ran.stdout)
+        # the update package moved away: the game is told which file is missing
+        os.replace(update, self.root / 'elsewhere.nsp')
+        ran = run('auto')
+        self.assertNotEqual(ran.returncode, 0); self.assertIn('the update package', ran.stdout); self.assertIn('is missing', ran.stdout)
 
 
 if __name__ == '__main__': unittest.main()

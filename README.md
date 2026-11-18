@@ -26,6 +26,8 @@ It is a recompiler, not an emulator: the game's code is translated once, ahead o
 - **Build straight from your dump.** NUP and NSP packages work directly; no unpacking, and the game data stays in the
   original file. That includes an NSP that holds a game together with its update and DLC (1G+1U, 1G+1U+1D).
 - **DLC support.** Install add-on content from NSP, NSZ, XCI, XCZ and NCA files.
+- **Updates in their own file.** Build an NSP game with an update that comes as a separate NSP, XCI or NCA
+  (`--update`); its data is read in place over the game's ([docs/UPDATES.md](docs/UPDATES.md)).
 - **Native graphics.** Switch graphics run on Vulkan, with a shader cache so games get smoother the more you play.
 - **Video and sound.** In-game movies (VP9 and AV1) and Opus audio play, which several games need to get past their
   intros.

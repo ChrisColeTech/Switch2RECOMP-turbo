@@ -228,8 +228,8 @@ Regression, the same runtime in every game (the runtime's hash equals each game'
   event; the game went on regardless.
 - **Non-ASCII characters in the build folder's own path** (the dump folder, not the name the build gives itself)
   still break the Vulkan shader translator, and the NUP marker (`romfs.nup`) is still opened in the ANSI code page.
-- **The game's own package as `.nsz` / `.xci`**, an **update in a separate file** from its base, and **sparse or
-  compressed Program NCAs** are not built; the last two are refused with the reason.
+- **The game's own package as `.nsz` / `.xci`** and **sparse or compressed Program NCAs** are not built; the
+  latter are refused with the reason. An **update in a separate file** from its base is built since: [UPDATES.md](UPDATES.md).
 - **DLC with an encrypted RomFS** is still unpacked once into `romfs.bin` (docs/DLC.md); the version 2 marker could
   serve it in place as well.
 - No save was written in either run, so saving and loading are untested for both titles.

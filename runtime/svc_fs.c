@@ -134,7 +134,9 @@ void romfs_init(void){
   if(g_romfs_dir_override[0] && plat_is_dir(g_romfs_dir_override)){ LOG("RomFS: %s\n",g_romfs_dir_override); romfs_build(g_romfs_dir_override); return; }
   snprintf(p,sizeof p,"%sromfs.nsp",g_datadir); const char* nsp_override=getenv("SWR_ROMFS_NSP");
   rnsp=nsp_open_marker(nsp_override&&nsp_override[0]?nsp_override:p);
-  if(rnsp){ rtotal=nsp_size(rnsp); LOG("RomFS: NSP %s (read in place, %.1f MB%s)\n",nsp_path(rnsp),(double)rtotal/1048576.0,nsp_kind(rnsp)); return; }
+  if(rnsp){ rtotal=nsp_size(rnsp); LOG("RomFS: NSP %s (read in place, %.1f MB%s)\n",nsp_path(rnsp),(double)rtotal/1048576.0,nsp_kind(rnsp));
+    if(nsp_update_path(rnsp)[0]) LOG("RomFS: update package %s\n",nsp_update_path(rnsp));
+    return; }
   char nup_path[2048]={0}; const char* override=getenv("SWR_ROMFS_NUP");
   if(override && override[0]){ strncpy(nup_path,override,sizeof nup_path-1); }
   else { snprintf(p,sizeof p,"%sromfs.nup",g_datadir); FILE* marker=fopen(p,"rb");

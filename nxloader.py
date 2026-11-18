@@ -389,18 +389,24 @@ def romfs_nros(romfs):
     return out
 
 
-def load_program(entry):
-    """-> (modules sorted with bases assigned, npdm bytes, romfs path or bytes)"""
+def load_program(entry, update=None, embedded_update=True):
+    """-> (modules sorted with bases assigned, npdm bytes, romfs path or bytes).
+    update: a game update in a package of its own (NSP sources only); embedded_update=False builds a combined
+    package's game without the update it brings"""
     mods = []; npdm = None; romfs = None
+    if update and not (os.path.isfile(entry) and entry.lower().endswith('.nsp')):
+        raise ValueError('a separate update needs the game as an NSP package: its data is patched in place from the '
+                         'two packages. %s is not one' % entry)
     if os.path.isfile(entry) and entry.lower().endswith('.nro'):
         m = load_nro(entry); mods = [m]; romfs = nro_romfs(m)
     elif os.path.isfile(entry):
         import nup, nsp
         if nup.is_nup(entry):
+            if update: raise ValueError('a NUP package holds its update already; a separate update cannot be applied to it')
             package = nup.load(entry)
             romfs = nup.NupRomfs(package)
         elif nsp.is_nsp(entry):
-            package = nsp.load(entry)
+            package = nsp.load(entry, update=update, embedded=embedded_update)
             romfs = nsp.romfs_of(package)
         else:
             raise ValueError('%s is not an NRO, NUP or NSP file' % entry)

@@ -256,13 +256,14 @@ class NspRomfs:
 
 
 @functools.lru_cache(maxsize=4)
-def _load(path, identity, keys_path, keys_identity, hactool):
+def _load(path, identity, keys_path, keys_identity, hactool, update, update_identity, embedded):
     import nca
     try:
-        package = nca.Package(path, keys_path)
+        package = nca.Package(path, keys_path, update, embedded)
     except nca.Locked:
+        if update: raise
         package = None      # these keys open no NCA header here: the plaintext reader says what is wrong
-    if package and (package.update or package.encrypted):
+    if package and (package.update or package.encrypted or package.embedded_update):
         return package
     return Nsp(path, keys_path, hactool)
 
@@ -273,8 +274,16 @@ def romfs_of(package):
     return nca.PackageRomfs(package) if isinstance(package, nca.Package) else NspRomfs(package)
 
 
-def load(path, keys=None, hactool=None):
+def load(path, keys=None, hactool=None, update=None, embedded=True):
+    """update: a game update in a package of its own, applied over this game (docs/UPDATES.md). embedded=False
+    leaves out the update a combined package brings itself"""
     stat = os.stat(path); keys_path = _keys_path(keys); key_stat = os.stat(keys_path)
     identity = (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     keys_identity = (key_stat.st_size, key_stat.st_mtime_ns)
-    return _load(os.path.abspath(os.fsdecode(path)), identity, keys_path, keys_identity, hactool)
+    update_identity = None
+    if update:
+        if not os.path.isfile(update): raise Error('%s: the update package is missing' % update)
+        other = os.stat(update); update = os.path.abspath(os.fsdecode(update))
+        update_identity = (other.st_size, other.st_mtime_ns)
+    return _load(os.path.abspath(os.fsdecode(path)), identity, keys_path, keys_identity, hactool, update, update_identity,
+                 bool(embedded))

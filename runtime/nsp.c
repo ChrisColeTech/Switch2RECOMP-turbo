@@ -4,7 +4,8 @@
 /* a RomFS image read in place from an application NSP, described by the build's marker (romfs.nsp):
      SWRNSP1  one plaintext byte range of the package
      SWRNSP2  the RomFS section of the Program NCA, AES-CTR encrypted, optionally the update's BKTR patch section
-              composed over the base's (a package that holds the game and its update). docs/COMBINED_NSP.md
+              composed over the base's. The update is in the game's package (a combined one, docs/COMBINED_NSP.md)
+              or in a package of its own, named by an "update <path>" row before the patch row (docs/UPDATES.md)
    the marker names the content keys and holds them wrapped, as they are in the package; they are unwrapped here
    with the user's prod.keys */
 #include "rt.h"
@@ -35,11 +36,12 @@ static FILE* open_utf8(const char* path,u64* size){
 
 typedef struct { u8 rk[176]; } Aes;
 /* one NCA section inside the package */
-typedef struct { int present,crypto; u64 file_off,size,nca_off; u8 upper[8]; Aes aes; } Layer;
+typedef struct { int present,crypto; u64 file_off,size,nca_off; u8 upper[8]; Aes aes; FILE* file; } Layer;
 typedef struct { u64 virt,phys; u32 patch; } Reloc;      /* [virt, next virt) of the patched section -> base or patch */
 typedef struct { u64 off; u32 gen; } Gen;                /* counter generation of the patch section from off on */
 
 struct Nsp { FILE* file; u64 offset,size; char path[2048];
+  FILE* ufile; u64 utotal; char upath[2048];           /* the update's own package, when it is not the game's */
   int v2; Layer base,patch; Reloc* rel; u32 nrel; u64 vsize; Gen* gen; u32 ngen; };
 
 /* ---------------------------------------------------------------- AES-128 */
@@ -158,15 +160,15 @@ static int unwrap(const char* spec,const char* keys,const char* package,Aes* out
   memset(kek,0,sizeof kek); memset(key,0,sizeof key); memset(&a,0,sizeof a); return 0; }
 
 /* ---------------------------------------------------------------- sections */
-static int raw_read(Nsp* n,void* dst,u64 size,u64 off){
+static int raw_read(FILE* f,void* dst,u64 size,u64 off){
   size_t done=0; while(done<size){ u64 left=size-done; int want=left>0x40000000?0x40000000:(int)left;
-    int got=plat_pread(n->file,(u8*)dst+done,want,off+done); if(got<=0) return -1; done+=(size_t)got; }
+    int got=plat_pread(f,(u8*)dst+done,want,off+done); if(got<=0) return -1; done+=(size_t)got; }
   return 0; }
 
 /* bytes [off, off+size) of a section, decrypted; gen<0 keeps the section's own counter generation */
 static int layer_read(Nsp* n,const Layer* l,void* dst,u64 size,u64 off,int64_t gen){
   if(!l->present || off>l->size || size>l->size-off) return -1;
-  if(raw_read(n,dst,size,l->file_off+off)) return -1;
+  if(raw_read(l->file? l->file : n->file,dst,size,l->file_off+off)) return -1;
   if(l->crypto==1) return 0;
   u8 upper[8]; memcpy(upper,l->upper,8);
   if(gen>=0){ upper[4]=(u8)(gen>>24); upper[5]=(u8)(gen>>16); upper[6]=(u8)(gen>>8); upper[7]=(u8)gen; }
@@ -261,14 +263,19 @@ Nsp* nsp_open_marker(const char* marker){
     if(!strncmp(row,"keys ",5)) snprintf(keys,sizeof keys,"%.2040s",row+5);
     else if(!strncmp(row,"romfs ",6)){ unsigned long long at,size; if(sscanf(row+6,"%llx %llx",&at,&size)!=2||!size) goto done;
       n->offset=at; n->size=size; have_romfs=1; }
+    else if(!strncmp(row,"update ",7)){ snprintf(n->upath,sizeof n->upath,"%.2040s",row+7);
+      n->ufile=open_utf8(n->upath,&n->utotal);
+      if(!n->ufile){ WARN("RomFS: the update package %s is missing (moved or on a disconnected drive). Put it back, or "
+                          "remove the update in the launcher (Game > Install Updates) and build the game again.\n",n->upath); goto done; } }
     else if(!strncmp(row,"base ",5)){ int r=layer_parse(row+5,&n->base,keys,path,total,NULL);
       if(r){ if(r==-1) WARN("RomFS: %s has an invalid base line\n",marker); goto done; } }
-    else if(!strncmp(row,"patch ",6)){ int r=layer_parse(row+6,&n->patch,keys,path,total,tables);
-      if(r){ if(r==-1) WARN("RomFS: %s has an invalid patch line\n",marker); goto done; } } }
+    else if(!strncmp(row,"patch ",6)){ int r=layer_parse(row+6,&n->patch,keys,n->ufile? n->upath : path,n->ufile? n->utotal : total,tables);
+      if(r){ if(r==-1) WARN("RomFS: %s has an invalid patch line\n",marker); goto done; }
+      n->patch.file=n->ufile; } }
   if(!have_romfs || (!n->base.present && !n->patch.present)) goto done;
   if(n->patch.present){
     if(tables_load(n,tables[0],tables[1],tables[2],tables[3])){
-      WARN("RomFS: the update in %s does not fit its game (wrong keys, or the package changed since the build)\n",path); goto done; } }
+      WARN("RomFS: the update in %s does not fit its game (wrong keys, or the package changed since the build)\n",n->ufile? n->upath : path); goto done; } }
   else n->vsize=n->base.size;
   if(n->offset>n->vsize || n->size>n->vsize-n->offset) goto done;
   { u8 head[8]; if(nsp_pread(n,head,8,0) || rd64(head)!=0x50){
@@ -276,13 +283,15 @@ Nsp* nsp_open_marker(const char* marker){
   ok=1;
 done: fclose(m); if(!ok && n){ nsp_close(n); n=NULL; } return n; }
 
-void nsp_close(Nsp* n){ if(!n) return; if(n->file) fclose(n->file); free(n->rel); free(n->gen);
+void nsp_close(Nsp* n){ if(!n) return; if(n->file) fclose(n->file); if(n->ufile) fclose(n->ufile); free(n->rel); free(n->gen);
   memset(&n->base.aes,0,sizeof(Aes)); memset(&n->patch.aes,0,sizeof(Aes)); free(n); }
 u64 nsp_size(Nsp* n){ return n?n->size:0; }
 const char* nsp_path(Nsp* n){ return n?n->path:""; }
-const char* nsp_kind(Nsp* n){ return !n||!n->v2? "" : n->patch.present? ", the update applied over the game, decrypted with prod.keys" : ", decrypted with prod.keys"; }
+const char* nsp_kind(Nsp* n){ return !n||!n->v2? "" : n->ufile? ", the update of its own package applied over the game, decrypted with prod.keys"
+  : n->patch.present? ", the update applied over the game, decrypted with prod.keys" : ", decrypted with prod.keys"; }
+const char* nsp_update_path(Nsp* n){ return n&&n->ufile? n->upath : ""; }
 int nsp_pread(Nsp* n,void* dst,u64 size,u64 off){
   if(!n||off>n->size||size>n->size-off) return -1;
-  if(!n->v2) return raw_read(n,dst,size,n->offset+off);
+  if(!n->v2) return raw_read(n->file,dst,size,n->offset+off);
   if(n->patch.present) return virtual_read(n,dst,size,n->offset+off);
   return layer_read(n,&n->base,dst,size,n->offset+off,-1); }

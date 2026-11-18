@@ -71,7 +71,7 @@ def members(path):
     head = nsp._read(path, 0, min(size, 0x1200)) if size >= 0x10 else b''
     extension = os.path.splitext(path)[1].lower()
     if extension not in EXTENSIONS:
-        raise Error('%s: not an add-on content package (%s)' % (path, ' '.join(EXTENSIONS)))
+        raise Error('%s: not a package (%s)' % (path, ' '.join(EXTENSIONS)))
     if extension == '.nca':
         return [SimpleNamespace(name=os.path.basename(path), offset=0, size=size)]
     if head[:4] == b'PFS0':
