@@ -31,7 +31,7 @@ class ShadowUpdate(unittest.TestCase):
         source = (ROOT / 'runtime/nvn/vk/vk_mem.c').read_text()
         fn = source[source.index('static void wr_shadow('):source.index('// The words that differ between base and after')]
         d = ROOT / 'build/mkw-investigation' / ('shadow-test-' + str(time.time_ns()))
-        d.mkdir()
+        d.mkdir(parents=True)
         with contextlib.nullcontext(d):
             src = Path(d) / 'shadow.c'; dll = Path(d) / 'shadow.dll'
             src.write_text('#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\nenum { PAGE=4096 };\n' + fn +

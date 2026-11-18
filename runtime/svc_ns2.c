@@ -303,7 +303,7 @@ typedef struct { u8* data; u32 n; u64 pts; int end; } VDecPacket;
 #define VDEC_PK_BYTES (64u<<20)
 typedef struct {
   PMutex lock; KEvent* ready; u32 width,height,rate,syncpt,sync_base,handed; u64 submitted,pictures,dropped,queue_bytes,next_serial;
-  int configured,started,ended,ctx_ok; char codec[32]; VDecImage images[VDEC_IMAGES]; u32 nimages,free[VDEC_IMAGES],nfree;
+  int configured,started,ended,ctx_ok,blank; char codec[32]; VDecImage images[VDEC_IMAGES]; u32 nimages,free[VDEC_IMAGES],nfree;
   VDecFrame frames[VDEC_FRAMES]; u32 nframes; VDecOutput outputs[VDEC_OUTPUTS]; u32 noutputs;
   VDecPacket* pk; u32 npk,cappk; u64 pk_bytes,pk_waited;
 #ifdef SWR_HAVE_VP9
@@ -335,11 +335,12 @@ static int vdec_make_room(VDec* v,u64 bytes,u64 pts){
 #ifdef SWR_HAVE_VP9
 static int vdec_codec_open(VDec* v){
   if(v->ctx_ok) return 1;
+  if(v->blank){ v->ctx_ok=1; return 1; }
   vpx_codec_dec_cfg_t cfg; memset(&cfg,0,sizeof cfg); cfg.threads=1; cfg.w=v->width; cfg.h=v->height;
   pm_lock(&g_vpx_lock); int e=vpx_codec_dec_init(&v->ctx,vpx_codec_vp9_dx(),&cfg,0); pm_unlock(&g_vpx_lock);
   if(e){ WARN("switch 2 video: libvpx decoder init failed: %s\n",vpx_codec_err_to_string((vpx_codec_err_t)e)); return 0; }
   v->ctx_ok=1; return 1; }
-static void vdec_codec_close(VDec* v){ if(v->ctx_ok){ pm_lock(&g_vpx_lock); vpx_codec_destroy(&v->ctx); pm_unlock(&g_vpx_lock); v->ctx_ok=0; } }
+static void vdec_codec_close(VDec* v){ if(v->blank){ v->ctx_ok=0; return; } if(v->ctx_ok){ pm_lock(&g_vpx_lock); vpx_codec_destroy(&v->ctx); pm_unlock(&g_vpx_lock); v->ctx_ok=0; } }
 #else
 static int vdec_codec_open(VDec* v){ (void)v; return 0; }
 static void vdec_codec_close(VDec* v){ (void)v; }
@@ -363,8 +364,23 @@ static int vdec_capture(VDec* v,const vpx_image_t* im,u64 fallback_pts,u64* seri
       for(u32 x=0;x<cw;x++){ if(high){ u16 a,b; memcpy(&a,u+x*2,2); memcpy(&b,q+x*2,2); d[x*2]=(u8)(a>>shift); d[x*2+1]=(u8)(b>>shift); } else { d[x*2]=u[x]; d[x*2+1]=q[x]; } } } }
   v->queue_bytes+=total; v->nframes++; return 1; }
 /* one submitted packet (cmd 109/400) into decoded pictures; with end, the decoder is drained and the last picture marked */
+/* AV1 (Ocarina of Time's movies): there is no AV1 decoder in this runtime yet. Refused, the game's movie player aborts (nn::codec::InitializeAv1Decoder...);
+   accepted, each packet gives one black picture with the packet's time, so a movie runs its length with its sound and the game goes on. A decoder is the open item */
+static int vdec_blank(VDec* v,u64 n,u64 pts,int end){
+  u64 last=0;
+  if(n){ u32 w=v->width,h=v->height,uvp=(w+1)&~1u,ch=(h+1)/2; u64 yn=(u64)w*h,uvn=(u64)uvp*ch,total=yn+uvn;
+    if(!vdec_make_room(v,total,pts)) return K_INVSIZE;
+    u8* data=malloc((size_t)total); if(!data) return K_OUTOFRES;
+    memset(data,16,(size_t)yn); memset(data+yn,128,(size_t)uvn);
+    VDecFrame* f=&v->frames[v->nframes]; memset(f,0,sizeof *f); f->y=data; f->uv=data+yn; f->w=w; f->h=h; f->uv_pitch=uvp; f->pts=pts; f->serial=++v->next_serial; last=f->serial;
+    v->queue_bytes+=total; v->nframes++; }
+  if(end){ if(last){ for(u32 i=0;i<v->nframes;i++) if(v->frames[i].serial==last) v->frames[i].end=1; }
+    else if(vdec_make_room(v,0,pts)){ VDecFrame* f=&v->frames[v->nframes++]; memset(f,0,sizeof *f); f->pts=pts; f->serial=++v->next_serial; f->end=1; }
+    v->ended=1; }
+  return 0; }
 static int vdec_decode(VDec* v,const u8* data,u64 n,u64 pts,int end){
   u64 last=0; const vpx_image_t* im; vpx_codec_iter_t it=NULL; int cap=1;
+  if(v->blank) return vdec_blank(v,n,pts,end);
   pm_lock(&g_vpx_lock); int e=vpx_codec_decode(&v->ctx,n? data : NULL,(unsigned)n,(void*)(uintptr_t)(pts+1),0);
   while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break;
   if(!e && cap==1 && end){ e=vpx_codec_decode(&v->ctx,NULL,0,(void*)(uintptr_t)(pts+1),0); it=NULL; while(!e && (im=vpx_codec_get_frame(&v->ctx,&it))) if((cap=vdec_capture(v,im,pts,&last))!=1) break; }
@@ -398,7 +414,7 @@ static void vdec_pump(VDec* v){
     vdec_free_frame(v,&f); }
 #ifdef SWR_HAVE_VP9
   /* pictures went out: decode what waited, up to VDEC_AHEAD pictures ahead of them */
-  if(v->npk && v->nframes<VDEC_AHEAD && v->ctx_ok){ VDecPacket p=v->pk[0]; memmove(v->pk,v->pk+1,(--v->npk)*sizeof *v->pk); v->pk_bytes-=p.n;
+  if(v->npk && v->nframes<VDEC_AHEAD && v->ctx_ok){ VDecPacket p=v->pk[0]; memmove(v->pk,v->pk+1,(--v->npk)*sizeof *v->pk); if(p.data) v->pk_bytes-=p.n;
     int rc=vdec_decode(v,p.data,p.n,p.pts,p.end); free(p.data); if(rc) WARN("switch 2 video: a waiting packet failed to decode (%x)\n",rc); continue; }
 #endif
   break; }
@@ -422,7 +438,9 @@ static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data; int rc=0; pm_lo
     case 200: case 201: case 202: case 210: break;
     case 101: { u64 a=0,n=0; char name[32]={0}; if(buf_in(c,0,&a,&n) && n && guest_span_readable(a,n,1)){ u64 z=n<sizeof name-1?n:sizeof name-1; memcpy(name,GP(a),(size_t)z); }
       v->width=in32(c,0); v->height=in32(c,4); v->rate=in32(c,8); if(!v->width || v->width>8192 || !v->height || v->height>8192) rc=K_INVSIZE;
-      else if(!strstr(name,"vp9")) rc=K_NOTIMPL; else { strncpy(v->codec,name,sizeof v->codec-1); v->configured=1; vdec_reset(v); if(!v->ctx_ok) rc=K_NOTIMPL; }
+      else if(!strstr(name,"vp9") && !strstr(name,"av1")) rc=K_NOTIMPL;
+      else { vdec_codec_close(v); v->blank= strstr(name,"av1")!=NULL; strncpy(v->codec,name,sizeof v->codec-1); v->configured=1; vdec_reset(v); if(!v->ctx_ok) rc=K_NOTIMPL;
+        if(v->blank){ static int said; if(!said++) WARN("switch 2 video: no AV1 decoder yet: the movie's pictures are black\n"); } }
       LOG("switch 2 video: configure codec \"%s\" %ux%u rate %u (%x)\n",name,v->width,v->height,v->rate,rc); break; }
     case 311: { u32 id=in32(c,0); NsImage* im=image_find(id); u64 base=im?nvmap_addr(im->mem):0,msz=im?nvmap_size(im->mem):0;
       if(!im || !im->decoder || !base || im->off>msz || im->size>msz-im->off || !guest_span_writable(base+im->off,im->size,1) || vdec_image(v,id) || v->nimages>=VDEC_IMAGES){ rc=K_NOTFOUND; for(int i=0;i<4;i++) out32(c,0); }
@@ -449,9 +467,10 @@ static int vdec_svc_disp(SvcObj* o, IpcCtx* c){ VDec* v=o->data; int rc=0; pm_lo
       else if(v->pk_bytes+n>VDEC_PK_BYTES) rc=K_OUTOFRES;
       else {   /* VDEC_AHEAD pictures ahead already: the bitstream waits (VDecPacket) */
         if(v->npk==v->cappk){ u32 nc=v->cappk? v->cappk*2 : 64; VDecPacket* q=realloc(v->pk,nc*sizeof *q); if(q){ v->pk=q; v->cappk=nc; } }
-        u8* d= n? malloc((size_t)n) : NULL;
-        if(v->npk==v->cappk || (n && !d)){ free(d); rc=K_OUTOFRES; }
-        else { if(n) memcpy(d,GP(a),(size_t)n); v->pk[v->npk++]=(VDecPacket){d,(u32)n,pts,end}; v->pk_bytes+=n; v->pk_waited++; if(end) v->ended=1; vdec_pump(v); } }
+        int keep= n && !v->blank;   /* a codec decoded to black pictures needs no bitstream: only that the packet had one */
+        u8* d= keep? malloc((size_t)n) : NULL;
+        if(v->npk==v->cappk || (keep && !d)){ free(d); rc=K_OUTOFRES; }
+        else { if(keep) memcpy(d,GP(a),(size_t)n); v->pk[v->npk++]=(VDecPacket){d,(u32)n,pts,end}; if(keep) v->pk_bytes+=n; v->pk_waited++; if(end) v->ended=1; vdec_pump(v); } }
 #else
       else rc=K_NOTIMPL;
 #endif

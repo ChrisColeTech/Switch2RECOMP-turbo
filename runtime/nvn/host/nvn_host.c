@@ -180,6 +180,15 @@ void plat_sleep_ns(uint64_t ns) {
 void plat_yield(void) { SwitchToThread(); }
 #endif
 
+/* The game profile keys that differ by title (game_profile.h; nxnative dm/games/<id>/game.tsv) */
+extern uint64_t g_title_id;
+int dm_game_tex_rewrite(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("NXRT_TEX_REWRITE");
+        v = e && *e ? atoi(e) != 0 : g_title_id == 0x0400486024DEC000ull || g_title_id == 0x0100F2C0115B6000ull;
+        if (v) LOG("game profile: textures the CPU rewrites after creating them are read again (tex_flush_upload, tex_dirty_upload)"); }
+    return v;
+}
 /* The Switch 2's NVN answers, from the game's sdk (nxnative dm/host/loader.c) */
 static uint64_t g_sdk_base, g_sdk_size;
 void nvn_host_sdk(uint64_t base, uint64_t size) { g_sdk_base = base; g_sdk_size = size; }

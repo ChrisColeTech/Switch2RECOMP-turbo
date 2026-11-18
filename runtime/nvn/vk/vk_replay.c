@@ -2017,15 +2017,29 @@ static void ev_recorded(volatile uint32_t *val, uint32_t mode, uint32_t v) {
     if (i == g_nevp) { if (g_nevp < 128) g_nevp++; else i = (int)(g_ev_gpu % 128); g_evp[i].val = val; g_evp[i].v = *val; }
     g_evp[i].v = mode == NVN_EVENT_SIGNAL_MODE_ADD ? g_evp[i].v + v : v;
 }
+int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms);
+static uint64_t g_ev_park;
+int vkr_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t v) {   // the value meets the wait now, or will once the GPU signals recorded so far have landed
+    if (ev_meets(*val, mode, v)) return 1;
+    for (int i = 0; i < g_nevp; i++) if (g_evp[i].val == val && ev_meets(g_evp[i].v, mode, v)) return 1;
+    return 0;
+}
 static void wait_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
     static int max_ms = -1; if (max_ms < 0) { const char *e = getenv("NXRT_VK_WAIT_EVENT_MS"); max_ms = e && atoi(e) > 0 ? atoi(e) : 250; }
     if (!vkc_int("wait_event", 1) || !val) return;   // gamectl set wait_event 0 (or NXRT_VK_WAIT_EVENT=0): ignored, as before
-    static uint64_t last; if (now_ns() - last > 5000000000ull) { last = now_ns(); VKLOG("GPU event waits so far: %llu met already, %llu by GPU signals ahead, %llu for the CPU (%.0f ms waited), %llu not met in time", (unsigned long long)g_ev_now, (unsigned long long)g_ev_gpu, (unsigned long long)g_ev_cpu, g_ev_ns / 1e6, (unsigned long long)g_ev_late); }
+    static uint64_t last; if (now_ns() - last > 5000000000ull) { last = now_ns(); VKLOG("GPU event waits so far: %llu met already, %llu by GPU signals ahead, %llu by another queue's commands replayed first, %llu for the CPU (%.0f ms waited), %llu not met in time", (unsigned long long)g_ev_now, (unsigned long long)g_ev_gpu, (unsigned long long)g_ev_park, (unsigned long long)g_ev_cpu, g_ev_ns / 1e6, (unsigned long long)g_ev_late); }
     pass_end(); barrier_all(vks_cb());   // what follows waits for what came before, as behind the console's wait
     if (ev_meets(*val, mode, v)) { g_ev_now++; return; }
     for (int i = 0; i < g_nevp; i++) if (g_evp[i].val == val && ev_meets(g_evp[i].v, mode, v)) { g_ev_gpu++; return; }   // a GPU signal ahead in the queue
     static volatile uint32_t *g_ev_nowait[64]; static int g_nnowait;   // events a wait timed out on once: signalled by work replayed later (another NVN queue), never waited for again
     for (int i = 0; i < g_nnowait; i++) if (g_ev_nowait[i] == val) { g_ev_late++; return; }
+    // Another NVN queue's commands signal it, and they are not replayed yet: this submission is parked and they go first (hle_nvn.c nvn_aq_park)
+    if (nvn_aq_park(val, mode, v, max_ms)) {
+        if (vkr_event_ready(val, mode, v)) { g_ev_park++; return; }
+        g_ev_late++; if (g_nnowait < 64) g_ev_nowait[g_nnowait++] = val;
+        if (g_ev_late <= 8 || !(g_ev_late % 1000)) VKRED("a GPU wait on an event at %p (mode %u, value %u, holds %u) was not met by another queue's commands in %d ms, or a present came first: going on (%llu so far)", (void *)val, mode, v, *val, max_ms, (unsigned long long)g_ev_late);
+        return;
+    }
     g_ev_cpu++;   // only the CPU can write it: what is recorded goes to the GPU first, then this thread waits
     split_now();
     uint64_t t0 = now_ns(), lim = (uint64_t)max_ms * 1000000ull;
@@ -2140,7 +2154,7 @@ void vkr_sub_begin(void) {
     memset(&g_sub, 0, sizeof g_sub); g_memo_sub++;   // the texture / sampler memo starts again with each submission
     P.valid = 0; P.open = 0; P.query = -1; g_last_pipe = VK_NULL_HANDLE; g_nwb = 0; g_nrtrb = 0; ds_forget();
     if (!S) S = rs_get(0);
-    g_rc_npend = 0; S->render_skip = 0;
+    { extern int nvn_sub_resuming; g_rc_npend = 0; if (!nvn_sub_resuming) S->render_skip = 0; }   // the rest of a parked submission keeps its queue's render condition
     // the slot's reset is recorded (VUID-vkResetQueryPool-firstQuery-02741: a host reset may meet the slot's last use still running while loading floods the queue)
     sub_open_rest();
 }

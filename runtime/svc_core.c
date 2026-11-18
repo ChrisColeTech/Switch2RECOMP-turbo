@@ -968,8 +968,51 @@ static int hwopus_disp(SvcObj* o, IpcCtx* c){
 
 static SvcObj* new_hwopus(void){ return svcobj_new("hwopus",hwopus_disp,0); }
 
+/* Event descriptors (bsd command 31, EventFd): a counter a thread can wait for with Poll. The network libraries of newer games (Ocarina of Time: NPLN) make one
+   for their worker's wake-up at start-up and abort() when they get none, long before any socket is opened. There is no network here (Socket still answers "no"),
+   so only what such a wake-up needs: a write adds to the counter, a read takes it, Poll reports it readable and otherwise waits its timeout out */
+enum { BSD_EVFD0=64, BSD_NEVFD=32 };
+static struct { int used; u64 count; } g_evfd[BSD_NEVFD]; static PMutex g_evfd_lk;
+static int evfd_of(i32 fd){ return fd>=BSD_EVFD0 && fd<BSD_EVFD0+BSD_NEVFD && g_evfd[fd-BSD_EVFD0].used? fd-BSD_EVFD0 : -1; }
+static int bsd_evfd(IpcCtx* c){
+  switch(c->cmd){
+    case 31: { u64 init=in64(c,0); i32 fd=-1; pm_lock(&g_evfd_lk);
+      for(int i=0;i<BSD_NEVFD;i++) if(!g_evfd[i].used){ g_evfd[i].used=1; g_evfd[i].count=init; fd=BSD_EVFD0+i; break; }
+      pm_unlock(&g_evfd_lk);
+      { static int said; if(!said++) LOG("bsd: event descriptor %d (no network: only its wake-ups work)\n",fd); }
+      if(fd<0){ out32(c,(u32)-1); out32(c,24); } else { out32(c,(u32)fd); out32(c,0); } return 1; }
+    case 24: { int k=evfd_of((i32)in32(c,0)); if(k<0) return 0; u64 a,n,v=0; buf_in(c,0,&a,&n); if(n>=8) memcpy(&v,GP(a),8);
+      pm_lock(&g_evfd_lk); g_evfd[k].count+=v; pm_unlock(&g_evfd_lk); out32(c,8); out32(c,0); return 1; }
+    case 25: { int k=evfd_of((i32)in32(c,0)); if(k<0) return 0; u64 a,n; buf_out(c,0,&a,&n);
+      pm_lock(&g_evfd_lk); u64 v=g_evfd[k].count; g_evfd[k].count=0; pm_unlock(&g_evfd_lk);
+      if(!v || n<8){ out32(c,(u32)-1); out32(c,35); } else { memcpy(GP(a),&v,8); out32(c,8); out32(c,0); } return 1; }   /* 35: EAGAIN */
+    case 26: { int k=evfd_of((i32)in32(c,0)); if(k<0) return 0; pm_lock(&g_evfd_lk); g_evfd[k].used=0; pm_unlock(&g_evfd_lk); out32(c,0); out32(c,0); return 1; }
+    case 20: case 19: { if(evfd_of((i32)in32(c,0))<0) return 0; out32(c,0); out32(c,0); return 1; }   /* Fcntl, Ioctl: accepted */
+    case 6: { u32 nfds=in32(c,0); i32 timeout=(i32)in32(c,4); u64 ia,in_,oa,on; buf_in(c,0,&ia,&in_); buf_out(c,0,&oa,&on);
+      if(nfds>64 || in_<(u64)nfds*8 || on<(u64)nfds*8) return 0;
+      int any=0; for(u32 i=0;i<nfds;i++){ i32 fd; memcpy(&fd,GP(ia)+8*i,4); if(evfd_of(fd)>=0) any=1; }
+      if(!any) return 0;
+      u64 t0=plat_ns(); int ready=0;
+      for(;;){
+        memcpy(GP(oa),GP(ia),(size_t)nfds*8); ready=0;
+        pm_lock(&g_evfd_lk);
+        for(u32 i=0;i<nfds;i++){ i32 fd; i16 ev, rev=0; memcpy(&fd,GP(ia)+8*i,4); memcpy(&ev,GP(ia)+8*i+4,2); int k=evfd_of(fd);
+          if(k>=0){ if((ev&1) && g_evfd[k].count) rev|=1; if(ev&4) rev|=4; }   /* POLLIN when the counter is not 0; POLLOUT always */
+          memcpy(GP(oa)+8*i+6,&rev,2); if(rev) ready++; }
+        pm_unlock(&g_evfd_lk);
+        if(ready || timeout==0 || (timeout>0 && plat_ns()-t0>=(u64)timeout*1000000ull)) break;
+        plat_sleep_ns(1000000);
+      }
+      out32(c,(u32)ready); out32(c,0); return 1; }
+  }
+  return 0; }
+
 static int bsd_disp(SvcObj* o, IpcCtx* c){ (void)o;
   switch(c->cmd){ case 0: out32(c,0); return 0; case 1: return 0; case 2: out32(c,(u32)-1); out32(c,106); return 0; }
+  if(bsd_evfd(c)) return 0;
+  /* The registrations newer SDKs make first (SDK 22: command 36 on a fresh bsd:s session, before any socket call): success, as RegisterClient. Answered with the
+     socket calls' "-1, errno" the SDK took it for a failed registration and aborted with a socket result (module 27): Ocarina of Time, 5.3 s in */
+  if(c->cmd>=33){ out32(c,0); out32(c,0); return 0; }
   out32(c,(u32)-1); out32(c,106); return 0; }
 
 static SvcObj* new_bsd(void){ return svcobj_new("bsd",bsd_disp,0); }

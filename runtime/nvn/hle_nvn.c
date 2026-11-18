@@ -1307,23 +1307,108 @@ static int g_aq_on = -1;
 static int aq_on(void) { if (g_aq_on < 0) { const char *e = getenv("SWR_ASYNC_SUBMIT"); g_aq_on = e ? atoi(e) > 0 : 1;   // on by default: synchronous replay took ~27 ms of a 34 ms MKW race frame on the game's own thread
     if (g_aq_on) LOG("[nvn] asynchronous submission: submits and presents are translated on a thread of their own (SWR_ASYNC_SUBMIT=0 restores the old synchronous replay)"); } return g_aq_on; }
 static int aq_busy(void) { return aq_on() && atomic_load(&g_aq_done) < g_aq_tail; }
+// ---------- Submissions parked at a GPU event wait ----------
+// A game with two NVN queues hands work between them with events: one queue's commands wait (nvnCommandBufferWaitEvent) for a value the other queue's commands signal.
+// Donkey Kong Bananza's frame: main queue Signal(E0=0), depth pre-pass, Wait(E1==1), ..., Signal(E0=2), Wait(E1==3), shading; second queue Wait(E0==0), Signal(E1=1),
+// Wait(E0==2), a dispatch over the depth buffer, Signal(E1=3). Replayed whole in submit order, the second queue's dispatch ran before the main queue's pre-pass (on last
+// frame's depth) and its first wait timed out. As nxnative's nvn_queue.inc parks a queue at an unresolved wait and replays another queue's continuation
+// (docs/reference/nvn-objects.md "GPU event waits order work across queues"; MIT, (c) seedds), each submission is translated on a fiber of the translation thread: at a
+// wait no recorded signal meets, what is recorded so far is committed and the fiber is left (nvn_aq_park, called by the replay); the thread goes on with the next
+// queued submission of another queue and comes back when a signal that meets the wait has been recorded, or after the wait's time limit. A submission of the same
+// queue, or a present, never overtakes a parked one: the parked one is resumed first. Windows only (fibers); NXRT_AQ_PARK=0: waits are waited out in place, as before
+#if defined(_WIN32) && defined(NXRT_GFX_VK)
+#define AQ_PARK 1
+int vkr_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t v);
+int nvn_sub_resuming;   // gfx_sub_begin is the rest of a parked submission (vk_replay.c vkr_sub_begin keeps the queue's render condition)
+enum { AQF_N = 8 };
+typedef struct { void *fiber; int state; aop_t op; uint64_t seq, t_park; volatile uint32_t *val; uint32_t mode, v; int max_ms; } aqf_t;   // state: 0 free, 1 running, 2 parked, 3 finished
+static aqf_t g_aqf[AQF_N]; static void *g_aq_sched; static aqf_t *g_aqf_cur; static uint64_t g_aq_parks, g_aq_forced;
+static void CALLBACK aqf_main(void *arg) { aqf_t *f = arg; for (;;) { submit_now(f->op.serial, f->op.origin_ll, f->op.n, f->op.h); free(f->op.h); f->state = 3; SwitchToFiber(g_aq_sched); } }
+int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) {   // 1: the submission was parked and is being translated again (in a new slot); 0: not possible here
+    aqf_t *f = g_aqf_cur; if (!f) return 0;
+    gfx_sub_commit(); pthread_mutex_unlock(&g_sub_mu); gfx_leave();
+    f->val = val; f->mode = mode; f->v = v; f->max_ms = max_ms; f->t_park = now_ns(); f->state = 2; g_aq_parks++;
+    SwitchToFiber(g_aq_sched);
+    dm_host_mutex_lock(&g_sub_mu); gfx_enter();
+    gfx_queue_activate(f->op.serial); gfx_set_queue_origin_lower_left(f->op.origin_ll);
+    nvn_sub_resuming = 1; gfx_sub_begin(); nvn_sub_resuming = 0;
+    return 1;
+}
+static uint8_t g_aq_fin[AQ_N];
+#else
+int nvn_aq_park(volatile uint32_t *val, uint32_t mode, uint32_t v, int max_ms) { (void)val; (void)mode; (void)v; (void)max_ms; return 0; }
+#endif
+static void aq_op_done(uint64_t seq, int kind) {   // ops are published done in order: one that finished while an earlier one was parked waits for it
+    pthread_mutex_lock(&g_aq_mu);
+    g_aq_f[seq % AQ_FN].fence = gfx_last_fence(); g_aq_f[seq % AQ_FN].seq = seq;
+    if (kind == 2) g_aq_npres--;
+#ifdef AQ_PARK
+    g_aq_fin[seq % AQ_N] = 1;
+    uint64_t d = atomic_load(&g_aq_done), h = atomic_load(&g_aq_head);
+    while (d < h && g_aq_fin[(d + 1) % AQ_N]) { d++; g_aq_fin[d % AQ_N] = 0; if (d != seq) { g_aq_f[d % AQ_FN].fence = gfx_last_fence(); g_aq_f[d % AQ_FN].seq = d; } }
+    atomic_store(&g_aq_done, d);
+#else
+    atomic_store(&g_aq_done, seq);
+#endif
+    pthread_cond_broadcast(&g_aq_done_cv);
+    pthread_mutex_unlock(&g_aq_mu);
+}
 static unsigned __stdcall aq_main(void *arg) {
     (void)arg; SetThreadDescription(GetCurrentThread(), L"nvn translation"); SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#ifdef AQ_PARK
+    { const char *e = getenv("NXRT_AQ_PARK"); if (!(e && *e == '0')) g_aq_sched = ConvertThreadToFiber(NULL);
+      if (g_aq_sched) LOG("[nvn] submissions are parked at GPU event waits another queue's commands signal (NXRT_AQ_PARK=0: waited out in place)"); }
+#endif
     for (;;) {
+#ifdef AQ_PARK
+        int nparked = 0;
+        if (g_aq_sched) {   // a parked submission whose wait a recorded signal meets, or whose time is up: the oldest first
+            aqf_t *r = NULL; uint64_t now = now_ns();
+            for (int i = 0; i < AQF_N; i++) { aqf_t *f = &g_aqf[i]; if (f->state != 2) continue; nparked++;
+                if ((vkr_event_ready(f->val, f->mode, f->v) || now - f->t_park >= (uint64_t)f->max_ms * 1000000ull) && (!r || f->t_park < r->t_park)) r = f; }
+            if (r) {
+                uint64_t t0 = now_ns(), c0 = thread_cyc();
+                g_aqf_cur = r; r->state = 1; SwitchToFiber(r->fiber); g_aqf_cur = NULL;
+                atomic_fetch_add(&g_aq_ns, now_ns() - t0); atomic_fetch_add(&g_aq_cyc, thread_cyc() - c0);
+                if (r->state == 3) { r->state = 0; aq_op_done(r->seq, 1); }
+                continue;
+            }
+        }
+#endif
         pthread_mutex_lock(&g_aq_mu);
+#ifdef AQ_PARK
+        if (nparked) {   // something is parked: look for new work for a millisecond at a time, the parked waits' limits run meanwhile
+            if (atomic_load(&g_aq_head) == g_aq_tail) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 1000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&g_aq_cv, &g_aq_mu, &ts); }
+            if (atomic_load(&g_aq_head) == g_aq_tail) { pthread_mutex_unlock(&g_aq_mu); continue; }
+            const aop_t *nx = &g_aq[(atomic_load(&g_aq_head) + 1) % AQ_N]; int conflict = nx->kind == 2;
+            for (int i = 0; i < AQF_N && !conflict; i++) if (g_aqf[i].state == 2 && g_aqf[i].op.serial == nx->serial) conflict = 1;
+            if (conflict) {   // a present, or the same queue's next submission: what is parked goes first, met or not
+                for (int i = 0; i < AQF_N; i++) if (g_aqf[i].state == 2 && (nx->kind == 2 || g_aqf[i].op.serial == nx->serial)) { g_aqf[i].max_ms = 0; g_aq_forced++; }
+                pthread_mutex_unlock(&g_aq_mu); continue;
+            }
+        } else
+#endif
         while (atomic_load(&g_aq_head) == g_aq_tail) pthread_cond_wait(&g_aq_cv, &g_aq_mu);
         uint64_t seq = atomic_load(&g_aq_head) + 1; aop_t op = g_aq[seq % AQ_N]; atomic_store(&g_aq_head, seq);
         pthread_mutex_unlock(&g_aq_mu);
         uint64_t t0 = now_ns(), c0 = thread_cyc();
-        if (op.kind == 1) { submit_now(op.serial, op.origin_ll, op.n, op.h); free(op.h); }
+        int done = 1;
+        if (op.kind == 1) {
+#ifdef AQ_PARK
+            aqf_t *f = NULL;
+            for (int i = 0; g_aq_sched && i < AQF_N && !f; i++) if (!g_aqf[i].state) { f = &g_aqf[i]; if (!f->fiber) f->fiber = CreateFiberEx(64 << 10, 8 << 20, 0, aqf_main, f); if (!f->fiber) f = NULL; }
+            if (f) { f->op = op; f->seq = seq; g_aqf_cur = f; f->state = 1; SwitchToFiber(f->fiber); g_aqf_cur = NULL; if (f->state == 3) f->state = 0; else done = 0; }
+            else
+#endif
+            { submit_now(op.serial, op.origin_ll, op.n, op.h); free(op.h); }
+        }
         else if (op.kind == 2) { gfx_enter(); uint64_t tk = gfx_present(op.t, op.period, op.crop); gfx_leave(); if (op.idx >= 0 && op.idx < 4) op.w->ticket[op.idx] = tk; }
         atomic_fetch_add(&g_aq_ns, now_ns() - t0); atomic_fetch_add(&g_aq_cyc, thread_cyc() - c0);
-        pthread_mutex_lock(&g_aq_mu);
-        g_aq_f[seq % AQ_FN].fence = gfx_last_fence(); g_aq_f[seq % AQ_FN].seq = seq;
-        if (op.kind == 2) g_aq_npres--;
-        atomic_store(&g_aq_done, seq);
-        pthread_cond_broadcast(&g_aq_done_cv);
-        pthread_mutex_unlock(&g_aq_mu);
+        if (done) aq_op_done(seq, op.kind);
+#ifdef AQ_PARK
+        { static uint64_t last; if (g_aq_parks && now_ns() - last > 30000000000ull) { last = now_ns(); LOG("[nvn] submissions parked at event waits so far: %llu (%llu resumed unmet, ahead of a present or of their queue's next submission)", (unsigned long long)g_aq_parks, (unsigned long long)g_aq_forced); } }
+#endif
     }
     return 0;
 }

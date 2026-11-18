@@ -36,7 +36,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--baseline', action='store_true'); ap.add_argument('--shader', type=Path)
     a = ap.parse_args()
     out = ROOT / 'build/mkw-investigation' / (time.strftime('tests-%Y%m%d-%H%M%S-') + str(time.time_ns() % 1000000000))
-    out.mkdir(exist_ok=False)
+    out.mkdir(parents=True, exist_ok=False)   # a fresh checkout has no build/mkw-investigation yet
     src = 'runtime/nvn/vk/vk_shader.c'
     text = subprocess.check_output(['git', 'show', 'HEAD:' + src], cwd=ROOT, text=True) if a.baseline else (ROOT / src).read_text()
     enums = '\n'.join(re.findall(r'^enum \{ OP_.*?\};', text, re.S | re.M))

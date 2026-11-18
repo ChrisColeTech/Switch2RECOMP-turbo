@@ -448,7 +448,7 @@ static void arb_note(u8 op, KThread* t, u64 addr, u32 type, i32 value, i64 arg, 
   r->op=op; r->tid= t? t->id : 0; r->addr=addr; r->lr= t? t->cpu.x[30] : 0; r->type=type; r->value=value; r->arg=arg; r->res=res;
   r->before=before; r->after= (addr&3)? 0 : (i32)gr32(addr); r->waiters=(u8)(waiters>255? 255 : waiters); pm_unlock(&g_arb_lk); }
 
-static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout){
+static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, u64 value64, i64 timeout){
   if(addr&3) return R_BADADDR;
   pm_lock(&g_klock);
   i32* p=(i32*)GP(addr);
@@ -458,6 +458,10 @@ static u32 svc_wait_addr(KThread* t, u64 addr, u32 type, i32 value, i64 timeout)
     case 1: for(;;){ if(cur>=value){ pm_unlock(&g_klock); return R_BADSTATE; }
               if(__atomic_compare_exchange_n(p,&cur,cur-1,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)) break; } break;
     case 2: if(cur!=value){ pm_unlock(&g_klock); return R_BADSTATE; } break;
+    /* Horizon 18's WaitIfEqual64: the 64-bit word at the address against a 64-bit value. SDK 19 and later call it (nn::os::WaitForAddress(const void*, long long),
+       under libc++'s atomic waits); answered InvalidEnumValue, the SDK aborted: Ocarina of Time (SDK 22.2.8) 5.4 s in. nxnative has it since Pokemon Legends Z-A
+       (hle_thread.c, "WaitForAddress type 3") */
+    case 3: { u64 cur64; memcpy(&cur64,p,8); if(cur64!=value64){ pm_unlock(&g_klock); return R_BADSTATE; } break; }
     default: pm_unlock(&g_klock); return R_BADENUM;
   }
   if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
@@ -1107,7 +1111,7 @@ static void swr_svc_(CPU* c, u32 imm){
     u8* p=GP(x[0]); memset(p,0,0x320); memcpy(p,n->cpu.x,29*8); memcpy(p+29*8,&n->cpu.x[29],8); memcpy(p+30*8,&n->cpu.x[30],8);
     memcpy(p+31*8,&n->cpu.x[31],8); memcpy(p+32*8,&n->cpu.pc,8); memcpy(p+0x110,n->cpu.v,0x200); x[0]=0; return; }
   case 0x34: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); arb_note('w',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],0,b,0);
-    x[0]=svc_wait_addr(t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
+    x[0]=svc_wait_addr(t,a,(u32)x[1],(i32)(u32)x[2],x[2],(i64)x[3]); arb_note('W',t,a,(u32)x[1],(i32)(u32)x[2],(i64)x[3],(u32)x[0],b,0); return; }
   case 0x35: { u64 a=x[0]; i32 b=(a&3)? 0 : (i32)gr32(a); pm_lock(&g_klock); int nw=wl_count(4,a); pm_unlock(&g_klock);
     x[0]=svc_signal_addr(a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3]); arb_note('S',t,a,(u32)x[1],(i32)(u32)x[2],(i32)(u32)x[3],(u32)x[0],b,nw); return; }
   case 0x45: { KEvent* e=kevent_new("user event",0); u32 w=h_new(&e->o), r=h_new(&e->o); x[0]=0; x[1]=w; x[2]=r; return; }
