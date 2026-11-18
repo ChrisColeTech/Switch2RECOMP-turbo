@@ -27,7 +27,7 @@ static int mprotect_(void *a, size_t len, int prot) {   // 0 = done
 // (the movie decoder thread writing a frame into texture storage, a disk read into a guest buffer) could set the state back to NONE, then the mprotect landed => the page read-only with state NONE: a game thread writing it got only
 // "re-execute" from the fault handler and spun forever; a host system call reading into it saw NONE in prep_write, skipped, and failed with EFAULT (reproduced by t_dirty_race).
 // BUSY lasts at most one mprotect (plus a few atomic writes when setting read-only). The wait is capped at BUSY_WAIT_MS and reports red beyond it: in the fault handler it then returns "not our page" so the crash handler reports truthfully
-enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2 };
+enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_LAZY = 3 };   // PG_LAZY: not accessible, the device has the page's bytes (write-back on demand, below)
 enum { BUSY_WAIT_MS = 2000 };
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 // The table grows in blocks of 1,024 slots, up to 262,144; a block is never moved or freed, so the signal handler reads it without locks. A pool past the end goes untracked: its textures count
@@ -78,6 +78,43 @@ static range_t *find_span(uintptr_t a, size_t len) {
     for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a + len <= r->end) return r; }
     return NULL;
 }
+// ---------- Write-back on demand (not nxnative's: its memory is the game's, a discrete GPU's is not) ----------
+// A page the GPU writes and the CPU does not touch need not be copied back to guest memory after every draw. The Vulkan backend (vk_mem.c "Write-back on demand")
+// hands such a page over: PROT -> BUSY -> no access -> LAZY. From then on the device's copy is the page, and guest memory is not looked at. The first access by the
+// CPU, read or write, by the game or by the host (a fault, or a host write announced through prep_write), brings the device's bytes in: LAZY -> BUSY -> fetch ->
+// writable -> copy -> read-only -> PROT, the state of a page that was just uploaded and not written since; a write then faults once more and is stamped as usual.
+// The fetch waits for the GPU (a few hundred microseconds to milliseconds), so it runs with the pages BUSY and no lock of this module held.
+// Between "writable" and "read-only" another thread could read half-copied bytes or write without a stamp; that is one memcpy long, on a page that faulted this
+// instant, and is accepted.
+static const void *(*g_lazy_fetch)(uintptr_t addr, size_t len); static void (*g_lazy_done)(uintptr_t addr, size_t len, int fetched);
+static _Atomic uint64_t g_lazy_n, g_lazy_ins, g_lazy_last_in; static _Atomic int g_lazy_ever;
+enum { LAZY_RUN = 64, LAZY_RUN_MORE = 8192 };   // pages brought in around a fault; when another fault follows within 100 ms (a reader walking the buffer)
+void nvn_dirty_lazy_register(const void *(*fetch)(uintptr_t, size_t), void (*done)(uintptr_t, size_t, int)) { g_lazy_fetch = fetch; g_lazy_done = done; }
+uint64_t nvn_dirty_lazy_pages(void) { return atomic_load(&g_lazy_n); }
+static int prot_raw(uintptr_t a, size_t len, DWORD prot) { DWORD old; return VirtualProtect((void *)a, len, prot, &old) ? 0 : -1; }
+// Page p of r is LAZY: it and the LAZY pages around it within [lo, hi) come in (fetch = 0: they only become read-only again, nothing was skipped yet).
+// Returns 1 when the page is no longer LAZY (also when another thread brought it in meanwhile)
+static int busy_wait(range_t *r, uintptr_t p);
+static int lazy_in(range_t *r, uintptr_t p, uintptr_t lo, uintptr_t hi, int fetch) {
+    uint8_t st = PG_LAZY;
+    if (!atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) return st == PG_BUSY ? busy_wait(r, p) : 1;
+    uintptr_t a = p, b = p + 1;
+    while (a > lo) { st = PG_LAZY; if (!atomic_compare_exchange_strong(&r->state[a - 1], &st, PG_BUSY)) break; a--; }
+    while (b < hi) { st = PG_LAZY; if (!atomic_compare_exchange_strong(&r->state[b], &st, PG_BUSY)) break; b++; }
+    uintptr_t addr = r->base + (a << g_shift); size_t len = (b - a) << g_shift;
+    const void *src = fetch && g_lazy_fetch ? g_lazy_fetch(addr, len) : NULL;
+    if (src) { prot_raw(addr, len, PAGE_READWRITE); memcpy((void *)addr, src, len); }
+    if (prot_raw(addr, len, PAGE_READONLY)) { prot_raw(addr, len, PAGE_READWRITE); for (uintptr_t k = a; k < b; k++) { atomic_store(&r->gen[k], UINT64_MAX); atomic_store(&r->state[k], PG_NONE); } }
+    else for (uintptr_t k = a; k < b; k++) atomic_store(&r->state[k], PG_PROT);
+    atomic_fetch_sub(&g_lazy_n, b - a);
+    if (fetch) { atomic_fetch_add(&g_lazy_ins, b - a); atomic_store(&g_lazy_last_in, mach_absolute_time()); if (g_lazy_done) g_lazy_done(addr, len, src != NULL); }
+    return 1;
+}
+static int lazy_in_fault(range_t *r, uintptr_t p) {
+    uint64_t last = atomic_load(&g_lazy_last_in), now = mach_absolute_time();
+    uintptr_t np = (r->end - r->base) >> g_shift, w = last && (now - last) * g_tb.numer / g_tb.denom < 100000000ull ? LAZY_RUN_MORE : LAZY_RUN;
+    return lazy_in(r, p, p > w ? p - w : 0, p + w < np ? p + w : np, 1);
+}
 static void stamp_page(range_t *r, uintptr_t p) {
     atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
     // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
@@ -95,6 +132,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = PG_PROT;
         if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); if (count) atomic_fetch_add(count, 1); return 1; }
+        if (st == PG_LAZY) { lazy_in(r, p, p, p + 1, 1); continue; }   // the device has it: its bytes first, then unprotect
         if (st != PG_BUSY) return atomic_load(&r->gen[p]) != 0;   // already NONE: just unprotected by another thread (the fault happened before the unprotect) -> re-execute; pages never protected are not ours
         if (!busy_wait(r, p)) return 0;
     }
@@ -138,8 +176,25 @@ static int ri_enter(int may_build) {
 }
 // The index of the first entry that starts at or after e: the ranges overlapping [a, e) are below it, down to where the largest end so far is no longer above a
 static int ri_upper(uintptr_t e) { int lo = 0, hi = g_ri_n; while (lo < hi) { int m = (lo + hi) / 2; if (g_ri[m].base < e) lo = m + 1; else hi = m; } return lo; }
+// A page handed to the device (LAZY) faults on any access. A read fault on a page that is no longer LAZY: another thread brought it in between the fault and here
+// (re-execute when the page can be read now), or it is not ours
+static int fault_lazy(uintptr_t a, int is_write) {
+    int n = atomic_load(&g_nr), seen = 0; range_t *hit = NULL, *busy = NULL;
+#define LAZY_LOOK(r) { uint8_t st = atomic_load(&(r)->state[(a - (r)->base) >> g_shift]); seen = 1; if (st == PG_LAZY) hit = (r); else if (st == PG_BUSY) busy = (r); }
+    if (ri_enter(0)) {   // looked up under the index's lock, brought in without it (the fetch waits for the GPU)
+        for (int i = ri_upper(a + 1) - 1; i >= 0 && g_ri[i].maxend > a; i--) { range_t *r = rg(g_ri[i].slot); if (live_at(g_ri[i].slot) && a >= r->base && a < r->end) LAZY_LOOK(r) }
+        ReleaseSRWLockShared(&g_ri_lk);
+    } else for (int i = 0; i < n; i++) { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) LAZY_LOOK(r) }
+#undef LAZY_LOOK
+    if (hit) return lazy_in_fault(hit, (a - hit->base) >> g_shift);
+    if (is_write) return 0;
+    if (busy) return busy_wait(busy, (a - busy->base) >> g_shift);
+    if (seen) { MEMORY_BASIC_INFORMATION mi; return VirtualQuery((void *)a, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)); }
+    return 0;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
+    if (atomic_load(&g_lazy_ever) && fault_lazy((uintptr_t)addr, is_write)) return 1;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     if (ri_enter(0)) {
@@ -165,7 +220,8 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
             if (count) atomic_fetch_add(count, i - run);
             open = 0;
         }
-        if (i <= q && st == PG_BUSY) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
+        if (i <= q && st == PG_LAZY) lazy_in(r, i, i, q + 1, 1);   // the device has it (and what follows, as far as this write goes): its bytes first
+        if (i <= q && (st == PG_BUSY || st == PG_LAZY)) release_page(r, i, count);   // another thread is changing it: wait, then unprotect it if it ended up protected
     }
 }
 static void prep_write(void *addr, size_t len) {
@@ -191,6 +247,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
     if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = (uintptr_t)__builtin_ctzll(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); dm_fault_wp_register(page_wp); }
     atomic_fetch_add(&g_adds_total, 1);
+    nvn_dirty_lazy_in(mem, size, 1);   // a pool laid over pages another pool handed to the device: two device copies again, so guest memory has to hold them
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
     int slot = -1;
@@ -235,6 +292,30 @@ void nvn_dirty_remove_range(const void *mem) {
     if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); atomic_store(&g_ri_stale, 1); }
     pthread_mutex_unlock(&g_slot_mu);
 }
+// Hands the pages of [addr, addr+len) to the device: 1 when every one of them was protected (uploaded, not written since) and no other range shares them
+int nvn_dirty_lazy_set(const void *span, const void *addr, size_t len) {
+    if (!len) return 0;
+    pthread_mutex_lock(&g_slot_mu);
+    range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || e > r->end) { pthread_mutex_unlock(&g_slot_mu); return 0; }
+    for (int i = 0; i < n; i++) { range_t *o = rg(i); if (o != r && live_at(i) && a < o->end && e > o->base) { pthread_mutex_unlock(&g_slot_mu); return 0; } }   // a page two pools share has two device copies
+    uintptr_t p = (a - r->base) >> g_shift, q = (e - 1 - r->base) >> g_shift, i;
+    for (i = p; i <= q; i++) { uint8_t st = PG_PROT; if (!atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) break; }
+    int ok = i > q && !prot_raw(r->base + (p << g_shift), (q - p + 1) << g_shift, PAGE_NOACCESS);
+    for (uintptr_t k = p; k < i; k++) atomic_store(&r->state[k], ok ? PG_LAZY : PG_PROT);
+    if (ok) { atomic_store(&g_lazy_ever, 1); atomic_fetch_add(&g_lazy_n, q - p + 1); }
+    pthread_mutex_unlock(&g_slot_mu);
+    return ok;
+}
+// Every LAZY page of [addr, addr+len), in any range, comes in (fetch = 0: taken back before anything was skipped)
+void nvn_dirty_lazy_in(const void *addr, size_t len, int fetch) {
+    if (!len || !atomic_load(&g_lazy_n)) return;
+    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) { range_t *r = rg(i); if (!live_at(i) || e <= r->base || a >= r->end) continue;
+        uintptr_t lo = a > r->base ? a : r->base, hi = e < r->end ? e : r->end, p = (lo - r->base) >> g_shift, q = (hi - 1 - r->base) >> g_shift;
+        for (uintptr_t k = p; k <= q; k++) if (atomic_load(&r->state[k]) == PG_LAZY) lazy_in(r, k, k, q + 1, fetch); }
+}
+void nvn_dirty_lazy_stats(uint64_t *pages, uint64_t *ins) { *pages = atomic_load(&g_lazy_n); *ins = atomic_load(&g_lazy_ins); }
 int nvn_dirty_tracked(const void *addr, size_t len) {
     return find_span((uintptr_t)addr, len) != NULL;
 }

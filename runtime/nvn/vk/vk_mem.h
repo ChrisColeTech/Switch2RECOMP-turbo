@@ -25,6 +25,8 @@ uint64_t vkm_up_ns(void);       // time spent copying pool pages so far (vkm_sta
 void vkm_gpu_wrote(uint64_t addr, uint64_t len);
 uint64_t vkm_wb_base(uint64_t addr, uint64_t len);
 void vkm_gpu_wrote_base(uint64_t addr, uint64_t len, uint64_t base);
+// Write-back on demand (vk_mem.c): pages now the device's alone, pages handed over and read back for the CPU so far, bytes not copied back, time in the read-backs
+void vkm_lazy_stats(uint64_t *pages, uint64_t *set, uint64_t *in, uint64_t *skip_bytes, uint64_t *fetch_ns);
 // GPU writes whose bytes the CPU knows (inline uniform updates, fills): guest memory gets the same bytes at completion; data is copied
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value);
 // Raw global memory (a shader's accesses at addresses it loaded from memory): the memory pool table and the write log to bind, and the logged pages (vk_mem.c)

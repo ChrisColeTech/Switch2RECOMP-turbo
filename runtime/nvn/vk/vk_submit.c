@@ -186,6 +186,19 @@ uint64_t vks_oldest_recording(uint64_t *assigned) {
     return m;
 }
 
+// Write-back on demand (vk_mem.c): which submission the recording thread is in, and whether one taken earlier has been committed
+static struct { uint64_t seq, value; } g_seqv[64];   // the last commits: take_seq -> timeline value (under g_lk)
+uint64_t vks_cur_seq(void) { return cur_here() ? g_slot[g_cur].take_seq : 0; }
+// The timeline value of the submission taken as seq: 0 while it is still being recorded (*mine: by this thread), 1 when it was committed too long ago to be listed
+uint64_t vks_seq_value(uint64_t seq, int *mine) {
+    uint64_t v = 1; *mine = 0;
+    AcquireSRWLockShared(&g_lk);
+    if (g_seqv[seq % 64].seq == seq) v = g_seqv[seq % 64].value;
+    else for (int i = 0; i < NSLOT; i++) if (g_slot[i].state == S_RECORDING && g_slot[i].take_seq == seq) { v = 0; *mine = i == g_cur && GetCurrentThreadId() == g_cur_tid; }
+    ReleaseSRWLockShared(&g_lk);
+    return v;
+}
+
 static void post_add(post_t p) {
     if (g_cur < 0) { VKRED("completion effect posted outside a submission (kind %d): applied now", p.kind); post_run(&p); return; }
     slot_t *s = &g_slot[g_cur];
@@ -204,7 +217,7 @@ static uint64_t commit_locked(int i) {
     if (s->deferred) vkd_end(i, s->up, s->main);   // the recorder ends them after the commands it still has
     else { vkEndCommandBuffer(s->up); vkEndCommandBuffer(s->main); }
     s->value = atomic_fetch_add(&g_vk.tl_assigned, 1) + 1;
-    s->t_commit = now_ns(); s->state = S_PENDING;
+    s->t_commit = now_ns(); s->state = S_PENDING; g_seqv[s->take_seq % 64].seq = s->take_seq; g_seqv[s->take_seq % 64].value = s->value;
     void vkm_committed(int owner, uint64_t value); vkm_committed(i, s->value);   // staging the slot used lives until this value
     g_order[g_norder++] = i;
     atomic_fetch_add(&g_subs, 1);

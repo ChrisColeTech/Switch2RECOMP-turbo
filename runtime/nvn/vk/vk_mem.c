@@ -36,6 +36,9 @@ typedef struct {
     uint64_t hot_n, cursor;       // vkm_sync_all's position
     uint64_t up_b, up_never, up_hot;   // bytes uploaded since the last report: all, of pages never copied, of hot pages
     uint32_t nvn_flags;           // the game's NVNmemoryPoolFlags (vkm_pool_flags): CPU_NO_ACCESS = the CPU never reads or writes it
+    // Write-back on demand (below): per page, 1 = the device's copy is the page and guest memory is inaccessible; GPU writes seen in a row; the frame before which it stays
+    // eager; how often the CPU came for it. lz_seq: the submission (vks_cur_seq) that last skipped a copy back into this pool
+    uint8_t *lz, *lz_n, *lz_fail; uint32_t *lz_hold; uint64_t lz_pages; _Atomic uint64_t lz_seq;
 } pool_t_;
 
 static pool_t_ *g_pool[MAXPOOL]; static int g_npool;
@@ -203,7 +206,8 @@ static void pool_free(pool_t_ *p) {
     for (int k = 0; k < p->nwin; k++) if (p->buf[k]) vkDestroyBuffer(g_vk.dev, p->buf[k], NULL);
     if (p->sparse) { for (uint64_t g = 0; g < p->ngran; g++) vk_free_mem(&p->gran[g]); free(p->gran); }
     else for (int k = 0; k < p->nwin; k++) vk_free_mem(&p->mem[k]);
-    free(p->up); free(p->hot_at); free(p->last_dirty); free(p->streak); free(p->hot); free((void *)p->gpu_pending); free(p->committed); free(p);
+    free(p->up); free(p->hot_at); free(p->last_dirty); free(p->streak); free(p->hot); free((void *)p->gpu_pending); free(p->committed);
+    free(p->lz); free(p->lz_n); free(p->lz_fail); free(p->lz_hold); free(p);
 }
 static void pool_free_cb(void *arg) { pool_free(arg); }
 
@@ -231,6 +235,7 @@ void vkm_pool_add(const void *mem, uint64_t size) {
         VKRED("memory pool %p+%#llx does not fit in %d buffers of the device's largest size (%#llx): not mirrored", mem, (unsigned long long)size, MAXWIN, (unsigned long long)g_max_buffer);
         p->nwin = 0; pool_free(p); return;
     }
+    if (nvn_dirty_lazy_pages()) nvn_dirty_lazy_in((const void *)p->base, (size_t)p->size, 1);   // pages another pool handed to the device: this pool's copy is taken from guest memory
     VkBufferCreateFlags fl = p->sparse ? VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT | (ov ? VK_BUFFER_CREATE_SPARSE_ALIASED_BIT : 0) : 0;
     int ok = p->up && p->hot && p->committed;
     for (int k = 0; ok && k < p->nwin; k++) {
@@ -274,6 +279,13 @@ static int wb_skip(uint64_t addr, uint64_t len, int count) {   // 1: a GPU write
 uint64_t vkm_wb_noaccess_bytes(void) { return atomic_load(&s_wb_noacc_b); }
 void vkm_pool_del(const void *mem) {
     pool_t_ *p = NULL;
+    if (nvn_dirty_lazy_pages()) {   // what the device alone has of it goes back to guest memory while the pool can still be read
+        uintptr_t b = 0; uint64_t n = 0;
+        AcquireSRWLockShared(&g_lk);
+        for (int i = 0; i < g_npool; i++) if (g_pool[i]->key == mem) { if (g_pool[i]->lz_pages) { b = g_pool[i]->base; n = g_pool[i]->size; } break; }
+        ReleaseSRWLockShared(&g_lk);
+        if (n) nvn_dirty_lazy_in((const void *)b, (size_t)n, 1);
+    }
     AcquireSRWLockExclusive(&g_lk);
     for (int i = 0; i < g_npool; i++) if (g_pool[i]->key == mem) { p = g_pool[i]; memmove(&g_pool[i], &g_pool[i + 1], (size_t)(g_npool - i - 1) * sizeof *g_pool); g_npool--; atomic_fetch_add(&g_pool_gen, 1); break; }
     ReleaseSRWLockExclusive(&g_lk);
@@ -380,6 +392,7 @@ static void page_rewritten(pool_t_ *p, uint64_t pg) {
 }
 // Whether page pg's device copy is behind guest memory: never copied, hot, or written (a fault stamped it) since its copy; untracked pages always are
 static inline int page_needs(pool_t_ *p, uint64_t pg) {
+    if (p->lz && p->lz[pg]) return 0;   // handed to the device (write-back on demand): guest memory is not looked at
     if (atomic_load(&p->gpu_pending[pg])) return 0;   // a GPU write in flight: the device copy is ahead until its bytes are written back
     if (p->hot[pg]) return p->hot_at[pg] != atomic_load(&g_sub_epoch);
     if (!p->up[pg] || !p->span) return 1;
@@ -752,10 +765,169 @@ static void wb_land(void *arg) {
 }
 // NXRT_VK_WB_OFF=1 (TEST ONLY, wrong results possible): no GPU write goes back to guest memory. Measures the most that fewer write-backs could gain
 static int wb_off(void) { static int v = -1; if (v < 0) v = vkc_int("wb_off", 0); return v; }
-void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
-    if (wb_off()) return;
-    wblog("rec", addr, len, 4, 0);
-    if (wb_skip(addr, len, 1)) return;
+// ---------- Write-back on demand ----------
+// Every GPU write into a pool was copied back to guest memory when its submission completed: the device's bytes into a ring, a compare with guest memory, the changed
+// pages written there, and those pages sent to the device again at their next use (a write to guest memory marks them). Donkey Kong Bananza's terrain does that for
+// 630 chunks a frame, a 64-byte indirect draw record and a 15,000-byte index list each, about 10 MB a frame in each direction, and its CPU never reads one of them.
+// nxnative has no such copies (the GPU's memory is the game's: docs/reference/memory.md); with a discrete GPU the answer is to copy only what the CPU asks for.
+//
+// A page that GPU writes keep coming to (LZ_STREAK of them), that has no copy on its way, is not hot and was not written by the CPU since its last upload is handed
+// to the device: the tracker makes it inaccessible (nvn_dirty.c PG_LAZY), and from then on writes to it are not copied back and nothing reads it from guest memory
+// (page_needs). The first CPU access, by the game or the host, faults; the tracker calls lz_fetch, which reads the page back from the device after every submission
+// that skipped a copy into it has reached the queue, and the access goes on with the device's bytes. That page then stays eager for LZ_HOLD frames, doubled each
+// time it happens again (a buffer the CPU does read is tried once in a long while, and costs one wait for the GPU each time).
+// What a submission still being recorded writes is not in a fetch made by the thread recording it: that thread reads guest memory as the submissions before left it,
+// which is what it read before (copies landed at completion). Any other thread waits for that submission to be committed (at most LZ_WAIT_NS).
+// A range written in part into lazy pages is copied back in its other parts only (lz_split). NXRT_VK_WB_LAZY=0 (gamectl set wb_lazy 0 before the first write): off.
+enum { LZ_STREAK = 48, LZ_HOLD = 600, LZ_FAIL_MAX = 5, LZ_RUNS = 128 };
+#define LZ_WAIT_NS 300000000ull
+typedef struct { uint64_t a, n; } lz_run;
+static SRWLOCK g_lz_lk = SRWLOCK_INIT;   // lazy pages come and go under it; a fetch holds it until its pages are in
+static _Atomic uint64_t s_lz_set, s_lz_in, s_lz_skip_b, s_lz_fetch_ns;
+uint64_t vks_cur_seq(void); uint64_t vks_seq_value(uint64_t seq, int *mine);
+static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; VkBuffer buf; vk_alloc mem; uint64_t size; int bad; } g_lzrb;   // the fetch's own command buffer and host buffer (under g_lz_lk)
+static __thread int t_lz_held;
+static int lzrb_ready(uint64_t n) {
+    if (g_lzrb.bad) return 0;
+    if (!g_lzrb.pool) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, g_vk.qfam};
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateCommandPool(g_vk.dev, &pci, NULL, &g_lzrb.pool) != VK_SUCCESS || vkCreateFence(g_vk.dev, &fci, NULL, &g_lzrb.fence) != VK_SUCCESS) { g_lzrb.bad = 1; return 0; }
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_lzrb.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        if (vkAllocateCommandBuffers(g_vk.dev, &ai, &g_lzrb.cb) != VK_SUCCESS) { g_lzrb.bad = 1; return 0; }
+    }
+    if (n <= g_lzrb.size) return 1;
+    if (g_lzrb.buf) { vkDestroyBuffer(g_vk.dev, g_lzrb.buf, NULL); vk_free_mem(&g_lzrb.mem); g_lzrb.buf = VK_NULL_HANDLE; g_lzrb.size = 0; }   // idle: every fetch waits for its copy
+    uint64_t sz = n < (1u << 20) ? (1u << 20) : (n + (1u << 20) - 1) & ~(uint64_t)((1u << 20) - 1);
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    if (vkCreateBuffer(g_vk.dev, &bci, NULL, &g_lzrb.buf) != VK_SUCCESS) { g_lzrb.buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_vk.dev, g_lzrb.buf, &mr);
+    if (vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0, &g_lzrb.mem) &&
+        vk_alloc_mem(&mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0, &g_lzrb.mem)) { vkDestroyBuffer(g_vk.dev, g_lzrb.buf, NULL); g_lzrb.buf = VK_NULL_HANDLE; return 0; }
+    vkBindBufferMemory(g_vk.dev, g_lzrb.buf, g_lzrb.mem.mem, g_lzrb.mem.off); g_lzrb.size = sz;
+    return 1;
+}
+// The pool that has page x (a page's start) as the device's alone. Caller holds g_lk
+static pool_t_ *pool_page(uintptr_t x) {
+    int lo = 0, hi = g_npool - 1, hit = -1;
+    while (lo <= hi) { int m = (lo + hi) / 2; if (g_pool[m]->base <= x) { hit = m; lo = m + 1; } else hi = m - 1; }
+    for (int i = hit; i >= 0 && i > hit - 4; i--) { pool_t_ *q = g_pool[i]; if (x >= q->base && x < q->base + q->size && q->lz && q->lz[(x - q->base) / PAGE]) return q; }
+    for (int i = 0; i < g_npool; i++) { pool_t_ *q = g_pool[i]; if (x >= q->base && x < q->base + q->size && q->lz && q->lz[(x - q->base) / PAGE]) return q; }
+    return NULL;
+}
+// The tracker's fetch: the device's bytes of the lazy pages [a, a+n), valid until lz_done. Any thread, also inside a fault. NULL: not available (the pages come in as guest memory has them)
+static const void *lz_fetch(uintptr_t a, size_t n) {
+    uint64_t t0 = now_ns(), v = 1;
+    for (;;) {   // the last submission that skipped a copy into these pools has to be committed, then handed to the queue
+        AcquireSRWLockExclusive(&g_lz_lk); AcquireSRWLockShared(&g_lk);
+        uint64_t seq = 0; int mine = 0;
+        for (uintptr_t x = a; x < a + n; ) { pool_t_ *q = pool_page(x); if (!q) { x += PAGE; continue; }
+            uint64_t sq = atomic_load(&q->lz_seq); if (sq > seq) seq = sq; x = q->base + q->size; }
+        v = seq ? vks_seq_value(seq, &mine) : 1;
+        if (v || mine || now_ns() - t0 > LZ_WAIT_NS) break;
+        ReleaseSRWLockShared(&g_lk); ReleaseSRWLockExclusive(&g_lz_lk);
+        Sleep(0);
+    }
+    while (v > 1 && atomic_load(&g_vk.tl_submitted) < v && now_ns() - t0 < LZ_WAIT_NS) { vks_flush(); if (atomic_load(&g_vk.tl_submitted) < v) Sleep(0); }
+    int ok = lzrb_ready(n), nc = 0;
+    if (ok) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+        vkResetCommandBuffer(g_lzrb.cb, 0); vkBeginCommandBuffer(g_lzrb.cb, &bi);
+        vk_mem_barrier(g_lzrb.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        for (uintptr_t x = a; x < a + n; ) {
+            pool_t_ *q = pool_page(x);
+            if (!q || !q->bound) { nc = 0; break; }   // a page with no device copy to read: none of it (guest memory stays as it is)
+            uint64_t off = x - q->base, m = q->size - off; if (m > a + n - x) m = a + n - x;
+            for (uint64_t left = m, o = off; left; ) { int k = win_of(q, o); uint64_t end = q->win_lo[k] + q->win_n[k], c = o + left <= end ? left : end - o;
+                VkBufferCopy r = {o - q->win_lo[k], (x - a) + (o - off), c}; vkCmdCopyBuffer(g_lzrb.cb, q->buf[k], g_lzrb.buf, 1, &r); nc++; o += c; left -= c; }
+            x += m;
+        }
+        vk_mem_barrier(g_lzrb.cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+        vkEndCommandBuffer(g_lzrb.cb);
+        if (nc) {
+            VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, g_lzrb.cb, 0};
+            VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 0, NULL, 1, &cbi, 0, NULL};
+            AcquireSRWLockExclusive(&g_vk.qlock); VkResult r = vkQueueSubmit2(g_vk.q, 1, &si, g_lzrb.fence); ReleaseSRWLockExclusive(&g_vk.qlock);
+            ok = r == VK_SUCCESS && vkWaitForFences(g_vk.dev, 1, &g_lzrb.fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+            if (r == VK_SUCCESS && !ok) { VKRED("write-back on demand: the device did not give %#llx+%#llx back in 10 s", (unsigned long long)a, (unsigned long long)n); g_lzrb.bad = 1; }
+            else if (r == VK_SUCCESS) vkResetFences(g_vk.dev, 1, &g_lzrb.fence);
+        } else ok = 0;
+    }
+    ReleaseSRWLockShared(&g_lk);
+    atomic_fetch_add(&s_lz_fetch_ns, now_ns() - t0);
+    if (!ok) { ReleaseSRWLockExclusive(&g_lz_lk); return NULL; }
+    t_lz_held = 1;
+    return g_lzrb.mem.map;
+}
+static void lz_done(uintptr_t a, size_t n, int fetched) {
+    if (!t_lz_held) AcquireSRWLockExclusive(&g_lz_lk);
+    t_lz_held = 0; (void)fetched;
+    AcquireSRWLockShared(&g_lk);
+    uint64_t pages = 0;
+    for (uintptr_t x = a; x < a + n; x += PAGE) { pool_t_ *q = pool_page(x); if (!q) continue;
+        uint64_t pg = (x - q->base) / PAGE; if (!q->lz[pg]) continue;
+        q->lz[pg] = 0; q->lz_n[pg] = 0; if (q->lz_fail[pg] < LZ_FAIL_MAX) q->lz_fail[pg]++;
+        q->lz_hold[pg] = (uint32_t)g_frame + ((uint32_t)LZ_HOLD << q->lz_fail[pg]); q->lz_pages--; pages++; }
+    ReleaseSRWLockShared(&g_lk);
+    ReleaseSRWLockExclusive(&g_lz_lk);
+    atomic_fetch_add(&s_lz_in, pages);
+    static _Atomic int said; if (atomic_fetch_add(&said, 1) < 24)
+        VKLOG("write-back on demand: thread %lu touched %#llx: %llu pages read back from the device (frame %llu); they are copied back after every write again for a while",
+              (unsigned long)GetCurrentThreadId(), (unsigned long long)a, (unsigned long long)pages, (unsigned long long)g_frame);
+}
+static int lz_on(void) { static int v = -1; if (v < 0) { v = vkc_int("wb_lazy", 1); if (v) nvn_dirty_lazy_register(lz_fetch, lz_done); } return v; }
+static int pool_alone(const pool_t_ *p, uintptr_t a, uintptr_t e) {   // no other pool has a device copy of these pages. Caller holds g_lk
+    for (int i = 0; i < g_npool; i++) { const pool_t_ *q = g_pool[i]; if (q != p && a < q->base + q->size && e > q->base) return 0; }
+    return 1;
+}
+// Pages [r0, r1) of p become the device's. Caller holds g_lz_lk and g_lk
+static int lz_make(pool_t_ *p, uint64_t r0, uint64_t r1) {
+    uintptr_t a = p->base + r0 * PAGE; size_t n = (size_t)((r1 - r0) * PAGE);
+    if (!pool_alone(p, a, a + n) || !nvn_dirty_lazy_set(p->span, (const void *)a, n)) return 0;
+    for (uint64_t pg = r0; pg < r1; pg++)   // written between the look and the hand-over: taken back, it goes the usual way
+        if (nvn_dirty_since_span(p->span, (const void *)(p->base + pg * PAGE), PAGE, p->up[pg])) { nvn_dirty_lazy_in((const void *)a, n, 0); return 0; }
+    for (uint64_t pg = r0; pg < r1; pg++) p->lz[pg] = 1;
+    p->lz_pages += r1 - r0; atomic_fetch_add(&s_lz_set, r1 - r0);
+    return 1;
+}
+// The parts of a GPU write [addr, addr+len) that still go back to guest memory: -1 = all of it, as one piece (no page of it is lazy), else their number in runs (0: none).
+// may_set: the write counts towards handing its pages over, and pages that qualify are handed over now. The recording thread only
+static int lz_split(uint64_t addr, uint64_t len, int may_set, lz_run *runs) {
+    if (!lz_on() || !len) return -1;
+    if (may_set) gpu_pending_drain();
+    int nr = -1, any = 0, over = 0; uint64_t back = 0;
+    AcquireSRWLockExclusive(&g_lz_lk); AcquireSRWLockShared(&g_lk);
+    pool_t_ *p = pool_find((uintptr_t)addr, len);
+    if (p && p->span && (p->lz || may_set)) {
+        if (!p->lz) { p->lz = calloc(p->npages, 1); p->lz_n = calloc(p->npages, 1); p->lz_fail = calloc(p->npages, 1); p->lz_hold = calloc(p->npages, sizeof *p->lz_hold);
+            if (!p->lz || !p->lz_n || !p->lz_fail || !p->lz_hold) { free(p->lz); free(p->lz_n); free(p->lz_fail); free(p->lz_hold); p->lz = p->lz_n = p->lz_fail = NULL; p->lz_hold = NULL; } }
+        uint64_t p0 = (addr - p->base) / PAGE, p1 = (addr + len - 1 - p->base) / PAGE + 1;
+        if (p->lz && p1 <= p->npages) {
+            nr = 0;
+            for (uint64_t pg = p0; pg < p1 && !over; ) {
+                if (p->lz[pg]) { pg++; any = 1; continue; }
+                uint64_t r0 = pg; int elig = may_set;
+                for (; pg < p1 && !p->lz[pg]; pg++) {
+                    if (!may_set) continue;
+                    if (p->lz_n[pg] < 255) p->lz_n[pg]++;
+                    if (elig && (p->lz_n[pg] < LZ_STREAK || (uint32_t)g_frame < p->lz_hold[pg] || atomic_load(&p->gpu_pending[pg]) || p->hot[pg] || !p->up[pg] ||
+                                 nvn_dirty_since_span(p->span, (const void *)(p->base + pg * PAGE), PAGE, p->up[pg]))) elig = 0;
+                }
+                if (elig && lz_make(p, r0, pg)) { any = 1; continue; }
+                if (nr == LZ_RUNS) { over = 1; break; }
+                uint64_t lo = p->base + r0 * PAGE, hi = p->base + pg * PAGE; if (lo < addr) lo = addr; if (hi > addr + len) hi = addr + len;
+                runs[nr].a = lo; runs[nr].n = hi - lo; back += hi - lo; nr++;
+            }
+            if (!any || over) nr = -1;
+            else { uint64_t sq = vks_cur_seq(); if (sq) atomic_store(&p->lz_seq, sq); atomic_fetch_add(&s_lz_skip_b, len - back); }
+        }
+    }
+    ReleaseSRWLockShared(&g_lk); ReleaseSRWLockExclusive(&g_lz_lk);
+    if (over) nvn_dirty_lazy_in((const void *)(uintptr_t)addr, (size_t)len, 1);   // in too many pieces: all of it eager again
+    return nr;
+}
+
+static void gpu_wrote_(uint64_t addr, uint64_t len) {
     VkBuffer pb; VkDeviceSize po;
     VkCommandBuffer cb = vks_cb();
     if (!cb || !len || !vkm_addr(addr, len, &pb, &po)) return;
@@ -780,11 +952,19 @@ void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
     gpu_pending_drain(); gpu_pending(addr, len, 1);
     vks_post_fn(wb_land, w);
 }
+static void gpu_wrote_runs(uint64_t addr, uint64_t len, int nr, const lz_run *rs) { if (nr < 0) gpu_wrote_(addr, len); else for (int i = 0; i < nr; i++) gpu_wrote_(rs[i].a, rs[i].n); }
+void vkm_gpu_wrote(uint64_t addr, uint64_t len) {
+    if (wb_off()) return;
+    wblog("rec", addr, len, 4, 0);
+    if (wb_skip(addr, len, 1)) return;
+    lz_run rs[LZ_RUNS]; gpu_wrote_runs(addr, len, lz_split(addr, len, 1, rs), rs);
+}
 // A dispatch's range before the shader runs: returns the ring offset + 1, 0 when it is not kept (vkm_gpu_wrote_base falls back to the whole range)
 uint64_t vkm_wb_base(uint64_t addr, uint64_t len) {
     VkBuffer pb; VkDeviceSize po; uint64_t at;
     VkCommandBuffer cb = vks_cb();
     if (wb_off() || wb_skip(addr, len, 0)) return 0;
+    { lz_run rs[LZ_RUNS]; if (!lz_split(addr, len, 0, rs)) return 0; }   // every page of it is the device's: nothing will be copied back
     if (vkc_int("wb_whole", 0) || !cb || !len || !vkm_addr(addr, len, &pb, &po) || !wr_take((len + 15) & ~15ull, &at)) return 0;
     VkBufferCopy c = {po, at, len}; vkCmdCopyBuffer(cb, pb, g_wr, 1, &c);
     return at + 1;
@@ -793,22 +973,37 @@ void vkm_gpu_wrote_base(uint64_t addr, uint64_t len, uint64_t base) {
     if (wb_off()) return;
     wblog("rec", addr, len, 3, 0);
     if (wb_skip(addr, len, 1)) return;
+    lz_run rs[LZ_RUNS]; int nr = lz_split(addr, len, 1, rs);
+    if (!nr) return;
     VkBuffer pb; VkDeviceSize po; uint64_t at;
     VkCommandBuffer cb = vks_cb();
-    if (!base || !cb || !vkm_addr(addr, len, &pb, &po) || !wr_take((len + 15) & ~15ull, &at)) { vkm_gpu_wrote(addr, len); return; }
-    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->kind = 3; w->base_at = base - 1; w->after_at = at; w->ring_end = g_wr_end();
+    if (!base || !cb || !vkm_addr(addr, len, &pb, &po) || !wr_take((len + 15) & ~15ull, &at)) { gpu_wrote_runs(addr, len, nr, rs); return; }
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferCopy c = {po, at, len}; vkCmdCopyBuffer(cb, pb, g_wr, 1, &c);
     vk_mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-    gpu_pending_drain(); gpu_pending(addr, len, 1);
-    vks_post_fn(wb_land, w);
+    gpu_pending_drain();
+    if (nr < 0) { rs[0].a = addr; rs[0].n = len; nr = 1; }
+    for (int i = 0; i < nr; i++) {   // the parts that are not the device's alone, each from the same two copies
+        wb_t *w = calloc(1, sizeof *w); w->addr = rs[i].a; w->len = rs[i].n; w->kind = 3; w->base_at = base - 1 + (rs[i].a - addr); w->after_at = at + (rs[i].a - addr); w->ring_end = g_wr_end();
+        gpu_pending(w->addr, w->len, 1);
+        vks_post_fn(wb_land, w);
+    }
 }
 // Writes whose bytes the CPU knows (inline uniform updates, fills): the GPU writes the mirror in order, guest memory gets the same bytes at completion
 void vkm_cpu_also(uint64_t addr, uint64_t len, const void *data, int fill, uint32_t value) {
-    wb_t *w = calloc(1, sizeof *w); w->addr = addr; w->len = len; w->kind = fill ? 2 : 1; w->fill = value;
-    if (!fill) { uint8_t *c = malloc((size_t)len); memcpy(c, data, (size_t)len); w->cpu = c; }
-    gpu_pending_drain(); gpu_pending(addr, len, 1);
-    vks_post_fn(wb_land, w);
+    lz_run rs[LZ_RUNS]; int nr = lz_split(addr, len, 0, rs);
+    if (nr < 0) { rs[0].a = addr; rs[0].n = len; nr = 1; }
+    gpu_pending_drain();
+    for (int i = 0; i < nr; i++) {
+        unsigned ph = (unsigned)((rs[i].a - addr) & 3) * 8;
+        wb_t *w = calloc(1, sizeof *w); w->addr = rs[i].a; w->len = rs[i].n; w->kind = fill ? 2 : 1; w->fill = ph ? value >> ph | value << (32 - ph) : value;
+        if (!fill) { uint8_t *c = malloc((size_t)w->len); memcpy(c, (const uint8_t *)data + (rs[i].a - addr), (size_t)w->len); w->cpu = c; }
+        gpu_pending(w->addr, w->len, 1);
+        vks_post_fn(wb_land, w);
+    }
+}
+void vkm_lazy_stats(uint64_t *pages, uint64_t *set, uint64_t *in, uint64_t *skip_bytes, uint64_t *fetch_ns) {
+    *pages = nvn_dirty_lazy_pages(); *set = atomic_load(&s_lz_set); *in = atomic_load(&s_lz_in); *skip_bytes = atomic_load(&s_lz_skip_b); *fetch_ns = atomic_load(&s_lz_fetch_ns);
 }
 
 // ---------- The memory pool table: raw global memory ----------
@@ -942,6 +1137,10 @@ void vkm_frame_tick(uint64_t frame) {
           (unsigned long long)s.staging_waits, usage / 1048576.0, budget / 1048576.0, secs > 0 ? "" : "");
     if (g_use_ph > 0) { static uint64_t pc, pp, pf, pcy; VKLOG("pending counts up to frame %llu, per frame: %.1f calls, %.0f pages, %.0f first (a page copied for its shadow), %.0f kcycles", (unsigned long long)frame, (double)(s_gp_calls - pc) / df, (double)(s_gp_pages - pp) / df, (double)(s_gp_first - pf) / df, (double)(s_gp_cyc - pcy) / df / 1000.0);
       pc = s_gp_calls; pp = s_gp_pages; pf = s_gp_first; pcy = s_gp_cyc; }
+    { static uint64_t pset, pin, pskip, pns; uint64_t pages, set, in, skip, ns; vkm_lazy_stats(&pages, &set, &in, &skip, &ns);
+      if (set) VKLOG("write-back on demand up to frame %llu: %llu pages are the device's; per frame: %.1f KB not copied back, %.2f pages handed over, %.2f read back for the CPU (%.3f ms waiting)",
+                     (unsigned long long)frame, (unsigned long long)pages, (skip - pskip) / 1024.0 / df, (double)(set - pset) / df, (double)(in - pin) / df, (ns - pns) / 1e6 / df);
+      pset = set; pin = in; pskip = skip; pns = ns; }
     prev = s; prev_frame = frame; t_prev = now;
     { pool_t_ *top[4] = {0}; AcquireSRWLockShared(&g_lk);
       for (int i = 0; i < g_npool; i++) { pool_t_ *q = g_pool[i]; for (int k = 0; k < 4; k++) if (!top[k] || q->up_b > top[k]->up_b) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = q; break; } }
