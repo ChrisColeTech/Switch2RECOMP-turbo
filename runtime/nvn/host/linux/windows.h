@@ -149,6 +149,20 @@ static inline BOOL CloseHandle(HANDLE o){ swr_wh* h=(swr_wh*)o; if(!h || o==INVA
 static inline void ExitProcess(UINT c){ _exit((int)c); }
 
 /* fiber-local storage: pthread keys */
+/* Fibers (hle_nvn.c: submissions parked at a GPU event wait), on ucontext: a fiber is a context with a stack of its own, switched to on the
+   same thread. The thread's own context is the one ConvertThreadToFiber names. Only C code that keeps no thread state across a switch runs on them */
+typedef struct swr_fiber { ucontext_t uc; void (*fn)(void *); void *arg; } swr_fiber;
+static __thread swr_fiber *swr_fiber_cur;
+static inline void *ConvertThreadToFiber(void *p){ (void)p; swr_fiber *f = (swr_fiber *)calloc(1, sizeof *f); swr_fiber_cur = f; return f; }
+static void swr_fiber_start(unsigned lo, unsigned hi){ swr_fiber *f = (swr_fiber *)(((uintptr_t)hi << 32) | lo); f->fn(f->arg); for(;;) pause(); }   /* a fiber's function never returns */
+static inline void *CreateFiberEx(size_t commit, size_t reserve, DWORD flags, void (*fn)(void *), void *arg){
+  (void)commit; (void)flags; swr_fiber *f = (swr_fiber *)calloc(1, sizeof *f); if(!f) return NULL;
+  void *st = mmap(NULL, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+  if(st == MAP_FAILED || getcontext(&f->uc)){ free(f); return NULL; }
+  f->fn = fn; f->arg = arg; f->uc.uc_stack.ss_sp = st; f->uc.uc_stack.ss_size = reserve; f->uc.uc_link = NULL;
+  makecontext(&f->uc, (void (*)(void))swr_fiber_start, 2, (unsigned)(uintptr_t)f, (unsigned)((uintptr_t)f >> 32));
+  return f; }
+static inline void SwitchToFiber(void *to){ swr_fiber *from = swr_fiber_cur; swr_fiber_cur = (swr_fiber *)to; swapcontext(&from->uc, &((swr_fiber *)to)->uc); }
 typedef void (*PFLS_CALLBACK_FUNCTION)(PVOID);
 static inline DWORD FlsAlloc(PFLS_CALLBACK_FUNCTION f){ pthread_key_t k; if(pthread_key_create(&k,f)) return 0xFFFFFFFFu; return (DWORD)k; }
 static inline PVOID FlsGetValue(DWORD k){ return pthread_getspecific((pthread_key_t)k); }

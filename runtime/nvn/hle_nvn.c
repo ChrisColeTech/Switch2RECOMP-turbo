@@ -1316,7 +1316,7 @@ static int aq_busy(void) { return aq_on() && atomic_load(&g_aq_done) < g_aq_tail
 // wait no recorded signal meets, what is recorded so far is committed and the fiber is left (nvn_aq_park, called by the replay); the thread goes on with the next
 // queued submission of another queue and comes back when a signal that meets the wait has been recorded, or after the wait's time limit. A submission of the same
 // queue, or a present, never overtakes a parked one: the parked one is resumed first. Fibers on Windows, ucontext on Linux (host/linux/windows.h); NXRT_AQ_PARK=0: waits are waited out in place, as before
-#if defined(_WIN32) && defined(NXRT_GFX_VK)
+#if (defined(_WIN32) || defined(__linux__)) && defined(NXRT_GFX_VK)
 #define AQ_PARK 1
 int vkr_event_ready(volatile uint32_t *val, uint32_t mode, uint32_t v);
 int nvn_sub_resuming;   // gfx_sub_begin is the rest of a parked submission (vk_replay.c vkr_sub_begin keeps the queue's render condition)
