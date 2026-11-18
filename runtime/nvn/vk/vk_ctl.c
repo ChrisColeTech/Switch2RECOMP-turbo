@@ -160,13 +160,19 @@ static void command(char *line, char *o, size_t cap) {
     else if (!strcmp(c, "quit")) { g_quit = 1; R("quitting\n"); }
     else R("unknown command: %s\n", c);
 }
+#ifdef _WIN32
+static unsigned long ctl_pid(void) { return GetCurrentProcessId(); }
+#else
+#include <unistd.h>
+static unsigned long ctl_pid(void) { return (unsigned long)getpid(); }   // host/linux/windows.h has no GetCurrentProcessId
+#endif
 static unsigned __stdcall ctl_main(void *arg) {
     (void)arg;
     static char in[4096], out[256 * 1024];
     for (;;) {
         // This game's own pipe, \\.\pipe\swr_ctl_<pid>. The one shared name went to whichever game started first, so with two games running a command meant for
         // one reached the other (a texdump asked of Ocarina of Time was taken by a Mario Kart 8 Deluxe). tools/plza_probe.py names its game's process.
-        static char name[64]; if (!name[0]) snprintf(name, sizeof name, "\\\\.\\pipe\\swr_ctl_%lu", (unsigned long)GetCurrentProcessId());
+        static char name[64]; if (!name[0]) snprintf(name, sizeof name, "\\\\.\\pipe\\swr_ctl_%lu", (unsigned long)ctl_pid());
         HANDLE p = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, sizeof out, sizeof in, 0, NULL);
         if (p == INVALID_HANDLE_VALUE) { VKLOG("control pipe: %s not available", name); return 0; }
         if (ConnectNamedPipe(p, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {

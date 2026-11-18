@@ -214,6 +214,9 @@ Tests: `python -m unittest discover -s tests -p "test_n*.py"` (17), `tests/test_
 
 ## 5. Hand-off: done, remaining, next steps, quick wins, hunches
 
+**The current hand-off is in section 8 ("Hand-off (2026-11-18)"): Ocarina of Time is not playable past its opening, and a new
+investigation is needed. What follows is the first round's.**
+
 ### Done (on `turbo`, engine CI green; launcher release v0.2.0)
 
 - DKB: terrain shaded (append counters reset per frame, one instance), size-0 storage buffers addressable, tutorial
@@ -683,7 +686,7 @@ The mixed output is measured in the log (`audio: output, last 5 s: RMS ..., peak
 |---|---|---|---|
 | the owner's build (`-002104-oot-baseline-launcher`, `-004218-oot-host1`) | RMS 0 | RMS 0, but for 5 s of the menu's confirm sound (0.052) | - |
 | libopus, voices straight to stereo (`-010105-oot-play1`) | - | 0.009 to 0.22, peak 1.24 (clipping) | - |
-| libopus and the mixes (`-010727-oot-stall3`, `-013422-oot-queue1`) | 0.007 / 0.025 to 0.036 / 0.046 (left / right) | 0.025 to 0.17, peak 0.99 | 0.026 to 0.028 |
+| libopus and the mixes (`-010727-oot-stall3`, `-013723-oot-queue1`) | 0.007 / 0.025 to 0.036 / 0.046 (left / right) | 0.025 to 0.17, peak 0.99 | 0.026 to 0.028 |
 
 ### Mixes and splitters (every Switch 2 game)
 
@@ -735,19 +738,69 @@ After the opening the game goes into its first scene (the Great Deku Tree's holl
 it pipelines compiled at first use (the second visit: 11.6 s, 0.3 s of pipelines); 330 shaders were translated live in the minute before,
 two failed (`Ampere instruction 243 ... is not implemented`). Then:
 
-- **The picture is black** (`-011734-oot-play2/0006`, `-013422-oot-queue1/0004`), with the scene's sound playing.
+- **The picture is black** (`-011734-oot-play2/0006`, `-013723-oot-queue1/0004`), with the scene's sound playing.
 - **1 to 5 frames a second.** The translation thread is idle 99.3 % of the time there (`SWR_HOST_PROF`, `prof1-hostprof.txt`: 0.47 s of CPU
   in 25 s, the rest in `aq_main`'s wait), the game's thread in `nvnSyncWait` -> `aq_wait_seq` (`-010727-oot-stall3/stall-1-stacks.txt`).
   Read: a submission of one queue is parked at an event wait and done ops are published in order, so the thread waits for the parked one
   (250 ms, its limit) instead of its own queue's work. A per-queue fence (`nvnQueueFenceSync` holding its queue's last op) was tried and
-  did not change the rate (76 frames in 90 s, `-013422-oot-queue1`); it is not in the tree. nxnative's rule is in nvn-objects.md "GPU event
+  did not change the rate (76 frames in 90 s, `-013723-oot-queue1`); it is not in the tree. nxnative's rule is in nvn-objects.md "GPU event
   waits order work across queues": an unmet wait parks its queue only, with no time limit, and CPU signals publish.
-- **It stops** after about 80 frames of the scene (`-013422-oot-queue1`: frame 11627 at 314 s, nothing until the run's end at 445 s).
+- **It stops** after about 80 frames of the scene (`-013723-oot-queue1`: frame 11627 at 314 s, nothing until the run's end at 445 s).
 - The log there: `kind tex_pool is not replayed yet (bound as empty)`, `render target ... cannot be a colour attachment here (its content
   comes from its storage)`, 90 MB of write-back a frame, mesh draws (`task shader a5288d0a6c4971fd`).
 
 So the owner's third point stands in part: the game now runs through the title and the whole opening with picture and sound, and what
 comes after is not playable. That is the renderer work `NXNATIVE_GAP_ANALYSIS.md` ranks first now.
+
+### Hand-off (2026-11-18): Ocarina of Time is NOT playable; a new investigation is needed
+
+**State in one line: nothing after the opening movie is verified, because nothing after it works.** This round fixed what stood between
+the boot and the end of the opening (picture, speed, sound) and the window mode. The owner's third point, "it does not get into the
+game", is unresolved: after the opening the screen is black, the game runs at 1 to 5 frames a second and stops. No frame of gameplay
+(a new file, Link's house, Kokiri Forest) has been seen on this engine. The work is not done until gameplay is on screen, controlled
+through the harness, and at the frame rate goal (60 FPS in play; nxnative holds 59 to 60 there). Do not report this game as working from
+the title or the movies again: that is what went wrong in the rounds before.
+
+Done and verified (launched the launcher's way, fullscreen, `-004218-oot-host1`; sound by the log's output level):
+
+- title movie and opening movie on screen, 60.0 FPS, the opening's 9,254 pictures in 155 s;
+- title music and the opening's sound (RMS 0.01 to 0.17, no clipping with the mixes);
+- F11 / Alt+Enter kept across starts, both ways;
+- the stop minutes into the movie (present ticket race);
+- DKB, MKW, PLZA not worse (table below); DKB and MKW now mix through their mixes.
+
+Not done, in the order to take it:
+
+1. **The first scene is black.** Nothing is known about why yet: no pass dump of a scene frame exists (the two tries, `-012538-oot-prof1`,
+   gave nothing: `ctl passdump` / `texdump` were sent while frames took seconds and the run ended first). First step: a run with
+   `NXRT_VK_PASSDUMP=<present>` / `NXRT_VK_TEXDUMP=<present>` set from the start for a present number inside the scene (the scene starts
+   about 11,470 presents in, when A is pressed 50 s after the start; the log's `[nvn] N presents` lines give the count), then read which
+   pass first holds nothing. Suspects from the log: `kind tex_pool is not replayed yet (bound as empty)` and `samp_pool` on the scene's
+   shaders (bindless texture pools: every material texture), `render target ser=... cannot be a colour attachment here (its content comes
+   from its storage)`, the two shaders the translator refuses (`Ampere instruction 243`), raw global memory (`gmem_map` on most of the
+   scene's shaders; nxnative: "foliage: 2,241 shaders with raw loads").
+2. **1 to 5 frames a second with an idle translation thread.** The game's thread sits in `nvnSyncWait` -> `aq_wait_seq`
+   (`-010727-oot-stall3/stall-1-stacks.txt`), the translation thread in `aq_main`'s 1 ms wait with a submission parked at an event wait
+   (`prof1-hostprof.txt`). The per-queue fence was tried alone and did not help; the next thing to try is nxnative's whole rule (an unmet
+   wait parks its queue with no time limit, other queues go on, CPU signals publish) and to log, per parked wait, the event, who signals
+   it and how long it waited. `NXRT_AQ_PARK=0` and `NXRT_VK_WAIT_EVENT=0` are the two switches to compare with first: one run each.
+3. **The stop** about 80 frames into the scene (`-013723-oot-queue1`, frame 11627): take `--stacks` there.
+4. The first visit's 106 s frame (73 s of pipelines at first use): the pipeline manifest only helps the second visit.
+5. The movie network's real kernels (picture quality only).
+6. Where the opening's voices really go (splitters 13 to 17 with no destination).
+7. Mario Kart 8 Deluxe was not rerun in this round.
+
+Quick wins for the next agent:
+
+- One run to the scene costs 4.5 minutes (50 s to the title, A, 155 s of movie that cannot be skipped). A save made on nxnative or by a
+  finished run would skip it; there is none yet (`_data/save/user` holds only `account.sav`). Until then: one run, several questions
+  (`--env NXRT_VK_PASSDUMP=... --env NXRT_VK_TEXDUMP=... --stacks --metrics` together).
+- The harness calls a first-visit pipeline frame a stall and its queued actions time out; give scene runs `--seconds 800` or more and
+  read `slow frame` lines before believing a stall.
+- `frames.csv`'s columns are cumulative: subtract the row before. In the scene the per-frame deltas were 90 MB of write-back and 1.5 s
+  of `cpu_ns` against a 0.8 s frame.
+- Two games at once share `P:` and the GPU; the control pipe is per process now, the frame rates are not comparable while another
+  agent's game runs.
 
 ### Regression checks of this round
 
@@ -761,7 +814,7 @@ the same time on the same GPU. **Mario Kart 8 Deluxe was not rerun**: its librar
 | Donkey Kong Bananza | `-015750-dkb-oot` | title, Continue, walk, punch, walk: 0 or 1 black cells of 64 in each of 7 screenshots; 55.2 FPS over 100 to 150 s, present interval p50 16.7 / p95 21.3 / p99 26.0 ms, one stop of 1.4 s (57.0 FPS, 16.7 / 21.2 / 26.5 ms in section 7) | mix routing now; 27 of 28 five-second windows with sound, RMS up to 0.046 |
 | Mario Kart World | `-020026-mkw-oot` | to a race, two drives: 0 black cells in 12 screenshots; 58.4 FPS over 150 to 185 s, p50 16.67 / p95 17.36 / p99 28.27 ms, 7 intervals over 50 ms (58.2 FPS, 16.67 / 17.52 / 31.75 ms, 6) | mix routing now; 36 of 36 windows with sound, RMS up to 0.042 |
 | Pokemon Legends Z-A | `-020336-plza-oot` | title, the station, two walks: 0 black cells after the boot screenshot; 30.0 FPS, p50 33.3 / p95 34.0 / p99 34.6 ms, longest 42.5 ms (as section 7) | AudioOut, unchanged; 15 of 15 windows with sound |
-| Ocarina of Time | `-004218-oot-host1` (the launcher's way, fullscreen), `-013422-oot-queue1` | title and both movies on screen at 60 FPS with sound; then the first scene: black (above) | above |
+| Ocarina of Time | `-004218-oot-host1` (the launcher's way, fullscreen), `-013723-oot-queue1` | title and both movies on screen at 60 FPS with sound; then the first scene: black (above) | above |
 
 Not listened to: the levels say there is sound and that it does not clip (peaks under 1 with the mixes), not that the mix is the console's.
 
