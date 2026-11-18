@@ -522,6 +522,15 @@ def copy_nxshader(outdir, say):
     if copied: say('Vulkan shader translator: %d files copied' % copied)
 
 
+def output_name(title):
+    """the name of the executable, the code module and the data folder: ASCII letters, digits, '-', '_' and spaces.
+    Accented letters lose their accent (Pokémon -> Pokemon): the runtime and the shader tools pass these paths
+    between programs as bytes, and a name outside ASCII does not survive that on every system"""
+    import unicodedata
+    plain = unicodedata.normalize('NFKD', title)
+    return ''.join(ch for ch in plain if ch.isascii() and (ch.isalnum() or ch in '-_ ')).strip() or 'Game'
+
+
 def check_writable(*paths):
     # a running game locks its exe and dll: say so before spending minutes compiling
     for p in paths:
@@ -613,7 +622,7 @@ def main():
     src_name = os.path.basename(os.path.normpath(a.input))
     if os.path.isfile(a.input): src_name = os.path.splitext(src_name)[0]
     title = a.out or (info['name'] if info['name'] not in ('Application', '') else None) or src_name
-    title = ''.join(ch for ch in title if ch.isalnum() or ch in '-_ ').strip() or 'Game'
+    title = output_name(title)
     outdir = os.path.abspath(a.outdir or os.getcwd())
     os.makedirs(outdir, exist_ok=True)
     base = os.path.join(outdir, title)

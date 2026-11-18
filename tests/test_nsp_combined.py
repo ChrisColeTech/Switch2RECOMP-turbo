@@ -180,7 +180,7 @@ class CombinedTest(unittest.TestCase):
         self.keys.write_text('header_key = %s\ntitlekek_02 = %s\nkey_area_key_application_02 = %s\n' % (
             HEADER_KEY.hex(), TITLEKEK.hex(), AREA_KEK.hex()))
         self.fixture = Fixture()
-        self.package = self.root / 'Game [v262144] (1G+1U+1D).nsp'
+        self.package = self.root / 'Gam\u00e9 [v262144] (1G+1U+1D).nsp'
 
     def tearDown(self): self.tmp.cleanup()
 
@@ -267,6 +267,11 @@ class CombinedTest(unittest.TestCase):
         self.assertTrue(any('1.2.3 (v262144)' in line for line in said), said)
         self.assertTrue(any(line.startswith('DLC:') and '%016x' % (GAME + 0x1001) in line for line in said), said)
 
+    def test_output_name_is_ascii(self):
+        self.assertEqual(switchrecomp.output_name('Pokémon Legends - Arceus (1G+1U)'), 'Pokemon Legends - Arceus 1G1U')
+        self.assertEqual(switchrecomp.output_name('Game v1.0 [0100]'), 'Game v10 0100')
+        self.assertEqual(switchrecomp.output_name('ゼルダ'), 'Game')
+
     def runtime(self, parts, expected):
         target_win = sys.platform == 'win32'
         cc = os.environ.get('CC') or switchrecomp.find_cc(None, target_win)
@@ -279,12 +284,12 @@ class CombinedTest(unittest.TestCase):
         command = [cc, '-O1', '-g', '-w', '-I', str(ROOT / 'runtime'), str(ROOT / 'tests' / 'test_nsp_runtime.c'),
                    str(ROOT / 'runtime' / 'nsp.c'), '-o', str(exe)]
         if not target_win: command[1:1] = ['-fsanitize=address,undefined']
-        built = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        env = dict(os.environ, PATH=os.path.dirname(cc) + os.pathsep + os.environ.get('PATH', ''))
+        built = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         if built.returncode and not target_win:       # a compiler without the sanitizer runtimes
             command = [part for part in command if not part.startswith('-fsanitize')]
-            built = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            built = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         self.assertEqual(built.returncode, 0, built.stdout)
-        env = dict(os.environ, PATH=os.path.dirname(cc) + os.pathsep + os.environ.get('PATH', ''))
         env.pop('SWR_PROD_KEYS', None)
         return lambda mode, **more: subprocess.run([str(exe), str(marker), str(image), mode], stdout=subprocess.PIPE,
                                                    stderr=subprocess.STDOUT, text=True, env=dict(env, **more))

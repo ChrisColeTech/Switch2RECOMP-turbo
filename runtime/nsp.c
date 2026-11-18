@@ -10,6 +10,24 @@
 #include "rt.h"
 #include <errno.h>
 #include <ctype.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+/* the marker is UTF-8 (the build writes it), the runtime's own paths are in the ANSI code page: a package or keys
+   path with other characters opens through the wide API. *size gets the file size */
+static FILE* open_utf8(const char* path,u64* size){
+  FILE* f=NULL;
+#if defined(_WIN32)
+  wchar_t w[2048];
+  if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,w,2048)>0) f=_wfopen(w,L"rb");
+  if(!f) f=fopen(path,"rb");
+  if(f && size){ _fseeki64(f,0,SEEK_END); *size=(u64)_ftelli64(f); _fseeki64(f,0,SEEK_SET); }
+#else
+  f=fopen(path,"rb");
+  if(f && size){ fseeko(f,0,SEEK_END); *size=(u64)ftello(f); fseeko(f,0,SEEK_SET); }
+#endif
+  return f; }
 #if defined(__x86_64__) && defined(__GNUC__) && !defined(__TINYC__)
 #include <immintrin.h>
 #define NSP_AESNI 1
@@ -117,7 +135,7 @@ static int hex(const char* s,u8* out,size_t n){
 
 /* the 16-byte key `name` of a prod.keys file */
 static int key_from_file(const char* path,const char* name,u8 key[16]){
-  FILE* f=fopen(path,"rb"); if(!f) return -1;
+  FILE* f=open_utf8(path,NULL); if(!f) return -1;
   char row[1024]; size_t nl=strlen(name); int found=-1;
   while(fgets(row,sizeof row,f)){ char* p=row; while(*p==' '||*p=='\t') p++;
     if(strncmp(p,name,nl)) continue; p+=nl; while(*p==' '||*p=='\t') p++;
@@ -227,10 +245,10 @@ Nsp* nsp_open_marker(const char* marker){
   FILE* m=fopen(marker,"rb"); char magic[16],path[2048],row[4096],keys[2048]="",*end; Nsp* n=NULL; int ok=0;
   if(!m) return NULL;
   if(!line(m,magic,sizeof magic)||(strcmp(magic,"SWRNSP1")&&strcmp(magic,"SWRNSP2"))||!line(m,path,sizeof path)) goto done;
-  u64 total=plat_file_size(path);
+  u64 total=0;
   n=calloc(1,sizeof *n); if(!n) goto done;
   snprintf(n->path,sizeof n->path,"%s",path);
-  n->file=fopen(path,"rb");
+  n->file=open_utf8(path,&total);
   if(!n->file){ WARN("RomFS: the package %s is missing (moved or on a disconnected drive)\n",path); goto done; }
   if(!strcmp(magic,"SWRNSP1")){ char off[32],size[32];
     if(!line(m,off,sizeof off)||!line(m,size,sizeof size)) goto done;
