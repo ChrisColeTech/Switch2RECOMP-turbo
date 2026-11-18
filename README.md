@@ -20,6 +20,19 @@ It is a recompiler, not an emulator: the game's code is translated once, ahead o
 
 60 FPS is the goal, not yet a guarantee. Measured numbers are in the [technical details](docs/TECHNICAL.md#measured-performance).
 
+## What's different in Turbo
+
+- **Build straight from your dump.** NUP and NSP packages work directly; no unpacking, and the game data stays in the
+  original file.
+- **DLC support.** Install add-on content from NSP, NSZ, XCI, XCZ and NCA files.
+- **Native graphics.** Switch graphics run on Vulkan, with a shader cache so games get smoother the more you play.
+- **Video and sound.** In-game movies (VP9 and AV1) and Opus audio play, which several games need to get past their
+  intros.
+- **PlayStation controllers on Windows.** DualSense and DualShock 4 work, with player lights and rumble.
+- **Built-in diagnostics.** Each game logs its frame rate, so problems can be measured instead of guessed at.
+
+The full list is in the [technical details](docs/TECHNICAL.md#what-turbo-adds).
+
 ## How to use it
 
 The easiest way is **RecompLauncher**, a desktop game library built on this engine: add your dump, click Build,
