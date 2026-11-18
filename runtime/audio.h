@@ -10,6 +10,7 @@ int swr_audio_read_pcm16(u64 address,unsigned frames,unsigned channels,float vol
 void swr_audio_begin_update(SvcObj* o,unsigned blocks);
 void swr_audio_configure_effects(SvcObj* o,const u8* effects,u32 count,u32 stride);
 void swr_audio_destroy(SvcObj* o);
+void swr_audio_update_routing(SvcObj* o,const u8* splitters,u32 splitters_size,const u8* mixes,u32 mixes_size);
 int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,
   const u8* resources,u32 resources_size,const u8* mixes,u32 mixes_size,
   const u8* sinks,u32 sinks_size,u8* status,float* stereo);

@@ -1420,7 +1420,11 @@ static uint64_t aq_push(const aop_t *op) {   // queues op (waiting while the que
     while (g_aq_tail - atomic_load(&g_aq_head) >= AQ_N - 1 || (op->kind == 2 && g_aq_npres >= AQ_PRESENTS)) pthread_cond_wait(&g_aq_done_cv, &g_aq_mu);
     dm_host_work--;
     uint64_t seq = ++g_aq_tail; g_aq[seq % AQ_N] = *op; g_aq[seq % AQ_N].seq = seq;
-    if (op->kind == 2) g_aq_npres++;
+    if (op->kind == 2) { g_aq_npres++;
+        // The window's ticket of this present, while the translation thread cannot have taken the op yet (it takes it under this mutex). Written by the caller after
+        // the push, it could land after the translation thread had put the present's real ticket there: the next acquire of that texture then waited for a present
+        // numbered by the queued marker, for ever. Seen once the frames got cheap (Ocarina of Time's movies at 60 FPS: a stop a few minutes in, nothing waiting on the GPU)
+        if (op->idx >= 0 && op->idx < 4) op->w->ticket[op->idx] = AQ_SEQ | seq; }
     pthread_cond_signal(&g_aq_cv);
     pthread_mutex_unlock(&g_aq_mu);
     return seq;
@@ -1662,7 +1666,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         nvn_cap_present(t, crop);
         if (aq_on()) {
             aop_t op = {2}; op.w = o; op.idx = idx; op.t = t; memcpy(op.crop, crop, sizeof op.crop); op.period = present_period(o) / 1e9;
-            gfx_leave(); o->ticket[idx] = AQ_SEQ | aq_push(&op); gfx_enter();   // queued: the gate is the translation thread's to pass
+            gfx_leave(); aq_push(&op); gfx_enter();   // queued: the gate is the translation thread's to pass
         } else o->ticket[idx] = gfx_present(t, present_period(o) / 1e9, crop);
     }
     gfx_leave();
