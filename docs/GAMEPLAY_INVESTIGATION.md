@@ -11,10 +11,10 @@ do not load (black screens, black gaps); MKW plays at about 30 FPS instead of 60
 | Donkey Kong Bananza | gameplay reached, terrain black | terrain shaded by the game's own mechanism (section 6), queues interleaved at their event waits, 48.7 FPS in the tunnel | 60 FPS: the per-chunk write-backs (section 6) |
 | Mario Kart World | race at 44-51 FPS | race at 58.6 FPS mean | texture streaming bursts (single frames of 60-170 ms) |
 | Pokemon Legends Z-A | title -> Language -> Appearance | in the world, lit, characters skinned, walking; 30 FPS (the game's interval) | 32x32 cube placeholders viewed as arrays |
-| Ocarina of Time | did not start (svcBreak 1.6 s in) | title screen and menu; its AV1 movies are decoded (dav1d, `AV1_DECODER.md`) and reach the game's textures | the movie network (`nn::ndve`) between those textures and the screen does not compute yet, so the movies still show black; the game itself not reached yet |
+| Ocarina of Time | did not start (svcBreak 1.6 s in) | title and opening movies on screen at 60 FPS with their sound (section 8: push constants, the movie network by the host, libopus) | the game itself after the opening: black, 1 to 5 frames a second, then it stops (section 8, "Open: the game itself") |
 
 Sections 1 to 5 are the first round as it was written; section 6 is the second round, which found the causes sections 1
-and 3 left open. The AV1 decoder that section 6 left open for Ocarina of Time is in `AV1_DECODER.md`.
+and 3 left open; section 8 (2026-11-18) is Ocarina of Time as the owner starts it, and the window mode. The AV1 decoder that section 6 left open for Ocarina of Time is in `AV1_DECODER.md`.
 
 Display: console session, 60 Hz, Vulkan on an RTX 5090. All numbers are from the real library builds, rebuilt through
 the engine CLI into each entry's `buildDir`, driven by `tools/plza_probe.py` (pad replay, runtime screenshots).
@@ -618,6 +618,166 @@ Run folders of this round: `build/evidence/gaps/plza-investigation/` of the main
 | metrics columns `wb_lazy_pages`, `wb_lazy_in`, `wb_lazy_skip_kb` | pages the device alone holds; pages read back for the CPU and KB not copied back, per second |
 | log lines `render sizes up to frame`, `write-back on demand up to frame`, `a wait for fence ... ran out` | the sizes a game draws at; the lazy pages; a GPU wait of 100 ms or more that ran out |
 | `tools/play_scenario.py <game> --game <buildDir> [--option k=v]`, `tools/plza_probe.py start --option k=v` | the scripted runs; an ini option for one run |
+
+## 8. Fourth round (2026-11-18): Ocarina of Time as the owner starts it, window mode
+
+Owner's report after release 0.4.0: Ocarina of Time's screens are still black and no video shows, there is no sound, it does not get past
+the intro title; and the window mode chosen with F11 is forgotten at the next start. The rounds before had called the same state "title
+screen and menu reached". This round started the game the way RecompLauncher's Play does (`tools/plza_probe.py start --as-launcher`: the exe
+alone in its folder, the ini as it is, the launcher's environment; `window.cpp` `play()`), and read the owner's own log of 2026-11-18 00:09
+(kept in `build/evidence/oot/owner-run`). The harness and the launcher gave the same picture: there was no difference between the two paths.
+What the owner saw was what the harness had shown all along: a black movie behind the logo, then, after A, the opening movie: 3,480 packets
+in 119 s (half speed), black, silent, until the window was closed.
+
+| | before | now |
+|---|---|---|
+| title and opening movies | black (the logo and menu over black) | on screen: near-black 0.1 % at the title, 0 black cells of 64 (`-004218-oot-host1`) |
+| frame rate at the title / in the movies | 27 to 28 FPS, so the 60-picture movies ran at half speed | 60.0 FPS; the opening's 9,254 pictures in 155 s (154.2 s is its length) |
+| sound | output RMS 0 from the title on, except the menu's own sounds | title music and the opening's sound: RMS 0.01 to 0.17 (-37 to -15 dBFS), peak up to 0.99 |
+| after the opening | not reached | **the first scene of the game itself is black**, at 1 to 5 frames a second, and stops after about 80 frames: open, below |
+| F11 / Alt+Enter | forgotten at the next start | written to the ini; the next start opens the same way |
+
+### The movies were black: push constants read as zeros
+
+`gamectl passdump` and `texdump` on a title frame (through the harness: see "The control pipe" below) show the whole chain: two buffer
+copies into the R8 1920x1080 and RG8 960x540 plane textures, the colour conversion `49dff010` into an RGBA8 picture, eleven convolutions of
+`nn::ndve`'s model on tensors of 960x540x16 half floats, `5a7d69b0` (the last convolution added to the picture, into an RGB10A2 picture),
+the resampler `4f41ccf2` into the RGBA8_SRGB 2560x1440 texture the title draws. `AV1_DECODER.md` had found the planes right and everything
+after them zero, and had put that on the convolutions' raw global memory. The first zero is earlier: the colour conversion itself, a shader
+with two textures, one image and no raw memory, wrote 0, 0, 0, 1. Its reflection has a `drvcb` binding of bank 24. Bank 24 is the NVN2 push
+constants (`DMSH_PUSH_BANK`; the game pushes the conversion's matrix with `nvnCommandBufferPushComputeConstants`), which the replay bound
+only when the reflection named them as a constant buffer in slot 21; as a driver bank they got the zero buffer. nxnative reads both forms
+as the push block (`nvn_refl.m`, `NVN_RB_PUSH`). With the pushed bytes bound (`vk_replay.c` `write_set_`) and image stores into textures
+made without the IMAGE flag on (`NXRT_VK_IMAGE_NOFLAG`, now the default), the picture is right up to the RGB10A2 texture
+(`-003642-oot-push1/ser6231-small.png`: Hyrule Field under the moon).
+
+### The movie network by the host
+
+Two things were still wrong behind that. The resampler's output was the picture with dashes of white and black all over it
+(`-003642-oot-push1/shot-small.png`): `4f41ccf2` is 128 threads a group with warp shuffles over 4,608 bytes of shared memory, which the old
+translator build does not get right (nxnative's notes list six fixes in that area since). And the title ran at 27 FPS: the convolutions
+write their tensors through raw global memory, 52 MB a frame copied back to guest memory and 89 MB a second uploaded again, with the game's
+thread 30 to 50 ms a frame in GPU waits; the player takes one picture a frame, so the movies ran at half their speed and behind their sound.
+
+`vk_replay.c` `ndve_host` takes the model's place, recognised by its shader keys as nxnative does (shaders.md "The NDVE movie network by the
+host", MIT, (c) seedds): the colour conversion stays the game's, the convolutions are skipped, `5a7d69b0` becomes a copy of the picture and
+`4f41ccf2` a linear blit to 2560x1440. What is lost is the network's correction, a learned sharpening of the decoded picture, not the picture.
+GPU time at the title went from 24 ms to 0.2 ms a frame, the title and both movies run at 60.0 FPS. `NXRT_VK_NDVE=0` (`gamectl set ndve 0`)
+runs the game's dispatches. nxnative runs the real network as host kernels; porting those (13 kernels with 8x8 matrix products) is the
+next step for the picture's quality, a newer translator the other.
+
+### No sound: the repository had no libopus
+
+The title's music and the opening's sound are the movies' own audio: Opus streams the game decodes through the `hwopus` service into PCM
+voices. `runtime/opus` held headers and a license, no archive (`.gitignore` kept `*.a` out except libvpx and dav1d), so
+`switchrecomp.py` built every runtime with `SWR_NO_OPUS`, and the service answered each packet with silence of the right length. No log
+line said so. Now: `runtime/opus/build_opus.py` builds Opus 1.5.2 from xiph.org's archive (SHA-256 checked, plain C, reproducible: two
+builds gave the same bytes on Windows and on Ubuntu), `win/libopus.a` and `lin/libopus.a` are in the repository with their hashes in
+`runtime/opus/README.md`, `tests/test_opus.py` checks the hash and decodes a tone, engine CI and the launcher's packaging check the
+runtime for the decoder's log line, and a runtime without libopus says so once.
+
+The mixed output is measured in the log (`audio: output, last 5 s: RMS ..., peak ...`, `audio.c` `swr_audio_submit_at`), which is how
+"is there sound" is answered here without listening:
+
+| run | title (10 to 50 s) | opening movie | first scene |
+|---|---|---|---|
+| the owner's build (`-002104-oot-baseline-launcher`, `-004218-oot-host1`) | RMS 0 | RMS 0, but for 5 s of the menu's confirm sound (0.052) | - |
+| libopus, voices straight to stereo (`-010105-oot-play1`) | - | 0.009 to 0.22, peak 1.24 (clipping) | - |
+| libopus and the mixes (`-010727-oot-stall3`, `-013422-oot-queue1`) | 0.007 / 0.025 to 0.036 / 0.046 (left / right) | 0.025 to 0.17, peak 0.99 | 0.026 to 0.028 |
+
+### Mixes and splitters (every Switch 2 game)
+
+The log's `audren mixer active (6 voices, 0 mixes), direct stereo fallback` was true of Donkey Kong Bananza and Mario Kart World as well:
+since REV7 an update carries only the mixes that changed, behind a 0x20-byte header, and `audio.c` took any mix section that was not a whole
+number of 0x930-byte mixes for "no mixes". Every voice then went to both stereo channels at its own volume: no mix volumes, no 5.1 downmix,
+no effects. `swr_audio_update_routing` keeps the mixes by ID between updates and parses the splitter section (it sits between the effects
+and the mixes; the mixes used to be read right behind the effects): `SNDI` records with their destination IDs, `SNDD` destinations of 0x70
+bytes or, on this SDK, 0xa8 (the size is learned from the distance to the next record; the in-use flag is 12 bytes from the end). A voice
+goes to its mix through its channel volumes or through its splitter's destinations, a mix to its mix or through a splitter. Ocarina of Time:
+11 mixes, a 6-channel final mix, 384 destinations. One thing is not understood: the opening's sound plays on voices that name no mix and
+whose splitters (13 to 17) are sent with 0 destinations. A console is not silent there. Such a voice is played in the final mix's front
+pair and logged (`audio: voice N names no mix ...`), so nothing that was audible before is lost; where its real route is, is open.
+`tests/test_audio.c` has a case for changed-mixes-only updates and splitter destinations.
+
+### A stop minutes into the movie: the present ticket
+
+With the frames cheap the game stopped a few minutes in, nothing waiting on the GPU, the translation, present and completion threads all
+idle and the game's thread in `nvnWindowAcquireTexture` -> `vkp_wait` (native stacks, `-004902-oot-stall2/stall-1-stacks.txt`).
+`nvnQueuePresentTexture` stored the queued present's marker in the window's ticket after pushing the present; the translation thread could
+have translated it and stored the real ticket first, and the marker then overwrote it: the next acquire of that texture waited for a
+present numbered by the marker, for ever. The marker is now written under the queue's mutex, before the translation thread can take the
+present (`hle_nvn.c` `aq_push`). The race is any game's; it needed a translation thread with nothing else to do.
+
+### The control pipe
+
+`gamectl` commands went to the pipe `\\.\pipe\swr_ctl`, which belongs to whichever game started first. The DLC work's Mario Kart 8 Deluxe
+was running, so this round's first `passdump` and `texdump` were answered ("in the log") by that game. The pipe is now
+`\\.\pipe\swr_ctl_<process ID>` and the harness names its own game's process.
+
+### Window mode
+
+F11 and Alt+Enter only changed the window (`backend_win32.c`, `backend_x11.c` `set_fullscreen`); nothing wrote `fullscreen=` back, so the
+ini kept its written-out default `fullscreen=1`. The launcher was not involved: Play writes `renderer` and `button_layout` and keeps every
+other line (`library.cpp` `writeIniKey`), and the `settings_version` step only touches `docked` and `game_dynamic_resolution`. Now the two
+keys go through `toggle_fullscreen`, which stores the choice (`ini_set`); the ini is written within a second, and at exit when the game is
+closed before that (`main.c`). The controls window and the start still use `set_fullscreen` and store nothing.
+
+Test, started the launcher's way each time (`build/evidence/oot/window_mode_test.py`, `wm_probe.py`; F11 as a message posted to the game's
+own window): `fullscreen=1`, the window opens without a caption at the screen's size; F11: caption, `fullscreen=0` in the ini 10 s later
+and after the exit; next start: `fullscreen=0`, style `0x14cf0000` (caption), 1296x740; the ini still `fullscreen=0` after it. The other
+way round (0, F11, 1, next start fullscreen) as well. Before this test ran, the ini already held `fullscreen=0`: the owner had pressed F11
+in this round's build. A launcher test keeps a `fullscreen=0` in the ini through Play's writes (`tests.cpp`). Seen in the test: the game's
+process lives a few seconds after its window is gone, and a start in that time is refused by the harness.
+
+### Open: the game itself
+
+After the opening the game goes into its first scene (the Great Deku Tree's hollow). On a first visit the first frame took 106 s, 73 s of
+it pipelines compiled at first use (the second visit: 11.6 s, 0.3 s of pipelines); 330 shaders were translated live in the minute before,
+two failed (`Ampere instruction 243 ... is not implemented`). Then:
+
+- **The picture is black** (`-011734-oot-play2/0006`, `-013422-oot-queue1/0004`), with the scene's sound playing.
+- **1 to 5 frames a second.** The translation thread is idle 99.3 % of the time there (`SWR_HOST_PROF`, `prof1-hostprof.txt`: 0.47 s of CPU
+  in 25 s, the rest in `aq_main`'s wait), the game's thread in `nvnSyncWait` -> `aq_wait_seq` (`-010727-oot-stall3/stall-1-stacks.txt`).
+  Read: a submission of one queue is parked at an event wait and done ops are published in order, so the thread waits for the parked one
+  (250 ms, its limit) instead of its own queue's work. A per-queue fence (`nvnQueueFenceSync` holding its queue's last op) was tried and
+  did not change the rate (76 frames in 90 s, `-013422-oot-queue1`); it is not in the tree. nxnative's rule is in nvn-objects.md "GPU event
+  waits order work across queues": an unmet wait parks its queue only, with no time limit, and CPU signals publish.
+- **It stops** after about 80 frames of the scene (`-013422-oot-queue1`: frame 11627 at 314 s, nothing until the run's end at 445 s).
+- The log there: `kind tex_pool is not replayed yet (bound as empty)`, `render target ... cannot be a colour attachment here (its content
+  comes from its storage)`, 90 MB of write-back a frame, mesh draws (`task shader a5288d0a6c4971fd`).
+
+So the owner's third point stands in part: the game now runs through the title and the whole opening with picture and sound, and what
+comes after is not playable. That is the renderer work `NXNATIVE_GAP_ANALYSIS.md` ranks first now.
+
+### Regression checks of this round
+
+The library builds of Donkey Kong Bananza, Mario Kart World and Pokemon Legends Z-A were rebuilt through the engine CLI into their `buildDir`
+with the final runtime and run with `tools/play_scenario.py` (the scenarios of section 7). Their saves were copied aside first
+(`build/evidence/oot/save-backups`) and put back where a run had moved them (DKB, MKW). Another agent's Mario Kart 8 Deluxe was running at
+the same time on the same GPU. **Mario Kart 8 Deluxe was not rerun**: its library build was in use by the DLC work, with that branch's runtime.
+
+| game | run | result | sound (new: measured) |
+|---|---|---|---|
+| Donkey Kong Bananza | `-015750-dkb-oot` | title, Continue, walk, punch, walk: 0 or 1 black cells of 64 in each of 7 screenshots; 55.2 FPS over 100 to 150 s, present interval p50 16.7 / p95 21.3 / p99 26.0 ms, one stop of 1.4 s (57.0 FPS, 16.7 / 21.2 / 26.5 ms in section 7) | mix routing now; 27 of 28 five-second windows with sound, RMS up to 0.046 |
+| Mario Kart World | `-020026-mkw-oot` | to a race, two drives: 0 black cells in 12 screenshots; 58.4 FPS over 150 to 185 s, p50 16.67 / p95 17.36 / p99 28.27 ms, 7 intervals over 50 ms (58.2 FPS, 16.67 / 17.52 / 31.75 ms, 6) | mix routing now; 36 of 36 windows with sound, RMS up to 0.042 |
+| Pokemon Legends Z-A | `-020336-plza-oot` | title, the station, two walks: 0 black cells after the boot screenshot; 30.0 FPS, p50 33.3 / p95 34.0 / p99 34.6 ms, longest 42.5 ms (as section 7) | AudioOut, unchanged; 15 of 15 windows with sound |
+| Ocarina of Time | `-004218-oot-host1` (the launcher's way, fullscreen), `-013422-oot-queue1` | title and both movies on screen at 60 FPS with sound; then the first scene: black (above) | above |
+
+Not listened to: the levels say there is sound and that it does not clip (peaks under 1 with the mixes), not that the mix is the console's.
+
+Tests: `python -m unittest discover -s tests -p "test_n*.py"`, `tests/test_controllers.py`, `tests/test_mkw_runtime.py`,
+`tests/test_mkw_perf.py`, `tests/test_av1.py`, `tests/test_opus.py` (new), `tests/run_audio.sh` (WSL): pass on Windows.
+
+Run folders and the saves copied aside before the runs: `build/evidence/oot/` of the main checkout (not in git).
+
+### Switches added
+
+| switch | what |
+|---|---|
+| `NXRT_VK_NDVE=0` (`gamectl set ndve 0`) | the game's own movie network dispatches instead of the host's copy and blit |
+| `NXRT_VK_IMAGE_NOFLAG=0` | image stores into textures made without the IMAGE flag are lost again (the default before) |
+| `tools/plza_probe.py start --as-launcher` | the game started as RecompLauncher's Play starts it |
+| log lines `audio: output, last 5 s`, `audren: update sections`, `audio: mix section`, `audio: splitter destinations of`, `audio: voice N names no mix` | the mixed output's level; what an update holds; the routing |
 
 ## Instrumentation and switches added in this round
 

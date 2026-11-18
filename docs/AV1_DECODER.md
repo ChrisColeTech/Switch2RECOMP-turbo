@@ -178,6 +178,11 @@ after: `build\evidence\av1\save-backups`):
 
 ## Open
 
+**2026-11-18:** items 1 and 2 are done differently from what they say: the movies are on screen and at their own speed
+(`GAMEPLAY_INVESTIGATION.md` section 8). The black was the colour conversion's push constants bound to zeros, not the network; the network's
+convolutions are skipped and its last two kernels done by the host (`vk_replay.c` `ndve_host`), which also brought the title to 60 FPS;
+`NXRT_VK_IMAGE_NOFLAG` is on by default. The movies' sound needed libopus (`runtime/opus`).
+
 1. **The movies are still black on screen.** `nn::ndve`'s network has to compute: its kernels' tensors through raw
    global memory first (a hunch worth one look: a pool page the GPU wrote through a loaded pointer and that was never
    copied back, because of the 1,024 pages a frame, may be uploaded from guest memory later, zeros over the result:

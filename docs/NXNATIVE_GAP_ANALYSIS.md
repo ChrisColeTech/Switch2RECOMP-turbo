@@ -3,7 +3,7 @@
      Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
 # Gap analysis against nxnative
 
-Status 2026-11-17. nxnative (https://github.com/seedds/nxnative, MIT, (c) seedds; a checkout at `D:\Projects\nxnative`) hosts
+Status 2026-11-18. nxnative (https://github.com/seedds/nxnative, MIT, (c) seedds; a checkout at `D:\Projects\nxnative`) hosts
 the same Switch and Switch 2 games natively on Apple hardware and has played Donkey Kong Bananza, Mario Kart World and Ocarina
 of Time, with a profile for Pokemon Legends Z-A. This engine's NVN layer (`runtime/nvn`) is a port of an older nxnative, and
 its shaders are translated by an older build of nxnative's translator (`tools/nxshader/xlate_bin`). This document lists what
@@ -46,11 +46,23 @@ Also in this round, not from nxnative: the MiiEdit applet answers "cancelled" (M
 applies any ini option for one run, a GPU wait that runs out is logged with what it waited for, the pass sizes a game draws at are in the log
 (`render sizes up to frame`), `tools/play_scenario.py`.
 
+## Fixed in the fourth round (2026-11-18)
+
+| # | Feature | nxnative reference | Games | Was | Now |
+|---|---|---|---|---|---|
+| 17 | NVN2 push constants named as a driver bank | `nvn_refl.m` (`NVN_RB_PUSH`: a `drvcb` binding of bank 24 is the push block) | Ocarina of Time (the movie's colour conversion and resampler) | bound to zeros: the conversion's matrix was zero, every movie picture black | `vk_replay.c` `write_set_`: the pushed bytes |
+| 18 | The NDVE movie network by the host (was rank 1) | shaders.md "The NDVE movie network by the host" | Ocarina of Time | the game's 14 dispatches: tensors through raw global memory (52 MB a frame written back), the resampler's output garbage, 27 FPS | `vk_replay.c` `ndve_host`: recognised by the model's shader keys as in nxnative; the convolutions skipped, the picture copied, the resampler a linear blit; 60 FPS. Not nxnative's kernels: the network's correction of the picture is left out (`NXRT_VK_NDVE=0`: the game's dispatches). Image stores without the IMAGE flag are on |
+| 19 | Opus through the hardware decoder service | audio.md "Hardware Opus decoders built on the SDK's software decoders" (nxnative uses the SDK's decoder; here libopus) | Ocarina of Time (movie sound), any game with Opus streams | the repository had no libopus archive: every packet decoded to silence | `runtime/opus` (Opus 1.5.2, `build_opus.py`, both archives, `tests/test_opus.py`) |
+| 20 | Audio renderer mixes and splitters as the SDK sends them since REV7 | audio.md (nxnative runs the SDK's own renderer) | every Switch 2 game here (DKB, MKW, Ocarina) | a changed-mixes-only update read as "no mixes": voices straight to stereo, no mix volumes | `audio.c` `swr_audio_update_routing`: mixes kept by ID, splitters parsed and kept |
+
+Also in this round, not from nxnative: the present ticket race (`hle_nvn.c` `aq_push`), the fullscreen choice written to the ini, the control
+pipe per process, `plza_probe.py --as-launcher`, the output level in the log.
+
 ## Open, ranked by expected effect on the library games
 
 | Rank | Feature | nxnative reference | Games | State here | Symptom |
 |---|---|---|---|---|---|
-| 1 | Ocarina's movies on screen: `nn::ndve`'s movie network has to compute | shaders.md "The NDVE movie network by the host", "`nn::ndve`'s movie enhancement file"; movies.md "`nn::codec` video decoders taken over" | Ocarina of Time | the AV1 decoder is done (`AV1_DECODER.md`: dav1d 1.5.5 in `runtime/av1`, `av1video.inc`, `svc_ns2.c`; the decoded pictures reach the game's plane textures). Missing: the network between those textures and the screen. Its kernels' tensors go through raw global memory (rank 2 below: raw loads through pointers) and give zeros; its image stores go into textures made without the IMAGE flag (`vk_tex.c` `vkt_want_image`, `NXRT_VK_IMAGE_NOFLAG=1`, off by default: with it the output is zeros, then noise). To do: make the network compute (the raw loads first; `AV1_DECODER.md` has a hunch about pages written through loaded pointers and uploaded over later), then turn `NXRT_VK_IMAGE_NOFLAG` on by default. nxnative runs the network as host kernels | Ocarina's title and opening movies are still black on screen, behind decoded pictures; the title runs at 27 FPS in the network's dispatches |
+| 1 | Ocarina of Time's world: the first scene after the opening | the game's README ("What it needs", "Open"); nvn-objects.md "GPU event waits order work across queues"; shaders.md (raw global memory through pointers, mesh and task shaders) | Ocarina of Time | reached for the first time in the fourth round (`GAMEPLAY_INVESTIGATION.md` section 8, "Open: the game itself"). Missing or wrong: the picture (black), the queue order (the game's thread waits in `nvnSyncWait` for a submission of another queue parked at an event wait; done ops are published in order), `tex_pool` / `samp_pool` bindings (bound as empty), render targets whose content comes from their storage, two shaders the translator refuses (Ampere instruction 243), 90 MB of write-back a frame. The movie network's real kernels (item 18) are a second, smaller part | after the opening: a black picture with sound, 1 to 5 frames a second, a stop after about 80 frames |
 | 2 | Current translator chain | shaders.md "Raw global memory through a pointer read when the draw is bound", "128-bit raw global loads...", "Early fragment tests from the control section", "Bindless constant buffer handles..." | Ocarina of Time (foliage: 2,241 shaders with raw loads; pools reached only through pointers), DKB (2,855 pixel shaders with the NVN2 early-test flag) | missing: `xlate_bin` has none of `FindPointerSite`, `GenerateRawVectorLoad`, `ABindlessConstant`, `F2ip`; `nxs_front.py` reads the early-test flag at +0x718 only; the pool table has 4,096 entries (nxnative 8,192: Ocarina holds about 4,170 ranges). Blocked on a build of nxnative's translator: it needs the .NET 10 SDK (this machine has 6, 7 and 9), nxnative's patched Ryujinx sources built with it, the chain's Python front end (`nxs_front.py`, `nxs_refl.py`, `dmsh_abi.h`) moved to the new ABI, and every game's shader cache made again | missing foliage and moss in Ocarina; depth-tested-late storage writes |
 | 3 | First-use texture work spread over frames (not an nxnative item: its answer is Metal's placement sparse textures) | frame-rate.md | Mario Kart World | missing: a burst of new ASTC textures is transcoded and uploaded on the translation thread in the frame that first uses them (`vk_tex.c`); the prefetch (`NXRT_VK_TEX_PREFETCH`) showed no gain | 4 to 8 frames of 60-180 ms when a new part of the course streams in (GAMEPLAY_INVESTIGATION.md section 7) |
 | 4 | Passthrough geometry draws gathered into one dispatch | shaders.md "Mesh geometry draws gathered into one dispatch", "Passthrough geometry shaders drawn by the vertex shader" | DKB (630 culling draws a frame) | the geometry shaders run natively (`VK_NV_geometry_shader_passthrough`), one draw each; their write-backs are gone (item 12) | translation thread time: DKB at 57 FPS, not a flat 60 |
@@ -72,10 +84,9 @@ cuts of SDK functions (this engine runs the SDK against its own services).
 
 ## Next, in order
 
-1. Ocarina's movies on screen (rank 1, with rank 2): the `nn::ndve` network's compute kernels read their tensors through raw global memory.
-   First the hunch of `AV1_DECODER.md` (a page written through a loaded pointer and never copied back is uploaded from guest memory later,
-   zeros over the result; write-back on demand now keeps such pages on the device once they are handed over, so look again), then the raw
-   loads of the newer translator, then `NXRT_VK_IMAGE_NOFLAG` on by default.
+1. Ocarina of Time's first scene (rank 1): first the queue order (an unmet event wait parks its queue only, a queue's fence is its own work: nxnative's
+   rule; the per-queue fence alone did not change the rate), then a pass dump of one frame of the scene for the black picture (`tex_pool` bindings,
+   the render targets read from storage), then the translator (item 3 below).
 2. First-use texture work over frames (rank 3): the small levels of a new texture now, the large ones in later frames, sampled through
    `VK_EXT_image_view_min_lod` so that a shader's size queries do not change; the view made again when the texture is whole. Mario Kart World's
    long frames.
