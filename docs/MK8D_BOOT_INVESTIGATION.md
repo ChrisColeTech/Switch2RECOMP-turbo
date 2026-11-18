@@ -1,14 +1,15 @@
 <!-- SwitchRecomp - Copyright 2026 MZ Labs
      Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
      Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
-# Mario Kart 8 Deluxe: from a crash at 1.4 s to the title screen
+# Mario Kart 8 Deluxe: from a crash at 1.4 s to a Grand Prix race
 
-Status 2026-11-17: Mario Kart 8 Deluxe (a Switch 1 program, NintendoSDK 4.4.0, built from the owner's dump
-`P:/Games/Nintendo/DUMPS/Mario Kart 8 Deluxe/dump` into the launcher entry's buildDir
-`.../SwitchRecomp Builds/Mario Kart 8 Deluxe 1G1U1D`) boots. Graphics, audio and the DualSense come up, it plays
-its intro logo and shows the title screen key art at about 5 s. It then crashes at about 6.8 s, when the title
-menu builds its Mii renderer: the MiiModel system archive it reads is still served empty. The archive's format
-is fully mapped (section 5); writing the synthesizer is open: see [Open items](#open-items).
+Status 2026-11-17 (evening): Mario Kart 8 Deluxe (a Switch 1 program, NintendoSDK 4.4.0, built from the owner's
+dump `P:/Games/Nintendo/DUMPS/Mario Kart 8 Deluxe/dump` into the launcher entry's buildDir
+`.../SwitchRecomp Builds/Mario Kart 8 Deluxe 1G1U1D`) **plays**: title, "Select a Mii" (blank heads), the main
+menu, the engine class menu, character and kart select, the cup select and a 50cc Grand Prix race at Mario Kart
+Stadium at 60 FPS (driving, items, the anti-gravity section). The last crash (5, the Mii face texture) is fixed by
+a MiiModel archive the runtime makes up with every part valid and blank (section 5). Remaining items are in
+[Open items](#open-items); none stops play.
 
 Before: `Mario Kart 8 Deluxe 1G1U1D.log` ended at 1.45 s with a crash in `nnosInitialize`, before any window
 content.
@@ -21,7 +22,7 @@ Five defects were found in sequence. Each fix moved the crash later.
 | 2 | 1.90 s, main thread right after `DeviceInitialize`, access to `0x20` | NVN API 55.15 reported to an SDK 4 game, which requires 53.x | 2f8f44e: `dm_sdk_major()` reads the game's SDK |
 | 3 | 6.6 s, worker thread, access to `0x48b4` | the Mii database answered no Miis, so the game validated an all-zero `CharInfo` | 2a42369, 5f80160: six default Miis; lookups answer NotFound |
 | 4 | 6.6 s, `nvnMemoryPoolMap(NULL)` in the runtime | MiiModel (0802) served empty: the game read part sizes from heap garbage | 9d0acd6: MiiModel synthesized with zeroed part tables |
-| 5 | 6.8 s, `vkt_reg_tex` (runtime), access to `0` | the Mii renderer, with no parts, gives the game a NULL face texture | open |
+| 5 | 6.8 s, `vkt_reg_tex` (runtime), access to `0` | the Mii renderer, with no parts, gives the game a NULL face texture | b7cde65: MiiModel with every part valid (blank texture, degenerate mesh) |
 
 ## 1. The build and runtime pairing (root cause of the reported crash)
 
@@ -216,7 +217,7 @@ pool) only exposed the next one (`nvnBufferMap(NULL)`), so those guards were rev
 zero-padded so every part table reads size 0. Shape tables end below about 86 KB (largest base 73940 plus 132
 entries × 0x58), texture tables below about 13 KB. The renderer then initializes and skips all parts.
 
-## 5. Open: the Mii face texture (crash at 6.8 s)
+## 5. The Mii face texture (crash at 6.8 s)
 
 ```
 [   6.82] *** Crash ... access to 0000000000000000 (game address 0) ***
@@ -231,7 +232,7 @@ A guard that leaves the slot empty (`if (!t) return;` in `nvnTexturePoolRegister
 then crashed in its own Mii drawing code (`88f0fd0`, `F_88EB1C0`, under `88e6550`) on a garbage pointer
 (`0x23b0c1010`), because it draws from parts that do not exist. The guard was not committed.
 
-Getting further needs MiiModel content the renderer accepts, made up by the runtime.
+Getting further needed MiiModel content the renderer accepts, made up by the runtime.
 
 ### The format (deep dive 2026-11-17)
 
@@ -272,7 +273,7 @@ materialization, not flags.
 - Prior art agrees on strategy: yuzu's 16-byte stubs only survive because few games look inside; nxnative,
   S2Arm and Lichii all ship all-entries-valid degenerate archives and report blank Miis without crashes.
 
-### Plan
+### Plan (as written before the fix; see [Fix](#fix-b7cde65) for what was done)
 
 1. `sysdata_open` (`runtime/svc_fs.c`) builds the six files for real instead of zero-padded headers:
    - Header: magic, version 1, file length, then largest-size `u32[11 or 12]` and alignment arrays — one page
@@ -297,6 +298,58 @@ materialization, not flags.
    no crash. Residual unknowns, probe-only: tile-index values ≥ 2, whether anything reads entry `+0x10`, and
    what the character-select path (reached at 40 s with the firmware archive) requests beyond the title path —
    the all-valid archive covers it by construction.
+
+### Fix (b7cde65)
+
+`runtime/svc_fs.c` `mii_model_init()` builds the two file images once; `sysdata_open` serves them under the six
+MiiModel names. It is a port of nxnative's stand-in writer (`dm/host/hle_mii.c`, MIT), synthesized data only:
+
+- Header: the first 12 bytes keep yuzu's `NFTR` / `NFSR` and version 1 (unread). Largest sizes at `+0xC`
+  (11 or 12 `u32`) and alignments right after them: 0x1000 each.
+- Texture file (9,307 bytes): 327 entries of 0x1C from `+0x64` (ends 0x2428 = 9256). Each one: offset 0x2430,
+  size 0x20, stored size 43, width 8, height 4, format index 0 (R8_UNORM), 1 mip, tile 0.
+- Shape file (85,515 bytes): 857 entries of 0x58 from `+0x6C` (ends 75524). Each one: offset 0x14DE0, size 0x20,
+  stored size 43, attribute 0 size 8 (`u32` 9; the other four attributes 0), index offset 0x10, index bytes 6.
+  The hair and faceline transforms (75524..85460) stay zero.
+- The shared payload: `78 01 | 01 20 00 df ff | 32 zero bytes | 00 20 00 01` (zlib header, one final stored
+  block, Adler-32). The same 32 zero bytes are the 8x4 texture and the mesh (one f16 vertex at the origin, u16
+  indices 0, 0, 0 at +0x10). Checked with Python's `zlib.decompress`.
+- The Switch 2 MiiResource (0400000000000849) gets the same images plus `OunceTexture{Low,Mid,High}{Linear,SRGB}.dat`
+  (nxnative: same accessors in Nintendo Switch Sports Resort). No game on hand mounts it: Mario Kart World's log
+  shows no system data at all. So this path is not exercised here; before it an empty archive was served.
+
+No ABI change (`runtime/cpu.h` untouched), but the game was rebuilt anyway because `turbo` had moved since the
+last MK8D build.
+
+### Probe
+
+The planned `SWR_TRACE_FN` list logged nothing. The hook only replaces dispatch-table entries, and every one of
+those Mii functions is a direct call in the generated C, so it never runs. The proof is behavioural instead: the
+crash at 6.82 s is gone in every run (3 of 3), and "Select a Mii" lists "Create a Mii" and the six default Miis,
+with blank heads above their shirts.
+
+### Verification (2026-11-17, real build, engine CLI, harness)
+
+Built with the launcher's arguments through `switchrecomp.py` from the `mk8d-mii` worktree (`--jobs 4 -O 2`, the
+worktree's freshly built `bin/runtime_win64_win32.exe`, `tools/build_nvn.py --jobs 4` first). The game's exe hash
+equals that runtime. Save data was backed up before the runs.
+
+| Run (`build/plza-investigation/` of the worktree) | Result |
+|---|---|
+| `20261117-191813-mk8d-mii1` (60 s, no input) | title "Press L R to start" from about 5 s to 60 s, no crash, 0-1 % near-black |
+| `20261117-191942-mk8d-menus` (input) | L+R: Select a Mii (`0002`), first default Mii: main menu (`0004`), Single Player, Grand Prix, engine class (`0006`), 50cc: character select (`0007`), kart (`0009`), Mushroom Cup (`0011`), Start Grand Prix (`0012`), course intro (`0014`). The race then ran at 1-2 FPS with a black 3D view: cold shader cache, see open item 2 |
+| `20261117-192702-mk8d-race` (input, warm cache) | same route (the save now skips the Mii pick): race at Mario Kart Stadium (`0011`), driving with `tools/plza_inputs/mkw_drive.txt` (`0012`, `0013`: anti-gravity, 3rd place). 58.5 FPS mean over 142 s, frame p50 16.66 ms, p99 17.8 ms, no crash |
+
+Regression:
+
+- Mario Kart World (shares the sysdata and Mii path), rebuilt through the CLI into its real buildDir with the same
+  runtime (exe hash equal): `20261117-202349-mkw-regress`, title (`0001`), L+R, A, A: character select (`0004`),
+  no crash, 60 FPS at the end. Its log has no `system data` line: it mounts neither 0802 nor 0849.
+- Engine tests: `unittest discover -s tests -p "test_n*.py"` (17 OK), `test_python_selection.py` (OK, 2 skipped),
+  `test_controllers.py` (4 PASS), `test_mkw_runtime.py` (PASS), `test_mkw_perf.py` (2 OK). In a fresh worktree,
+  `test_mkw_runtime.py` needs `build/mkw-investigation/` to exist first.
+- Engine CI (`engine-ci.yml`, dispatched on `mk8d-mii`): Windows and Linux green.
+- Save data of both games was backed up before the runs. MK8D's was restored afterwards; MKW's did not change.
 
 ## How to reproduce and analyse
 
@@ -327,7 +380,7 @@ Techniques that found each step:
   the return value (hex). It works for functions reached through the dispatch table (PLT and indirect calls).
 - **SDK version:** `NintendoSdk_nnSdk-*` string in the sdk module.
 
-## Verification (2026-11-17)
+## Verification before the Mii fix (2026-11-17)
 
 - Engine tests: `unittest discover -s tests -p "test_n*.py"` (17 OK), `test_python_selection.py` (OK),
   `test_controllers.py` (PASS), `test_mkw_runtime.py` (PASS).
@@ -339,20 +392,32 @@ Techniques that found each step:
 
 ## Open items
 
-1. **MiiModel content** (crash 5): the format is fully mapped (section 5, deep dive 2026-11-17); what remains
-   is writing the synthesizer in `sysdata_open` and probing. No firmware dump or emulator is needed — the game's
-   own code is the spec, and nxnative (another MK8D recomp host) ships the same synthesizer as prior art.
-2. **Stale `libnvn.a` / runtime without an ABI change:** after a submodule bump the build still copies
+1. **Mii heads draw nothing.** That's by design: the archive is blank and nothing firmware-derived ships. nxnative,
+   S2Arm and Lichii have the same result. Bodies and favourite colours show.
+2. **The first race on a cold shader cache runs at 1-2 FPS with a black 3D view for minutes.** In
+   `-191942-mk8d-menus` the course's shaders were all new (423 `not in the shader cache` lines as the race loaded). The live translator
+   (`tools/nxshader/nxs_live.py`) delivered the last of them 246 s after they were missed (`[nxs] shader ... is in
+   the cache now (246.2 s after it was missed)`), and meanwhile frames took 0.5-1 s each in GPU waits with the GPU
+   idle. On the next launch (warm cache) the same race loads normally and runs at 60 FPS. This is the shader
+   pipeline in general, not MK8D-specific, and not investigated further (the renderer is the gameplay
+   investigation's area). A first-time player sees it once per new course.
+3. **The engine class menu's preview movie is a black panel** (`-191942-mk8d-menus/0006`). The movies are H.264
+   from `subsdk0` (nxnative: "the menus' H.264 previews"). Not investigated.
+4. **`SWR_TRACE_FN` cannot trace direct calls.** It hooks the dispatch table only, so the planned probe list for
+   the Mii loader logged nothing (section 5, Probe). A trace on generated-C entry would need a codegen hook.
+5. **MiiResource 0849 (Switch 2) is unexercised.** It serves the same layout, but no game on hand mounts it.
+6. **Stale `libnvn.a` / runtime without an ABI change:** after a submodule bump the build still copies
    `bin/`'s runtime and links `build/nvn/libnvn.a` as they are. Only an ABI mismatch triggers a rebuild, so fixes
    in runtime sources are silently missing until `build_nvn.py` and `--build-runtime` are run.
-3. **Picture in the top-left third of the 4K fullscreen window** in captures. This is likely the 300% display
-   scaling (DPI awareness, present size), not investigated.
-4. **Save data from test sessions** in `<buildDir>/Mario Kart 8 Deluxe 1G1U1D_data/save`. One run reached the
-   menus and saved. Delete it for a fresh start.
-5. **The runtime's crash hint** ("got NULL from its allocator (out of memory?)") misled twice here. Both NULLs
+7. **Picture in the top-left third of the 4K fullscreen window** in captures. This is likely the 300% display
+   scaling (DPI awareness, present size), not investigated. Harness runs are windowed and unaffected.
+8. **Save data from test sessions** in `<buildDir>/Mario Kart 8 Deluxe 1G1U1D_data/save`. The save from before
+   this round was backed up and restored after the runs (the runs picked a Mii and started a Grand Prix).
+9. **The runtime's crash hint** ("got NULL from its allocator (out of memory?)") misled twice here. Both NULLs
    were unset globals or members, with plenty of memory free.
 
 ## Commits
 
 Engine (`turbo`): e440705 ABI guard · 2f8f44e SDK version → NVN API · 2a42369 default Miis · 5f80160
-UpdateLatest/GetIndex NotFound · 9d0acd6 MiiModel zeroed tables. Launcher (`main`): 64c10f5 submodule bump.
+UpdateLatest/GetIndex NotFound · 9d0acd6 MiiModel zeroed tables · fe06526 format deep dive and plan ·
+b7cde65 MiiModel with every part valid. Launcher (`main`): 64c10f5 submodule bump.
