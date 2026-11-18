@@ -296,6 +296,11 @@ static int am_lib_accessor(SvcObj* o, IpcCtx* c){
       else if(id==0x10){ /* PlayerSelect: UiReturnArg { u64 result; Uid uid; } with the console user. deltarune
                             keeps asking forever if it gets "no user" */
         u8 r[0x18]; memset(r,0,sizeof r); memcpy(r+8,g_user_id,16); n=sizeof r; st=am_storage_new(n,r); }
+      else if(id==0x12){ /* MiiEdit ("Create a Mii"): MiiEditAppletOutput { u32 result (0 = a Mii was made, 1 = cancelled); s32 index }. There
+                            is no Mii editor here: answered "cancelled". All zeros read as "made, at index 0" of a database that holds none:
+                            Mario Kart 8 Deluxe took a null Mii from it and crashed in nn::mii::CreateId::IsValid (its first "Select a Mii"
+                            screen starts on Create a Mii) */
+        u8 r[0x100]; memset(r,0,sizeof r); r[0]=1; r[4]=r[5]=r[6]=r[7]=0xFF; if(n>sizeof r) n=sizeof r; st=am_storage_new(n,r); }
       else st=am_storage_new(n,NULL);
       { static int said; if(said<4){ said++; LOG("applet: library applet %02x closed right away (no applet UI here), %llu bytes of output\n",id,(unsigned long long)n); } }
       out_obj(c,st); return 0; }

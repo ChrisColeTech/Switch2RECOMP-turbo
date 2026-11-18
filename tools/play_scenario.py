@@ -9,8 +9,8 @@ python tools/play_scenario.py stats <run folder> [--window 100,150]
 A scenario starts the game through the harness (metrics on), sends its steps, stops the game and prints the run's
 numbers: FPS from metrics.csv and the present interval's p50 / p95 / p99 / longest from frames.csv, over the window
 (seconds since the game's start), with each screenshot's black audit. Scenarios: dkb (title, Continue, walk, punch,
-walk), mkw (to a race, two drives), plza (title, the station, two walks), zelda (title, menu, A, A), mk8d (to a
-Grand Prix race, drive). The game's save is not touched here: copy <Game>_data/save aside first.
+walk), mkw (to a race, two drives), plza (title, the station, two walks), zelda (title, menu, A, A), mk8d (from a
+save without a Mii: Select a Mii, then to a Grand Prix race, drive). The game's save is not touched here: copy <Game>_data/save aside first.
 """
 import argparse
 import csv
@@ -36,7 +36,7 @@ SCENARIOS = {
     'zelda': dict(seconds=140, window=(45, 100), steps=[
         ('shot', 40, 'boot'), ('shot', 25, 'title'), ('a', 15, 'menu'), ('a', 15, 'menu'), ('shot', 10, 'end')]),
     'mk8d': dict(seconds=240, window=(100, 140), steps=[
-        ('shot', 9, 'boot'), ('lr', 4, 'title'), ('a', 3, 'menu1'), ('a', 3, 'menu2'), ('a', 5, 'menu3'), ('a', 4, 'char'),
+        ('shot', 9, 'boot'), ('lr', 4, 'title'), ('right', 1.5, 'Select a Mii: off Create a Mii'), ('a', 3, 'first Mii'), ('a', 3, 'menu1'), ('a', 3, 'menu2'), ('a', 5, 'menu3'), ('a', 4, 'char'),
         ('a', 2, 'k1'), ('a', 2, 'k2'), ('a', 4, 'k3'), ('a', 4, 'cup'), ('a', 30, 'gp-ok'),
         ('replay', 20, 'driving', 'mkw_drive.txt'), ('shot', 18, 'driving +20s')]),
 }
