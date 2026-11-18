@@ -469,6 +469,11 @@ def _installed(datadir, title_id, source):
     return state.get('storage') == 'stub'
 
 
+def _has_data(datadir, title_id):
+    folder = title_folder(datadir, title_id)
+    return os.path.isfile(os.path.join(folder, 'romfs.nsp')) or _romfs_ok(os.path.join(folder, 'romfs.bin'))
+
+
 def install(paths, datadir, say=print, keys=None, hactool=None, allow_stub=False):
     """install the add-on content of each package for the game built in datadir. Returns (installed, errors)."""
     datadir = os.path.abspath(datadir)
@@ -487,30 +492,51 @@ def install(paths, datadir, say=print, keys=None, hactool=None, allow_stub=False
                                 % (path, base_of(titles[0].title_id), application))
                 held = ', '.join(sorted({TYPE_NAMES.get(other.type, 'other content') for other in others}))
                 raise Error('%s: the package has no add-on content%s' % (path, ' (it holds %s)' % held if held else ''))
-            for title in mine:
-                folder = title_folder(datadir, title.title_id)
-                if _installed(datadir, title.title_id, path) and title.title_id in entries:
-                    say('DLC: %016x v%d is already installed' % (title.title_id, title.version))
-                    done.append(title.title_id); continue
-                kind = 'data'
+            for title in mine:      # one title failing does not stop the package's other titles
                 try:
-                    storage = extract(tools, title, folder, say)
-                except Error as problem:
-                    if not allow_stub: raise
-                    say('DLC warning: %s' % problem); storage = kind = 'stub'
-                state = _stamp(path); state.update(storage=storage, version=title.version)
-                with open(os.path.join(folder, 'install.json'), 'w', encoding='utf-8') as fileobj:
-                    json.dump(state, fileobj, indent=1)
-                entries[title.title_id] = (title.title_id, title.version, kind, path)
-                write_manifest(datadir, list(entries.values()))
-                what = {'package': 'read in place from the package', 'image': 'RomFS image, %.1f KB' % (
-                    os.path.getsize(os.path.join(folder, 'romfs.bin')) / 1024.0 if storage == 'image' else 0),
-                    'stub': 'license only, no data: the game may not accept it'}[storage]
-                say('DLC: installed %016x v%d (%s) from %s' % (title.title_id, title.version, what, path))
-                done.append(title.title_id)
+                    done.append(_install_title(tools, title, datadir, entries, say, allow_stub))
+                except (Error, OSError) as problem:
+                    errors.append(str(problem)); say('DLC error: %s' % problem)
         except (Error, OSError) as problem:
             errors.append(str(problem)); say('DLC error: %s' % problem)
     return done, errors
+
+
+def _install_title(tools, title, datadir, entries, say, allow_stub):
+    path = title.path
+    folder = title_folder(datadir, title.title_id)
+    if _installed(datadir, title.title_id, path) and title.title_id in entries:
+        say('DLC: %016x v%d is already installed' % (title.title_id, title.version))
+        return title.title_id
+    # two packages with the same title (a standalone DLC file and a combined one): the installed one stays unless
+    # this one is newer, so that every listed package is either installed or refused with a reason
+    have = entries.get(title.title_id)
+    if (have and have[3] and not same_file(have[3], path) and have[1] >= title.version
+            and _has_data(datadir, title.title_id)):
+        raise Error('%s: %016x v%d is already installed from %s (remove that one first to install it from this file)'
+                    % (path, title.title_id, title.version, os.path.basename(have[3])))
+    kind = 'data'
+    try:
+        storage = extract(tools, title, folder, say)
+    except (Error, OSError) as problem:
+        if not allow_stub:
+            # nothing half-installed: without data the title leaves the manifest and its folder goes
+            shutil.rmtree(folder, ignore_errors=True)
+            if entries.pop(title.title_id, None): write_manifest(datadir, list(entries.values()))
+            root = os.path.join(datadir, 'dlc')
+            if os.path.isdir(root) and not os.listdir(root): os.rmdir(root)
+            raise
+        say('DLC warning: %s' % problem); storage = kind = 'stub'
+    state = _stamp(path); state.update(storage=storage, version=title.version)
+    with open(os.path.join(folder, 'install.json'), 'w', encoding='utf-8') as fileobj:
+        json.dump(state, fileobj, indent=1)
+    entries[title.title_id] = (title.title_id, title.version, kind, path)
+    write_manifest(datadir, list(entries.values()))
+    what = {'package': 'read in place from the package', 'image': 'RomFS image, %.1f KB' % (
+        os.path.getsize(os.path.join(folder, 'romfs.bin')) / 1024.0 if storage == 'image' else 0),
+        'stub': 'license only, no data: the game may not accept it'}[storage]
+    say('DLC: installed %016x v%d (%s) from %s' % (title.title_id, title.version, what, path))
+    return title.title_id
 
 
 def remove(datadir, what, say=print):

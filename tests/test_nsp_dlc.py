@@ -345,7 +345,13 @@ class DlcTest(unittest.TestCase):
             self.assertTrue(self.install(path)[1], name)
         self.assertTrue(self.install(self.root / 'missing.nsp')[1])
         self.assertFalse((self.data / 'dlc.manifest').exists())
-        self.assertFalse(list((self.data / 'dlc').rglob('romfs.bin')) if (self.data / 'dlc').exists() else [])
+        self.assertFalse((self.data / 'dlc').exists())                          # nothing half-installed is left
+        # in a package with several titles the good ones are installed, the refusal names the other
+        files = dlc_package(AOC, data_id='a1' * 16, meta_id='b1' * 16)
+        mixed = dlc_package(AOC + 1, 2, data_id='a2' * 16, meta_id='b2' * 16, with_ticket=False); files.update(mixed)
+        done, errors = self.install(self.package('mixed.nsp', files))
+        self.assertEqual(done, [AOC]); self.assertEqual(len(errors), 1); self.assertRegex(errors[0], '0100152000023002 needs a ticket')
+        self.assertEqual([entry[0] for entry in dlc.read_manifest(str(self.data))], [AOC])
 
     def test_keys_without_the_content_generation_are_named(self):
         self.keys.write_text('header_key = ' + '00' * 32 + '\n')
@@ -380,6 +386,22 @@ class DlcTest(unittest.TestCase):
         self.assertFalse((self.data / 'dlc.manifest').exists()); self.assertFalse((self.data / 'dlc').exists())
         self.assertEqual(dlc.remove(str(self.data), '%016x' % AOC, self.said.append), 0)
         self.assertEqual(sync()[1], [])
+
+    def test_two_packages_with_the_same_title(self):
+        # the standalone DLC file and a combined package that holds the same title
+        first = self.package('standalone.nsp', dlc_package())
+        again = self.package('combined.nsp', dlc_package(meta_id='2f' * 16))
+        done, errors = self.install(first, again)
+        self.assertEqual(done, [AOC]); self.assertRegex(errors[0], 'already installed from standalone.nsp')
+        self.assertEqual(dlc.read_manifest(str(self.data)), [(AOC, 65536, 'data', str(first))])
+        # a newer version of the title replaces it
+        newer = self.package('newer.nsp', dlc_package(version=131072, meta_id='3f' * 16))
+        self.assertEqual(self.install(newer), ([AOC], []))
+        self.assertEqual(dlc.read_manifest(str(self.data)), [(AOC, 131072, 'data', str(newer))])
+        # and when the installed one lost its data, the other package takes over
+        (self.data / 'dlc' / ('%016x' % AOC) / 'romfs.bin').unlink()
+        self.assertEqual(self.install(first), ([AOC], []))
+        self.assertEqual(dlc.read_manifest(str(self.data)), [(AOC, 65536, 'data', str(first))])
 
     def test_manifest_accepts_the_three_column_form(self):
         (self.data / 'dlc.manifest').write_text('# comment\n\n0100152000023001 65536 P:/a b/c.nsp\n'

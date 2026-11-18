@@ -57,6 +57,8 @@ Refused, with the reason in the message:
 - keys that don't open the content metadata, or that lack the content's key generation (the data then does not
   decrypt to a RomFS; the message names `titlekek_XX` / `key_area_key_application_XX`),
 - a package without add-on content (the game, an update) or with add-on content of another game,
+- a title that is already installed from another package in the same or a newer version (a standalone DLC file and
+  a combined package that holds the same title): the installed one stays, a newer version replaces it,
 - BKTR and AES-XTS data sections, a broken NCZ, a file that is not one of the five types.
 
 Nothing is installed for a refused package: no manifest line, no partial files. `--dlc-stub` (diagnostics) installs
