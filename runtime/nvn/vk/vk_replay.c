@@ -66,12 +66,17 @@ static rchunk *g_free_chunks; static rdpool *g_free_pools; static SRWLOCK g_free
 // nanoseconds"; MIT, (c) seedds), on Vulkan timestamp queries:
 // - each report is stamped where it was recorded: vkCmdWriteTimestamp2 at the top of the pipeline for TIMESTAMP_TOP (the GPU's start), after all commands for the rest;
 // - the GPU's clock is brought to the guest clock by the smallest difference seen between a part's end stamp and the guest clock at its completion;
-// - the time the GPU sat idle between the parts of one NVN submission, waiting for the host to translate the next part (vks_split), is left out of the reports after
+// - the time the GPU sat idle between the parts of one frame (rep_gaps below), waiting for the host to translate the next part, is left out of the reports after
 //   it: a console runs a submission's commands back to back, and a dynamic resolution that counted the host's translation as GPU time stepped down for nothing;
 // - a Switch 2 program's NVN2 holds nanoseconds in the report, a Switch program's NVN 614.4 MHz ticks (dm_sdk_ounce).
 // On with game_dynamic_resolution=auto or 1 (g_opt_drs; the default with this renderer); with 0 the reports stay as they were (vk_submit.c post_run: a clock 256 times slower, the game always at full size).
 enum { RQ_PER = 16 };   // stamped reports per part; the ones past that get the part's end
 static VkQueryPool g_rqp; static int g_rq_used; static uint32_t g_rep_sub;
+// Which idle time is left out. nxnative leaves out the gaps inside one NVN submission. Here a frame is several submissions (Donkey Kong Bananza: 8, on two queues),
+// each translated after the one before went to the GPU, and a game that spans its frame with two reports then read its whole frame time as GPU time: Bananza drew
+// its scene at its smallest size (2095x1179 of 2880x1620) on a GPU that was two thirds idle. So by default the idle time between all the parts of one frame
+// (from present to present) is left out. gamectl set rep_gaps 1 (NXRT_VK_REP_GAPS=1): inside one submission only
+static int rep_gaps(void) { static int v = -1; if (v < 0) v = vkc_int("rep_gaps", 2); return v; }
 typedef struct { uint64_t addr; uint32_t type, sub; int tq, rq; } rep_post;
 static struct { uint32_t sub; int tq, have; uint64_t idle, prev_end, last; int64_t off; } g_rc;   // the completion thread's
 uint64_t guest_ns(void); int dm_sdk_ounce(void);
@@ -455,12 +460,14 @@ static void pass_targets(void) {
 // shader cache those draws were skipped, the race stayed black for as long as it ran although every shader had arrived within the first seconds (60 FPS, 700 draws
 // a frame, 95 % of the picture black). nxnative translates at first use and the game waits. The translator answers in 0.3 to 1.6 s (it takes the shaders of a
 // batch together), so the first load of a course is some seconds longer, once. NXRT_VK_SHADER_WAIT_MS (3000): the longest wait; 0: skipped at once, as before
+static uint64_t g_shader_wait_frame;   // waited in this frame so far (vkr_frame starts it again)
 static void shader_wait(const vks_shader **sh, int mesh) {
     static int ms = -1; if (ms < 0) ms = getenv("SWR_NXS_LIVE") ? vkc_int("shader_wait_ms", 3000) : 0;
     if (ms <= 0) return;
     static uint64_t waited[4096]; uint64_t h = 1469598103934665603ull;
     for (int s = 0; s < 5; s++) h = (h ^ (uint64_t)(uintptr_t)S->bst[s]) * 1099511628211ull;
     if (!h) h = 1;
+    if (g_shader_wait_frame > 1500000000ull) return;   // a frame's waits end after 1.5 s: the rest is skipped as before and looked at again in the next frame (five new programs in one frame of a race were a stop of 2.3 s)
     unsigned k = (unsigned)(h >> 20) & 4095; if (waited[k] == h) return;   // waited for once: a shader that never comes (one the translator fails on) is skipped from then on
     waited[k] = h;
     uint64_t t0 = now_ns(); int all = 0;
@@ -471,6 +478,7 @@ static void shader_wait(const vks_shader **sh, int mesh) {
         all = mesh ? sh[4] != NULL : sh[0] && (!S->bst[1] || sh[1] || S->rast_discard);   // the stages the draw cannot go without (a place an earlier program left bound may stay empty)
     }
     nxs_rt_force_look = 0;
+    g_shader_wait_frame += now_ns() - t0;
     static uint64_t total, n, said; total += now_ns() - t0; n++;
     if (now_ns() - said > 2000000000ull) { said = now_ns(); VKLOG("draws that waited for their shaders from the live translator so far: %llu, %.1f s in all (the last one %.0f ms, %s)",
                                                                  (unsigned long long)n, total / 1e9, (now_ns() - t0) / 1e6, all ? "they came" : "not all came: skipped"); }
@@ -2259,7 +2267,7 @@ static void split_now_(void) {   // what is recorded so far goes to the GPU, rec
 }
 void vkr_sub_begin(void) {
     g_split_t = now_ns(); g_split_ms = vkc_int("split_ms", 8);
-    memset(&g_sub, 0, sizeof g_sub); g_memo_sub++; g_rep_sub++;   // the texture / sampler memo starts again with each submission
+    memset(&g_sub, 0, sizeof g_sub); g_memo_sub++; if (rep_gaps() < 2) g_rep_sub++;   // the texture / sampler memo starts again with each submission
     P.valid = 0; P.open = 0; P.query = -1; g_last_pipe = VK_NULL_HANDLE; g_nwb = 0; g_nrtrb = 0; ds_forget();
     if (!S) S = rs_get(0);
     { extern int nvn_sub_resuming; g_rc_npend = 0; if (!nvn_sub_resuming) S->render_skip = 0; }   // the rest of a parked submission keeps its queue's render condition
@@ -2321,6 +2329,8 @@ static void slow_frame(uint64_t frame) {
     t0 = now; pb = b; pn = n; pw = w; pu = u; pp = ps.create_ns; pd = ms.up_ns;
 }
 void vkr_frame(uint64_t frame) {
+    g_shader_wait_frame = 0;
+    if (rep_gaps() >= 2) g_rep_sub++;   // counter reports: a new frame's times start on the guest clock again
     g_app_frame = frame + 2;   // from 1: 0 means "never bound"
     gm_frame(frame);
     static vkr_stats_t prev; static uint64_t pf;

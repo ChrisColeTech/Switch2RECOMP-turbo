@@ -466,6 +466,159 @@ Run folders of this round are under `build/plza-investigation/` of the worktree 
 | `NXRT_TEX_REWRITE=0/1` | textures the CPU rewrites after creating them, read again or not |
 | metrics columns `gmem_pages_learned`, `tf_captures` | pages learned from the raw global memory log; transform feedback captures |
 
+## 7. Third round (2026-11-17, night): the gap list, and the resolution
+
+Worked from `docs/NXNATIVE_GAP_ANALYSIS.md`'s open list in order, plus one item the owner added: the games looked soft, more like 720p than
+1080p or 1440p. All numbers are from the scripted runs of `tools/play_scenario.py` (new: one command per game, the same steps as the runs of
+sections 4 to 6) on the library builds, windowed on the 3840x2160 60 Hz display. Another agent (the AV1 decoder) built and ran the same library
+folders during this round: every run here was checked to have run this engine's runtime (`provenance.json`, exe hash = runtime hash), and three
+that had not were thrown away and run again. Its compiles and runs still share the machine, so single long frames are noisier than in section 6.
+
+### The games drew for the console's own screen
+
+Measured first (`render sizes up to frame` in the log, new: the passes a frame by target size; the presented picture's size is in the
+`screenshot: present` lines):
+
+| game | handheld (`docked=0`, what every ini had) | docked (`docked=1`) |
+|---|---|---|
+| Donkey Kong Bananza | scene and picture 1920x1080 | scene and picture 2880x1620 (the scene at 2095x1179 when the game's dynamic resolution steps down) |
+| Mario Kart World | 1920x1080 (half-size passes 960x540) | 2560x1440 (1280x720) |
+| Pokemon Legends Z-A | scene 1920x1080, picture 1280x720 | scene and picture 1920x1080 |
+| Ocarina of Time (title, menu) | 1920x1080 | 2560x1440 |
+| Mario Kart 8 Deluxe | 1280x720 | 1920x1080 |
+
+Cause: `docked` was 0 in every ini. The runtime writes every option with its default into the ini at each start, the default was handheld, and
+the operation mode, the performance mode and the default display resolution (`svc_core.c` `am_csg` commands 5, 6, 60, 62) answer from it. So
+each game drew for the console's panel and the window stretched that (bilinear, `vk_present.c`) to the monitor. The other suspects were clean:
+the graphics scale already answered tier 0 (nxnative's finding), `game_dynamic_resolution=0` told the games the GPU takes no time (largest size,
+never a step down), and the swapchain is the window's size.
+
+Fix: TV mode is the default, and an ini written before (`settings_version` below 2) is moved to it once; `docked=0` set afterwards stays. The
+docked sizes are the ones nxnative measures (DKB 2880x1620 with main passes 2095x1179, Ocarina 2560x1440). Crops of the same scene, handheld
+left, docked right: `build/evidence/gaps/plza-investigation/{dkb,mkw,mk8d,plza}-crop-handheld-vs-docked.png`.
+
+The launcher gets a "Screen mode" choice in Properties > Runtime (TV mode / Handheld mode) that writes `docked` into the game's ini.
+
+### Counter reports with the GPU's own time (gap rank 2)
+
+`vk_replay.c` "Counter reports: the GPU's own time", nxnative's design on Vulkan timestamp queries: each `TIMESTAMP` / `TIMESTAMP_TOP` report
+is stamped where it was recorded (`vkCmdWriteTimestamp2`, top of the pipeline for `TIMESTAMP_TOP`), the GPU's clock is brought to the guest
+clock by the smallest difference seen between a part's end and the guest clock at its completion, the time the GPU waited between the parts
+of one NVN submission is left out, and a Switch 2 SDK's report holds nanoseconds (`dm_sdk_ounce`; `nvnDeviceGetTimestampInNanoseconds` is then
+the identity). `game_dynamic_resolution=auto` is the new default: on with the Vulkan renderer, off with OpenGL (as before), and an old ini is
+moved to it once.
+
+Which idle time is left out matters. nxnative leaves out the gaps inside one NVN submission. Donkey Kong Bananza's frame is 8 submissions on
+two queues, each translated after the one before went to the GPU, and with that rule the game read its whole frame as GPU time: it drew its
+scene at 2095x1179, its smallest step, and upscaled to 2880x1620, on a GPU two thirds idle, and ran slower for it (55.6 FPS,
+`-231722-dkb-final2`; 55.9, `-222528-dkb-docked-drs2`). So the idle time between all the parts of one frame, present to present, is left out
+(`rep_gaps`, 2 by default; 1 is nxnative's rule): the scene is at 2880x1620 and the run at 57.0 FPS (`-233233-dkb-final3`). Mario Kart World
+stays at 2560x1440 either way (GPU 3.6 to 4.0 ms a frame in 4 submissions).
+
+### Donkey Kong Bananza: write-back on demand (gap rank 1)
+
+`vk_mem.c` "Write-back on demand", `nvn_dirty.c` `PG_LAZY`. A page of pool memory that GPU writes keep coming to (48 of them), with no copy
+on its way, not hot and not written by the CPU since its last upload, is handed to the device: the dirty tracker makes it inaccessible, writes
+to it are no longer copied back, and nothing reads it from guest memory. The first access by the CPU, by the game or by the host (a fault, or
+a host write announced through `dm_guest_write_prepare`), reads the page back from the device after every submission that skipped a copy into
+it has reached the queue, and goes on. Such a page then stays eager for 600 frames, doubled each time it happens again. A range written partly
+into lazy pages is copied back in its other parts only; a pool laid over lazy pages, or deleted, brings them in first.
+
+In the mining tunnel 3,900 to 5,300 pages are the device's and 7.8 MB a frame are no longer copied back (and no longer sent to the device again);
+the CPU comes for about 15 pages a second (chunks the game rebuilds). In a Mario Kart World race it is 25 MB a frame (its compute buffers), 5,400
+pages, under one page a frame read back.
+
+Same scripted run as section 6 (title, Continue, walk, punch, walk), window 100-150 s:
+
+| | section 6 (`-203354-dkb-final`, handheld) | write-back on demand, handheld (`-213418-dkb-lazy2`, `-214125-dkb-handheld`) | docked 2880x1620, scene 2880x1620 (`-220905-dkb-docked2`) | docked 2880x1620, the game's dynamic resolution on (`-233233-dkb-final3`, the default now) |
+|---|---|---|---|---|
+| FPS mean | 48.7 | 57.2, 57.3 | 54.9 | 57.0 |
+| present interval p50 / p95 / p99 | 20.0 / 26.3 / 28.6 ms | 16.7 / 21.6 / 24.8 and 16.7 / 21.3 / 24.6 ms | 16.8 / 23.0 / 32.4 ms | 16.7 / 21.2 / 26.5 ms |
+| intervals over 20 ms / over 33 ms (of about 2,700) | 1,240 / 8 | 233 / 7 and 223 / 7 | 313 / 16 | 218 / 9 |
+| black cells of 64 in the screenshots | 0 | 0 | 0 | 0 |
+
+Not a flat 60: the translation thread still takes most of the frame for the 630 culling draws (rank 4 of the gap list: one dispatch for them).
+
+### Other gap items
+
+- **Maps past the application pool fail** (rank 5; `kernel.c` svc 0x2C): Pokemon Legends Z-A's log has the refusal nxnative describes, once, at
+  1.5 s: `MapPhysicalMemory +4 MB refused: 3174 MB mapped, the application pool (3285 MB) is full`, then the game goes on as before.
+- **Queue parking on Linux**: the three fiber calls on `ucontext` (`host/linux/windows.h`); the Linux NVN archive and runtime build in WSL. Not
+  run on a Linux GPU here.
+- **A newer translator chain** (rank 4): not done. It needs nxnative's translator built with the .NET 10 SDK (this machine has 6, 7 and 9), the
+  Python front end moved to its ABI, and every game's shader cache made again.
+
+### Mario Kart World: the long frames
+
+Unchanged, and now attributed frame by frame (`frames.csv`'s cumulative columns over the long presents, window 150-185 s of
+`-222919-mkw-docked-drs3`): one cluster of seven frames of 54 to 145 ms at 161.5 s, each with 28 to 115 ms of texture upload, 40 to 100 ms of
+ASTC transcoding and up to 32 ms of sparse binds; one frame of 98 ms of texture upload alone; and one of 689 ms that is a single pipeline
+compiled at first use (the first docked run: the pipeline cache had no 2560x1440 variants). The handheld run has the same cluster at the same
+place in the race (`-215238-mkw-handheld`: 60, 124, 147, 162, 182 ms). So it is first-use texture work, in a burst when a new part of the course
+streams in. Not fixed: the texture path uploads a texture whole in the frame that first uses it, and the existing prefetch
+(`NXRT_VK_TEX_PREFETCH`) had shown no gain. The next step is in the gap list (rank 3): small levels now, large ones over the next frames, sampled
+through `VK_EXT_image_view_min_lod`.
+
+| | section 6 (`-202635-mkw-nx`, handheld) | handheld, this round (`-215238-mkw-handheld`) | docked 2560x1440 (`-223716-mkw-docked3`, `game_dynamic_resolution=0`) | docked 2560x1440, the game's dynamic resolution on (`-233605-mkw-final3`, the default now) |
+|---|---|---|---|---|
+| FPS mean | 58.0 | 58.1 | 58.1 | 58.2 |
+| present interval p50 / p95 / p99 | 16.67 / 17.66 / 25.98 ms | 16.84 / 18.51 / 32.67 ms | 16.67 / 17.15 / 28.71 ms | 16.67 / 17.52 / 31.75 ms |
+| intervals over 20 / 33 / 50 ms | 33 / 14 / 9 | 55 / 15 / 8 | 26 / 10 / 8 | 44 / 11 / 6 |
+
+### Mario Kart 8 Deluxe
+
+- **A crash on the first screen**: with the save as the owner has it (no Mii picked yet), L+R opens "Select a Mii" with the cursor on "Create a
+  Mii"; A starts the MiiEdit applet, whose output here was all zeros, read as "a Mii was made, at index 0" of a database that holds none: a
+  null Mii and a crash in `nn::mii::CreateId::IsValid` (`access to 48b4`). The applet now answers "cancelled" (`svc_core.c`); the scenario
+  picks the first default Mii.
+- **The first race on a new course** (1-2 FPS for about 4 minutes on a cold shader cache): the translator is not what takes the time. Its own
+  log has 48 shaders in 1.6 s; the course's 423 took about 15 s of translator time in all. The frames were slow because the game's thread sat in
+  two GPU waits of about 490 ms each a frame with the GPU idle (`GPU waits, last 5 s: 4925 ms in 10 waits`, GPU time 0.7 ms a frame), and
+  shaders are only asked for as frames go by. This round's cold run (`NXRT_SHADER_CACHE` pointed at an empty folder, so the owner's cache was not touched; `-225901-mk8d-coldcache`) did not have those waits: 60 FPS, 700 draws a frame, 654 shaders delivered within the first minute, and the race 95 % black to its end. The game draws parts of a course's lighting once while the course loads, and those draws had been skipped. Fix (`vk_replay.c` `shader_wait`): a draw whose shaders the live translator has not delivered waits for them, once per set of programs, at most 3 s and at most 1.5 s a frame (`NXRT_VK_SHADER_WAIT_MS`; 0: skipped at once, as before). With it the cold run reaches a fully drawn race (`-233914-mk8d-coldcache4/0017`, 2.5 % near-black); its 407 waits took 160 s in all, 0.39 s each, from the first boot to the race, once per shader ever. That per-wait time is the translator's (a process start per batch): the next step there. A new shader met in play is now a short stop instead of a missing object (Mario Kart World: one of 415 ms in a race, `-232054-mkw-final2`).
+
+### Regression checks of this round
+
+All five library builds were rebuilt through the engine CLI into their `buildDir` with the final runtime and run with the harness, with the
+defaults (TV mode, the game's dynamic resolution). The saves were copied aside first (`build/evidence/gaps/save-backups-20261117c`) and put back
+after the runs (Mario Kart 8 Deluxe's had a Mii picked, DKB's and MKW's had moved).
+
+| game | run | result |
+|---|---|---|
+| Donkey Kong Bananza | `-233233-dkb-final3` | title, Continue, walk, punch, walk at 2880x1620: terrain shaded in every screenshot, 0 black cells of 64; 57.0 FPS, present interval p50 16.7 / p95 21.2 / p99 26.5 ms (48.7 FPS and 20.0 / 26.3 / 28.6 ms at 1920x1080 before) |
+| Mario Kart World | `-233605-mkw-final3` | to a race, two drives at 2560x1440: 0 black cells; 58.2 FPS, p50 16.67 / p95 17.52 / p99 31.75 ms, 6 intervals over 50 ms (the texture bursts) |
+| Pokemon Legends Z-A | `-232801-plza-final2` | title, the station, two walks, picture 1920x1080 (1280x720 before): 0 black cells; 30.0 FPS (the game's interval 2), p50 33.3 / p95 34.0 / p99 34.5 ms, longest 42.6 ms |
+| Ocarina of Time | `-232513-zelda-final2` | title and menu at 2560x1440, 28.6 FPS (p50 34.7 ms); dav1d decodes the movies (598 pictures, 1.36 ms a unit), the screen behind the logo is still black (`AV1_DECODER.md`: the `nn::ndve` network) |
+| Mario Kart 8 Deluxe | `-232945-mk8d-final2`, `-225659-mk8d-final` | Select a Mii, the menus, a 50cc Grand Prix race at Mario Kart Stadium at 1920x1080 (1280x720 before): 0 black cells; 59.8 FPS, p50 16.66 / p95 17.03 / p99 17.46 ms (`-225659`). In `-232945` five new shader sets of the docked race came in one frame: a stop of 2.3 s, once (a frame's waits end after 1.5 s since) |
+
+Tests: `python -m unittest discover -s tests -p "test_n*.py"` (17), `tests/test_controllers.py`, `tests/test_mkw_runtime.py`,
+`tests/test_mkw_perf.py` pass. Linux: the NVN archive and the runtime build in WSL.
+
+Run folders of this round: `build/evidence/gaps/plza-investigation/` of the main checkout (not in git).
+
+### Seen and not followed up
+
+- **Donkey Kong Bananza's tunnel is posterized**: flat patches with hard edges where the lighting should fall off smoothly (any gameplay
+  screenshot of this round and of section 6, e.g. `-213418-dkb-lazy2/0006`; the large cave before the tunnel is smooth). Not from this round's
+  changes. The log has one `[RED] a 3D texture read as another type ... it reads 0` (texture 1x1x1, shader `4419f04c58bf1535` binding 3) as
+  the tunnel loads; a colour or light table read as zero is the first suspect.
+- **Ocarina of Time**: title and menu at 2560x1440, 27 FPS (GPU time 25 ms a frame in 7 submissions at the title: the movie's conversion
+  dispatches). Gameplay not reached in the scripted run (the opening movie is AV1).
+- **Pokemon Legends Z-A's eight `[RED]` cube placeholder lines** are unchanged.
+
+### Switches added
+
+| switch | what |
+|---|---|
+| `docked=1` / `0` (ini, or `--docked=0` for one run) | TV mode (default now) or handheld mode |
+| `game_dynamic_resolution=auto` / `1` / `0` | counter reports with the GPU's own time (auto: with the Vulkan renderer), or the old reports |
+| `NXRT_VK_WB_LAZY=0` | no write-back on demand: every GPU write is copied back, as before |
+| `gamectl set rep_gaps 1` (`NXRT_VK_REP_GAPS=1`) | counter reports leave out the GPU's idle time inside one NVN submission only (nxnative's rule), not across the frame |
+| `NXRT_VK_SHADER_WAIT_MS=<ms>` (3000; 0 = never) | how long a draw waits for shaders the live translator has not delivered |
+| `SWR_MAP_LIMIT=1` / `0` | maps past the application pool fail, for any title |
+| metrics columns `wb_lazy_pages`, `wb_lazy_in`, `wb_lazy_skip_kb` | pages the device alone holds; pages read back for the CPU and KB not copied back, per second |
+| log lines `render sizes up to frame`, `write-back on demand up to frame`, `a wait for fence ... ran out` | the sizes a game draws at; the lazy pages; a GPU wait of 100 ms or more that ran out |
+| `tools/play_scenario.py <game> --game <buildDir> [--option k=v]`, `tools/plza_probe.py start --option k=v` | the scripted runs; an ini option for one run |
+
 ## Instrumentation and switches added in this round
 
 | switch | what |
