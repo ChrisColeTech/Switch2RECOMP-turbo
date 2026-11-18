@@ -1,27 +1,22 @@
 # Switch2RECOMP Turbo
 
+[![Engine CI](https://github.com/ChrisColeTech/Switch2RECOMP-turbo/actions/workflows/engine-ci.yml/badge.svg?branch=turbo)](https://github.com/ChrisColeTech/Switch2RECOMP-turbo/actions/workflows/engine-ci.yml)
+
 Turn your own Switch and Switch 2 game dumps into native Windows and Linux games.
 
 This is an enhanced fork of SwitchRecomp by MZ Labs, maintained by [ChrisColeTech](https://github.com/ChrisColeTech).
 It is a recompiler, not an emulator: the game's code is translated once, ahead of time, into a real program for your PC.
 
-No games, keys or firmware are included. Use your own legally obtained dumps and console keys.
+> [!IMPORTANT]
+> No games, keys or firmware are included. Use your own legally obtained dumps and console keys.
 
 ## Games
 
 | | |
 | --- | --- |
-| ![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>**Donkey Kong Bananza** | ![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>**Mario Kart World** |
-| ![Mario Kart 8 Deluxe at Paris Promenade](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>**Mario Kart 8 Deluxe** (with the Booster Course Pass) | ![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>**Pokémon Legends: Z-A** |
-| ![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>**The Legend of Zelda: Ocarina of Time** | |
-
-| Game | Status |
-| --- | --- |
-| Mario Kart World | Plays at about 58–59 FPS, with occasional stutters |
-| Mario Kart 8 Deluxe | Plays at 60 FPS, including Booster Course Pass DLC |
-| Donkey Kong Bananza | Plays at 52–60 FPS, with some slowdowns and stutters |
-| Pokémon Legends: Z-A | Plays, but held at 30 FPS |
-| The Legend of Zelda: Ocarina of Time | Title screen and opening movie work; gameplay doesn't yet |
+| ![Mario Kart World mid-race](docs/images/screenshots/mario-kart-world.jpg)<br>**Mario Kart World**<br>Plays at about 58–59 FPS, with occasional stutters | ![Mario Kart 8 Deluxe at Paris Promenade](docs/images/screenshots/mario-kart-8-deluxe.jpg)<br>**Mario Kart 8 Deluxe**<br>Plays at 60 FPS, including Booster Course Pass DLC |
+| ![Donkey Kong Bananza in the mining tunnel](docs/images/screenshots/donkey-kong-bananza.jpg)<br>**Donkey Kong Bananza**<br>Plays at 52–60 FPS, with some slowdowns and stutters | ![Pokémon Legends: Z-A at Lumiose station](docs/images/screenshots/pokemon-legends-z-a.jpg)<br>**Pokémon Legends: Z-A**<br>Plays, but held at 30 FPS |
+| ![The Legend of Zelda: Ocarina of Time opening cutscene](docs/images/screenshots/zelda-ocarina-of-time.jpg)<br>**The Legend of Zelda: Ocarina of Time**<br>Title screen and opening movie work; gameplay doesn't yet | |
 
 60 FPS is the goal, not yet a guarantee. Measured numbers are in the [technical details](docs/TECHNICAL.md#measured-performance).
 
