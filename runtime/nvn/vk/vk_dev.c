@@ -431,6 +431,66 @@ int vk_alloc_mem(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, VkMe
     { uint64_t c = atomic_fetch_add(&nosys, 1); if (!(c % 4096)) VKLOG("a %llu byte allocation has no memory type outside device memory (types %#x): over the budget it fails (%llu times)", (unsigned long long)r->size, r->memoryTypeBits, (unsigned long long)c + 1); }
     return -1;
 }
+// ---------- The process's memory cap ----------
+// On 2026-11-18 Ocarina of Time's process grew by 1 GB a second (the NVIDIA driver's own allocations while its pipelines were made: VirtualAlloc of 136 and
+// 296 MB from vkCreatePipelineLayout and shader creation, not this layer's vkAllocateMemory), took the machine's whole commit and Windows went down. No game
+// may do that: on Windows the process puts itself into a job whose committed memory is limited, so past the limit allocations fail in this process (it
+// stops, with the reason in its log) instead of in every other program. The limit: half of the machine's memory, at least 12 GB and at most 32 GB;
+// SWR_MEMORY_CAP_GB overrides it, 0 turns it off. Logged when set
+#ifdef _WIN32
+void vk_process_memory_cap(void) {
+    static int done; if (done) return; done = 1;
+    MEMORYSTATUSEX ms = {sizeof ms}; GlobalMemoryStatusEx(&ms);
+    uint64_t cap = ms.ullTotalPhys / 2; if (cap < 12ull << 30) cap = 12ull << 30; if (cap > 32ull << 30) cap = 32ull << 30;
+    const char *e = getenv("SWR_MEMORY_CAP_GB"); if (e) cap = strtoull(e, NULL, 0) << 30;
+    if (!cap) { VKLOG("process memory cap: off (SWR_MEMORY_CAP_GB=0)"); return; }
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li; memset(&li, 0, sizeof li);
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY; li.ProcessMemoryLimit = (SIZE_T)cap;
+    if (job && SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) && AssignProcessToJobObject(job, GetCurrentProcess()))
+        VKLOG("process memory cap: %llu MB of committed memory (half of the machine's %llu MB, between 12 and 32 GB; SWR_MEMORY_CAP_GB sets it, 0 = off). Past it this game stops instead of the machine",
+              (unsigned long long)(cap >> 20), (unsigned long long)(ms.ullTotalPhys >> 20));
+    else VKRED("process memory cap: could not be set (error %lu): this game's memory is not limited", (unsigned long)GetLastError());
+}
+#else
+void vk_process_memory_cap(void) {}
+#endif
+// ---------- What vkAllocateMemory has given, per heap, and the cap on system memory ----------
+// Every vkAllocateMemory and vkFreeMemory of this file is counted per memory heap: calls, bytes allocated in all, bytes live. A line goes to the log each time a
+// heap's live bytes pass another 512 MB ("[vk] device memory allocations"), so a growth shows with its time. Heaps that are not device local are system
+// memory: what this layer allocates there is capped at 8 GB or a quarter of the heap, whichever is smaller (NXRT_VK_HOST_MB overrides, 0 = no cap). Over
+// the cap the allocation is refused and says so; the caller's own fallbacks apply (a texture that does not fit is not made), freed blocks are reused as
+// before. The cap is a guard: on 2026-11-18 a game's process took the machine's whole commit and Windows went down with it (that growth was the
+// driver's own memory per pipeline, vk_shader.c spv_pool_len, which this cap does not see; it bounds what this layer can add to such a case)
+static _Atomic uint64_t g_am_live[VK_MAX_MEMORY_HEAPS], g_am_all[VK_MAX_MEMORY_HEAPS], g_am_calls[VK_MAX_MEMORY_HEAPS], g_am_step[VK_MAX_MEMORY_HEAPS], g_am_refused;
+static void am_line(void) {
+    char b[512]; int o = 0;
+    for (uint32_t h = 0; h < g_vk.memp.memoryHeapCount && o < 440; h++)
+        o += snprintf(b + o, sizeof b - o, "%sheap %u (%s) %llu MB live, %llu MB in %llu calls so far", h ? "; " : "", h, g_vk.memp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device" : "system",
+                      (unsigned long long)(atomic_load(&g_am_live[h]) >> 20), (unsigned long long)(atomic_load(&g_am_all[h]) >> 20), (unsigned long long)atomic_load(&g_am_calls[h]));
+    VKLOG("device memory allocations: %s; %llu refused over the system memory cap", b, (unsigned long long)atomic_load(&g_am_refused));
+}
+static uint64_t am_cap(uint32_t h) {
+    static uint64_t over = ~0ull; if (over == ~0ull) { const char *e = getenv("NXRT_VK_HOST_MB"); over = e ? strtoull(e, NULL, 0) << 20 : ~0ull - 1; }
+    if (g_vk.memp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) return ~0ull;
+    if (over != ~0ull - 1) return over ? over : ~0ull;
+    uint64_t q = g_vk.memp.memoryHeaps[h].size / 4, c = 8ull << 30;
+    return q < c ? q : c;
+}
+static int am_ok(int type, uint64_t size) {   // 0: over the cap of a system memory heap
+    uint32_t h = g_vk.memp.memoryTypes[type].heapIndex; uint64_t cap = am_cap(h), live = atomic_load(&g_am_live[h]);
+    if (live + size <= cap) return 1;
+    uint64_t n = atomic_fetch_add(&g_am_refused, 1);
+    if (!(n & (n - 1))) { VKRED("system memory cap: an allocation of %llu MB refused, heap %u holds %llu MB of this layer's and its cap is %llu MB (NXRT_VK_HOST_MB); refused %llu times so far", (unsigned long long)(size >> 20), h,
+                                (unsigned long long)(live >> 20), (unsigned long long)(cap >> 20), (unsigned long long)n + 1); am_line(); }
+    return 0;
+}
+static void am_add(int type, uint64_t size) {
+    uint32_t h = g_vk.memp.memoryTypes[type].heapIndex; atomic_fetch_add(&g_am_calls[h], 1); atomic_fetch_add(&g_am_all[h], size);
+    uint64_t live = atomic_fetch_add(&g_am_live[h], size) + size, step = live >> 29;
+    if (step > atomic_load(&g_am_step[h])) { atomic_store(&g_am_step[h], step); am_line(); }
+}
+static void am_sub(int type, uint64_t size) { atomic_fetch_sub(&g_am_live[g_vk.memp.memoryTypes[type].heapIndex], size); }
 static int alloc_in(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid, vk_alloc *out) {
     memset(out, 0, sizeof *out); out->block = -1;
     int type = vk_mem_type(r->memoryTypeBits, want, avoid);
@@ -441,9 +501,10 @@ static int alloc_in(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, V
     if (r->size >= DEDICATED_MIN) {
         VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};   // buffers are made with device addresses (validation: memory must say so too)
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, g_vk.f12.bufferDeviceAddress ? &fi : NULL, r->size, (uint32_t)type};
-        if (vkAllocateMemory(g_vk.dev, &ai, NULL, &out->mem) != VK_SUCCESS) return -1;
-        out->size = r->size;
+        if (!am_ok(type, r->size) || vkAllocateMemory(g_vk.dev, &ai, NULL, &out->mem) != VK_SUCCESS) return -1;
+        out->size = r->size; out->type = type;
         if (host && vkMapMemory(g_vk.dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, out->mem, NULL); return -1; }
+        am_add(type, r->size);
         atomic_fetch_add(&g_dedicated_bytes, r->size);
         if (g_vk.memp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { out->dev = 1; atomic_fetch_add(&g_dev_used, r->size); }
         return 0;
@@ -463,8 +524,9 @@ static int alloc_in(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, V
         block_t *b = calloc(1, sizeof *b);
         VkMemoryAllocateFlagsInfo fi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, g_vk.f12.bufferDeviceAddress ? &fi : NULL, BLOCK, (uint32_t)type};
-        if (!b || vkAllocateMemory(g_vk.dev, &ai, NULL, &b->mem) != VK_SUCCESS) { free(b); break; }
+        if (!b || !am_ok(type, BLOCK) || vkAllocateMemory(g_vk.dev, &ai, NULL, &b->mem) != VK_SUCCESS) { free(b); break; }
         if (host && vkMapMemory(g_vk.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, b->mem, NULL); free(b); break; }
+        am_add(type, BLOCK);
         b->type = (uint32_t)type; b->fr[0] = (span_t){0, BLOCK}; b->nfr = 1;
         if (g_vk.memp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) atomic_fetch_add(&g_dev_used, BLOCK);
         int slot = -1; for (int i = 0; i < g_nblk; i++) if (!g_blk[i]) { slot = i; break; }
@@ -478,11 +540,11 @@ static int alloc_in(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, V
 void vk_free_mem(vk_alloc *a) {
     if (!a->mem) return;
     if (a->sys) atomic_fetch_sub(&g_sys_used, a->size);
-    if (a->block < 0) { atomic_fetch_sub(&g_dedicated_bytes, a->size); if (a->dev) atomic_fetch_sub(&g_dev_used, a->size); vkFreeMemory(g_vk.dev, a->mem, NULL); }
+    if (a->block < 0) { atomic_fetch_sub(&g_dedicated_bytes, a->size); if (a->dev) atomic_fetch_sub(&g_dev_used, a->size); am_sub(a->type, a->size); vkFreeMemory(g_vk.dev, a->mem, NULL); }
     else {
         AcquireSRWLockExclusive(&g_alk);
         block_t *b = g_blk[a->block];
-        if (b) { block_give(b, a->off, a->size); if (!b->used && !b->map) { if (g_vk.memp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) atomic_fetch_sub(&g_dev_used, BLOCK); vkFreeMemory(g_vk.dev, b->mem, NULL); free(b); g_blk[a->block] = NULL; } }   // an empty block goes back to the device
+        if (b) { block_give(b, a->off, a->size); if (!b->used && !b->map) { if (g_vk.memp.memoryTypes[b->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) atomic_fetch_sub(&g_dev_used, BLOCK); am_sub((int)b->type, BLOCK); vkFreeMemory(g_vk.dev, b->mem, NULL); free(b); g_blk[a->block] = NULL; } }   // an empty block goes back to the device
         ReleaseSRWLockExclusive(&g_alk);
     }
     memset(a, 0, sizeof *a); a->block = -1;

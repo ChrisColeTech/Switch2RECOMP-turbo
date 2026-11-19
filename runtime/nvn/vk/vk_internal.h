@@ -100,7 +100,7 @@ void vk_mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage, VkAcces
 
 // Device memory: blocks sub-allocated first-fit; big requests get a dedicated allocation
 uint64_t vk_device_used(void);   // bytes this process holds in device-local allocations, by its own count
-typedef struct { VkDeviceMemory mem; VkDeviceSize off, size; void *map; int block, sys, dev; } vk_alloc;   // sys: taken from system memory because device memory was full
+typedef struct { VkDeviceMemory mem; VkDeviceSize off, size; void *map; int block, sys, dev, type; } vk_alloc;   // sys: taken from system memory because device memory was full
 uint64_t vk_sys_used(void);
 extern _Thread_local int vk_rt_alloc;   // set around a render target's vk_alloc_mem: it stays in device memory past the budget (textures make way, evict_old)
 int vk_alloc_mem(const VkMemoryRequirements *r, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid, vk_alloc *out);

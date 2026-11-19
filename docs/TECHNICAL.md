@@ -36,7 +36,7 @@ Windows, on a 60 Hz display, 2026-11-18:
 | Donkey Kong Bananza | 55 | 52–60 (dips to 45) | 17–29 ms | 130–1420 ms | Stretches where every frame takes about 19 ms (about 55 FPS), plus hitches |
 | Mario Kart 8 Deluxe | 56 | 60.0 | 17.1 ms | 31 ms | 22-second run, through to a race |
 | Pokémon Legends: Z-A | 55–60 | 59.5 | 17.7 ms (p50 16.8, p99 29.6) | 82 ms | 60 FPS since the base-frame-rate patch (the game asks for 30 by itself); measured while another build was running on the machine |
-| The Legend of Zelda: Ocarina of Time | 60 (title, movies) | 27–50 in the first scene | 30–50 ms | seconds | Not playable: the first scene after the opening shows, then the game slows to frames of seconds and crashes about 10 minutes in; first-visit pipeline compiles take 40–90 s |
+| The Legend of Zelda: Ocarina of Time | 60 (title, movies) | 27–50 in the first scene | 30–50 ms | seconds | Not playable: the first scene after the opening shows, then the game slows to frames of seconds and stops. Its process grows by 1 GB a second from the start (the graphics driver's memory); since 0.5.5 a cap stops the game at half of the machine's memory (12 to 32 GB, `SWR_MEMORY_CAP_GB`) instead of exhausting the PC; first-visit pipeline compiles take 40–90 s |
 | Pokémon Legends: Arceus | not measured | 25–30 | 34 ms | 34–1944 ms | The game's own 30 FPS; walking around the first field works (10-minute run from a new save) |
 | Pokémon Violet | not measured | 30.0 | 34 ms | 75 ms | Menus and opening at 30 FPS; crashed once at the end of the opening (audio voice list), not reproduced or fixed |
 

@@ -47,7 +47,8 @@ VkDescriptorSetLayout vksh_pool_dsl(void) {
             VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
             vkGetPhysicalDeviceProperties2(g_vk.pd, &p2);
             uint32_t lim = p12.maxDescriptorSetUpdateAfterBindSampledImages < p12.maxPerStageDescriptorUpdateAfterBindSampledImages ? p12.maxDescriptorSetUpdateAfterBindSampledImages : p12.maxPerStageDescriptorUpdateAfterBindSampledImages;
-            uint32_t n = 1u << 18; while (n > 1024 && (uint64_t)n * VKSH_POOL_TYPES > lim) n >>= 1;
+            const char *pe = getenv("NXRT_VK_POOL_LOG2"); int lg = pe ? atoi(pe) : 16; if (lg < 10) lg = 10; if (lg > 20) lg = 20;
+            uint32_t n = 1u << lg; while (n > 1024 && (uint64_t)n * VKSH_POOL_TYPES > lim) n >>= 1;
             VkDescriptorSetLayoutBinding b[1 + VKSH_POOL_TYPES]; VkDescriptorBindingFlags bf[1 + VKSH_POOL_TYPES];
             b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_SAMPLER, VKSH_POOL_SAMPLERS, VK_SHADER_STAGE_ALL, NULL};
             for (int i = 0; i < VKSH_POOL_TYPES; i++) b[1 + i] = (VkDescriptorSetLayoutBinding){(uint32_t)(1 + i), VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, n, VK_SHADER_STAGE_ALL, NULL};
@@ -72,6 +73,26 @@ static void spv_move_var(uint32_t *w, size_t n, uint32_t var, uint32_t set, uint
     for (size_t i = 5; i < n; ) { uint32_t wc = w[i] >> 16, op = w[i] & 0xffff; if (!wc || i + wc > n) return;
         if (op == 71 && wc >= 4 && w[i + 1] == var) { if (w[i + 2] == 33) w[i + 3] = binding; else if (w[i + 2] == 34) w[i + 3] = set; }
         i += wc; }
+}
+// The array a pool variable declares gets the pool set's length (a new constant for its array type). The translator declares the game's whole pool, 1,048,576 elements, and NVIDIA's driver
+// takes host memory for every pipeline in proportion to the declared length (70 to 300 MB a pipeline: Ocarina of Time's 680 prewarmed pipelines took 61 GB of
+// system memory in its first minute and the machine ran out of commit minutes later). The module grows by that constant
+static uint32_t *spv_pool_len(uint32_t *w, size_t *pn, uint32_t var, uint32_t len) {   // the module, grown by one constant when the array was longer; NULL: not found
+    size_t n = *pn; uint32_t pt = 0, at = 0, c = 0; size_t ci = 0, ai = 0;
+    for (size_t i = 5; i < n; ) { uint32_t wc = w[i] >> 16, op = w[i] & 0xffff; if (!wc || i + wc > n) return NULL; if (op == 59 && wc >= 4 && w[i + 2] == var) pt = w[i + 1]; i += wc; }
+    for (size_t i = 5; pt && i < n; i += w[i] >> 16) if ((w[i] & 0xffff) == 32 && (w[i] >> 16) == 4 && w[i + 1] == pt) at = w[i + 3];
+    for (size_t i = 5; at && i < n; i += w[i] >> 16) if ((w[i] & 0xffff) == 28 && (w[i] >> 16) == 4 && w[i + 1] == at) { c = w[i + 3]; ai = i; }
+    for (size_t i = 5; c && i < n; i += w[i] >> 16) if ((w[i] & 0xffff) == 43 && (w[i] >> 16) == 4 && w[i + 2] == c) ci = i;
+    if (!ci || ci > ai) return NULL;
+    if (w[ci + 3] <= len) return w;   // short enough (or already given its own constant by another pool variable of the same type)
+    uint32_t *o = malloc((n + 4) * 4); if (!o) return NULL;
+    size_t at_ = ci + 4;   // right after the old constant: a new one of the same type, used by this array type only
+    memcpy(o, w, at_ * 4); uint32_t id = o[3]++;
+    o[at_] = 4u << 16 | 43; o[at_ + 1] = w[ci + 1]; o[at_ + 2] = id; o[at_ + 3] = len;
+    memcpy(o + at_ + 4, w + at_, (n - at_) * 4);
+    o[ai + 4 + 3] = id;
+    free(w); *pn = n + 4;
+    return o;
 }
 void vksh_stats(uint64_t *loaded, uint64_t *failed) { *loaded = g_loaded; *failed = g_failed; }
 
@@ -1113,6 +1134,8 @@ vks_shader *vksh_make(const char *key, const uint8_t *spv, size_t spv_size, cons
         lb[nlb++] = (VkDescriptorSetLayoutBinding){b->binding, b->type, b->count, (VkShaderStageFlags)vksh_stage_bit(s), NULL};
     }
     for (int i = 0; i < npoolv; i++) spv_move_var(w, nw, poolv[i], VKSH_POOL_SET, poolb[i]);
+    for (int i = 0; i < npoolv; i++) { uint32_t *pw = spv_pool_len(w, &nw, poolv[i], vksh_pool_images());
+        if (pw) w = pw; else { static int said; if (!said++) VKLOG("shader %s: a pool array keeps its declared length (its length constant was not found)", s->key); } }
     // interface
     const vj *in = vj_get(j, "inputs");
     for (int i = 0; in && i < in->n && s->stage == VKS_VS && s->nin < 32; i++) {

@@ -834,7 +834,8 @@ Run folders and the saves copied aside before the runs: `build/evidence/oot/` of
 
 ## 9. Fifth round (2026-11-18): Ocarina of Time's first scene, Pokemon Legends Z-A at 60
 
-State at the end of this round, in one paragraph: **Ocarina of Time is still not playable.** Its first scene after the opening (the Great
+State at the end of this round, in one paragraph: **Ocarina of Time is still not playable, and it takes tens of GB of memory (below; capped
+at 32 GB now).** Its first scene after the opening (the Great
 Deku Tree, the fairy) is on screen now, recognisable, at 27 to 50 FPS, where it was black at 1 to 5 FPS and stopped with the device lost.
 About 200 s into that cutscene the game slows to frames of 5 to 24 s and crashes near 630 s with its heap full; controllable gameplay was
 not reached. Pokemon Legends Z-A runs at 60 FPS. The pacing line is time based. Donkey Kong Bananza, Mario Kart World, Mario Kart 8 Deluxe,
@@ -896,6 +897,39 @@ Each of these is a general fix in `runtime/nvn`.
   `attachment-less pass at the viewport's size 1x1`.
 - First-visit cost: the first frame of the scene compiles pipelines for 38 to 94 s, the first pool pass writes 730,000 descriptors.
 - Not done: the opening voices' mix route, gameplay input, the launcher-style fullscreen check of the scene.
+
+### Ocarina of Time takes the machine's memory (NOT fixed; bounded by a cap now)
+
+Ocarina of Time's process grows by about 1 GB a second from its start: 9.5 GB at 5 s, 61.6 GB at 60 s, then flat while the title and the
+movies play, then more in the first scene until Windows had no commit left. That, not the game's heap, is what ended the long runs above, and
+on 2026-11-18 it took the whole machine down twice (a low-virtual-memory event naming the game at 227 GB, the display driver resetting, an
+unclean restart). Pokemon Legends Z-A holds 3.7 GB.
+
+What is known (`build/evidence/gameplay4`: `mem-*.txt`, `ramp-*.txt`, `vq1.txt`, `vq3.txt`, `cdbva.txt`, `nst1.txt`):
+
+- The memory is the NVIDIA driver's own, not this layer's: `VirtualAlloc` calls of 296, 152, 136 and 72 MB from inside `nvoglv64.dll`
+  (`cdbva.txt`: a breakpoint on large `VirtualAlloc` calls), 16 blocks of 296 MB and 17 of 136 MB by the time the process holds 17.7 GB
+  (`vq3.txt`). The callers are the pipeline prewarm's `vkp_graphics` -> `vkp_layout` (`vkCreatePipelineLayout`) and `get_l` -> `vksh_make`
+  (shader creation). This layer's own `vkAllocateMemory` holds 94 MB of device memory and 741 MB of system memory at that time (the new
+  log line `[vk] device memory allocations`).
+- It grows while the 680 pipelines of `pipelines.tsv` are made ahead (15 a second) and stops when they are done.
+- Ruled out by runs, each with the same curve: the pool set off (`NXRT_VK_POOLS=0`), the old queue rule, no per-frame sync; pool arrays
+  of 65,536 and of 1,024 instead of 262,144 (`NXRT_VK_POOL_LOG2`); the declared length of the pool arrays in the shader modules cut from
+  1,048,576 to the pool set's (`spv_pool_len`, kept: 0 shaders refused); the pool set without update-after-bind.
+- Not known: which property of this game's shaders or layouts makes the driver take 136 to 296 MB per object. Not tried: the same run
+  with the pipeline prewarm off, and with the runtime of turbo 51ea340 (before this round), which would say whether the pool set brought it.
+
+What was done about it:
+
+- **A cap on the process's memory** (`vk_dev.c` `vk_process_memory_cap`, Windows): the game puts itself into a job whose committed
+  memory is limited to half of the machine's memory, at least 12 and at most 32 GB (`SWR_MEMORY_CAP_GB` sets it, 0 = off). Verified:
+  run `-190309-g4-m13`, Ocarina of Time's private bytes went 9.1, 14.6, 19.1, 23.5, 27.0, 29.4, 31.6 GB and then stood at 32,768 MB for
+  25 s, after which the game stopped by itself; the machine had 127 GB of free commit at the start, so about 94 GB stayed free. So the game still cannot be played, but it can no
+  longer take the machine with it. Linux has no such cap yet.
+- A count of this layer's `vkAllocateMemory` per heap in the log (a line each time a heap's live bytes pass another 512 MB), and a cap
+  on what it takes from system-memory heaps (8 GB or a quarter of the heap; `NXRT_VK_HOST_MB`), refused allocations logged in red.
+- Every game launch of this work now goes through `build/evidence/gameplay4/guard.py` (the lock file `build/evidence/GAME_LOCK`, no other
+  game running, 40 GB of free commit) with a watchdog that stops the game by PID past 20 GB of private bytes or under 25 GB of free commit.
 
 ### Pokemon Legends Z-A: 60 FPS
 
