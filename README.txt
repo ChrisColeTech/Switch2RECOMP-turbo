@@ -115,11 +115,13 @@ notice) that the recompiler and every recompiled game show when they start.
     button_map=            optional per-button overrides, physical:guest pairs,
                            e.g. south:a east:b (see the comments in the .ini)
 
-  renderer=vulkan translates the game's shaders while it runs. It needs
-  Python 3 (Install.bat downloads it) and the .NET 10 runtime
-  (https://dotnet.microsoft.com/download/dotnet/10.0). The first time a
-  shader is used it appears about a second and a half later; after that it
-  comes from <game>_nvn\cache. On Linux it also needs, once:
+  renderer=vulkan translates the game's shaders when the game is built
+  (switchrecomp.py --no-shaders skips that), and any shader the build did
+  not find while it runs. It needs Python 3 (Install.bat downloads it) and
+  the .NET 10 runtime (https://dotnet.microsoft.com/download/dotnet/10.0).
+  A shader translated while the game runs appears about a second and a
+  half after its first use; after that it comes from <game>_nvn\cache.
+  On Linux it also needs, once:
       sudo sysctl vm.mmap_min_addr=0
 
   If something goes wrong: send MyGame.log (next to the exe). The F5 trace

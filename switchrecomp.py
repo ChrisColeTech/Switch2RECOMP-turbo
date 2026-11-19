@@ -532,6 +532,54 @@ def copy_nxshader(outdir, say):
     if copied: say('Vulkan shader translator: %d files copied' % copied)
 
 
+def shader_prebuild_wanted(base, target_win, no_shaders):
+    """Build-time shaders are for the Vulkan renderer (the NVN layer): the game's INI decides when it exists; a first build
+    takes them when this engine has the layer. SWR_SHADER_PREBUILD=0/1 overrides."""
+    env = os.environ.get('SWR_SHADER_PREBUILD', '')
+    if no_shaders or env == '0': return False
+    if env == '1': return True
+    if not target_win: return False
+    ini = base + '.ini'
+    if os.path.isfile(ini):
+        try:
+            with open(ini, encoding='utf-8', errors='replace') as fileobj:
+                for line in fileobj:
+                    if line.strip().startswith('renderer='): return line.strip()[9:].strip() == 'vulkan'
+        except OSError: pass
+        return False
+    return os.path.isfile(os.path.join(HERE, 'build', 'nvn', 'libnvn.a'))
+
+
+def copy_pipeline_seed(outdir, title, title_id, say):
+    """The pipelines a game is known to make (tools/nxshader/pipelines/<title id>.tsv: shader keys and render state, no
+    game data), put where the runtime's prewarm reads them: a fresh build makes them while the game boots instead of
+    one by one where each is first drawn."""
+    src = os.path.join(HERE, 'tools', 'nxshader', 'pipelines', '%016X.tsv' % title_id)
+    if not os.path.isfile(src): return
+    dst = os.path.join(outdir, title + '_nvn', 'vk')
+    os.makedirs(dst, exist_ok=True)
+    out = os.path.join(dst, 'pipelines.tsv')   # the runtime's own list (vk_pipe.c manifest_path), read at start by its prewarm
+    if os.path.exists(out): return            # a list this build made while it ran is kept: it names what this machine draws
+    shutil.copyfile(src, out)
+    say('Pipeline list for this game copied (made ahead when the game starts)')
+
+
+def start_shader_prebuild(outdir, title, jobs, say):
+    """tools/nxshader/nxs_prebuild.py on a thread beside the compile: every shader the game ships, translated now.
+    -> the thread (join it before the build says it is done). A failure never fails the build: the game then
+    translates its shaders while it runs, as before."""
+    def work():
+        try:
+            sys.path.insert(0, os.path.join(HERE, 'tools', 'nxshader'))
+            import nxs_prebuild
+            nxs_prebuild.run(outdir, title, jobs=max(1, min(jobs, 4)), say=say)
+        except Exception as e:
+            say('shaders: not translated at build time (%s: %s); the game translates them while it runs' % (type(e).__name__, str(e)[:200]))
+    thread = threading.Thread(target=work, name='shader prebuild', daemon=True)
+    thread.start()
+    return thread
+
+
 def program_hints(path, mods, say=lambda message: None):
     """the execution hints (addresses the running game reported, <name>.hints) belong to one program: when the build is
     of another one (an update applied or taken back), the file is put aside under that program's id and the file of
@@ -589,6 +637,8 @@ def main():
     ap.add_argument('--backend', choices=['auto', 'win32', 'x11', 'headless'], default='auto')
     ap.add_argument('--native', action='store_true', help='optimize for THIS processor (-march=native)')
     ap.add_argument('--no-build', action='store_true', help='only generate the C code and copy the game data')
+    ap.add_argument('--no-shaders', action='store_true',
+                    help='do not translate the shaders of the game during the build (Vulkan renderer): they are then translated while the game runs')
     ap.add_argument('--keep-c', action='store_true', help=argparse.SUPPRESS)   # the C is always kept, for rebuilds
     ap.add_argument('--interp-only', action='store_true', help='(diagnostics) no recompilation, everything interpreted')
     ap.add_argument('--runtime', help='use an already built runtime (.exe) instead of building it')
@@ -705,9 +755,14 @@ def main():
     datadir = base + '_data'
     copy_data(mods, npdm, romfs, a.input, datadir, say)
     copy_nxshader(outdir, say)
+    want_shaders = shader_prebuild_wanted(base, target_win, a.no_shaders)   # before a first build writes its INI
     if not os.path.exists(base + '.ini'):
         with open(base + '.ini', 'w', encoding='utf-8') as fo: fo.write(INI % {'title': title})
     if a.no_build: return
+    shaders = None
+    if want_shaders:
+        copy_pipeline_seed(outdir, title, info['title_id'], say)
+        shaders = start_shader_prebuild(outdir, title, a.jobs, say)
     say('Compiling with %s (-O%s, %d at a time)...' % (os.path.basename(cc), a.O, a.jobs))
     extra = []
     if a.native and not is_tcc(cc): extra.append('-march=native')
@@ -717,6 +772,9 @@ def main():
     link_module(objs, cc, modout, target_win, say)
     place_runtime(cc, exe, target_win, backend, say, a.runtime)
     if not target_win: os.chmod(exe, 0o755)
+    if shaders and shaders.is_alive():
+        say('The game is built; its shaders are still being translated...')
+    if shaders: shaders.join()
     say('Done: %s' % exe)
 
 

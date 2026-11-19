@@ -10,7 +10,7 @@ import struct
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools' / 'nxshader'))
-from nxs_live import ParentProcess, current_keys
+from nxs_live import ParentProcess, is_current
 from nxs_cache import Cache
 from nxs_front import job_for, job_digest
 
@@ -43,7 +43,7 @@ class ParentTest(unittest.TestCase):
             cache.publish(keys[3], spv, {'cache': {'chain': 'current'}})
             Path(root, 'vk', keys[3]+'.spv').unlink()
             Path(root, 'vk', keys[4]+'.json').write_text('{')
-            self.assertEqual(current_keys(cache, 'current'), {keys[0]})
+            self.assertEqual({k for k in keys if is_current(cache, "current", k)}, {keys[0]})
             self.assertTrue(Path(root, 'vk', keys[1]+'.spv').exists())
 
     def test_probe_preserves_child_and_detects_exit(self):

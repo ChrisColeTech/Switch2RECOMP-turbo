@@ -1,5 +1,16 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Shaders are translated when the game is built, not while it runs (renderer=vulkan). A freshly built game used to
+  find its shaders one by one while it ran: each unknown one was dumped, translated by one Python process, and the
+  draws that needed it waited up to 3 s, so a new build of Mario Kart World sat for minutes at 1-4 FPS with frames
+  of 2-7 s (a frozen title screen). The build now reads the game's files (RomFS folder, NUP or NSP in place, DLC,
+  ExeFS), writes every shader it finds as the runtime's dump (same key) and translates them 4 at a time beside the
+  compile (tools/nxshader/nxs_prebuild.py; its scanning rules are nxnative's shader_split.py, MIT). Mario Kart
+  World: 11,609 shaders found in 13 s, every one of the 6,349 its runtime had ever used among them. Games whose
+  packs are Oodle-compressed (Game Freak's) are not read and keep the live path. --no-shaders or
+  SWR_SHADER_PREBUILD=0 turns it off. A fresh build also gets the game's known pipeline list
+  (tools/nxshader/pipelines/<title id>.tsv) as its prewarm list when it has none. The live translator (nxs_live.py)
+  looks up only the keys it is given instead of reading every cache entry at start.
 - Game updates in a package of their own. switchrecomp.py GAME.nsp --update UPDATE (an NSP, an XCI, or an NCA with its
   ticket beside it; a combined package's update serves too) recompiles the update's code and reads its patch RomFS in
   place over the game's, each from its own file (romfs.nsp gets an "update <path>" row). --no-update builds a combined

@@ -59,6 +59,8 @@ renderdoc_app.h ((c) Baldur Karlsson, MIT), each with its licence text.
 Its shaders are translated while the game runs by tools/nxshader: nxs_live.py (SwitchRecomp), the nxs_*.py and dmsh_*.py
 scripts (from the same fork, porting parts of nxnative, MIT) and xlate_bin, nxnative's dmsh_xlate built on Ryujinx's
 shader translator (https://github.com/Ryubing, MIT). Their licences are in tools/nxshader/xlate_bin.
+tools/nxshader/nxs_prebuild.py, which finds the shaders in the game's files when the game is built, takes its scanning
+rules from nxnative's dm/gfx/tools/shader_split.py (MIT, (c) seedds; licence in tools/nxshader/xlate_bin).
 
 Eden renderer (renderer=eden): runtime/edenvk/src contains video_core, shader_recompiler and parts of common from the
 Eden Emulator Project (GPL-3.0-or-later, https://git.eden-emu.dev/eden-emu/eden), which includes code from the yuzu
