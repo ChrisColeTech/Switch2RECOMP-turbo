@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* The committed libopus decodes: a tone encoded with the archive's own encoder comes back as that tone, through the two
    decoders the hwopus service uses (opus_decode, opus_multistream_decode), at 48 kHz in 20 ms packets as the games send
    them. No game data. Run by tests/test_opus.py. */

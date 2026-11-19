@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Synthetic, game-data-free tests for standard application NSP in-place reads."""
 import os
 from pathlib import Path

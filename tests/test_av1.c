@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* The AV1 path of the Switch 2 video decoder service, without a game: runtime/av1video.inc and the committed dav1d
    decode two synthetic streams (tests/av1/vectors.h, made by tests/av1/make_vectors.py from ffmpeg's test pattern)
    and every picture has to come out once, in order, with its unit's time, as the NV12 libaom's decoder gives.

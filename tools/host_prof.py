@@ -1,6 +1,5 @@
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-# Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Where the NVN translation thread spends its time: a table by function from a SWR_HOST_PROF sample file.
 
 python tools/host_prof.py <game folder>/<Game>.log.hostprof.txt [--exe bin/runtime_win64_win32.exe] [--top 40]

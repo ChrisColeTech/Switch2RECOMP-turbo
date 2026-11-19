@@ -1,5 +1,5 @@
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 # Engine-only CI: tests and native runtime builds. Release bundles are packaged by the RecompLauncher repository.
 name: Engine CI
 on:

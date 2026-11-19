@@ -1,5 +1,5 @@
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 # source after setting root; do not install tools or change PATH here.
 if [ -n "${SWR_PYTHON:-}" ]; then
   "$SWR_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 8))' || return 1

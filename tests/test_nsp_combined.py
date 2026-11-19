@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Synthetic, game-data-free tests for encrypted and combined (game + update + DLC) NSPs: nca.py, the version 2
 romfs.nsp marker and the runtime that reads it (runtime/nsp.c, compiled here when a C compiler is around).
 

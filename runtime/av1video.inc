@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* av1video.inc - AV1 with dav1d (BSD-2-Clause, runtime/av1), for the Switch 2 video decoder service (svc_ns2.c, only
    compiled when SWR_HAVE_AV1 is defined) and for tests/test_av1.c. It needs nothing of the runtime.
 

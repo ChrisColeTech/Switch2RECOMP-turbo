@@ -1,6 +1,4 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech */
 /* protocol layouts adapted from Linux drivers/hid/hid-playstation.c:
    Copyright (c) 2020-2022 Sony Interactive Entertainment, GPL-2.0-or-later.
    https://github.com/torvalds/linux/blob/v6.12/drivers/hid/hid-playstation.c

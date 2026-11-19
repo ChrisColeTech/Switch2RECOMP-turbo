@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* controller button layout, shared by every pad path (XInput, Sony native HID, WinMM, Linux SDL2).
    each path reports its buttons BY POSITION in the Switch bit order: bit 0 = the right face button (where the Switch
    has A), 1 = bottom (B), 2 = top (X), 3 = left (Y), 4..15 = stick clicks, L, R, ZL, ZR, Plus, Minus, D-pad. this

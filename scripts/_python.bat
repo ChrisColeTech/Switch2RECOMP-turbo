@@ -1,6 +1,6 @@
 @echo off
-rem SwitchRecomp - Copyright 2026 MZ Labs
-rem Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+rem Copyright 2026 ChrisColeTech
+rem SPDX-License-Identifier: MIT
 rem CALL this file: select Python without installing anything or changing PATH.
 if defined SWR_PYTHON (
   "%SWR_PYTHON%" -c "import sys; sys.exit(sys.version_info < (3, 8))" >nul 2>nul

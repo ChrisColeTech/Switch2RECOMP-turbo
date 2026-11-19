@@ -82,3 +82,8 @@ Thanks to all of these projects.
 The runtime links libopus 1.5.2 (https://opus-codec.org, BSD-3-Clause, (c) Xiph.Org Foundation and contributors) for the
 hwopus service; its licence is runtime/opus/LICENSE, its source and build are named in runtime/opus/README.md. The recognition of
 nn::ndve's movie network by its shader keys (runtime/nvn/vk/vk_replay.c ndve_host) follows nxnative (MIT, (c) seedds).
+
+Turbo fork additions: files whose header reads "Copyright 2026 ChrisColeTech" were written for this fork by
+ChrisColeTech and are not part of SwitchRecomp by MZ Labs. Those marked "SPDX-License-Identifier: MIT" are licensed
+under the MIT License (Copyright (c) 2026 ChrisColeTech); runtime/controller_sony.h keeps its own note on the Linux
+hid-playstation protocol layouts. Everything else in this repository remains under the terms above.

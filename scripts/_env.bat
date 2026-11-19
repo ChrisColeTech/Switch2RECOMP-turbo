@@ -1,5 +1,5 @@
 @echo off
-rem SwitchRecomp - Copyright 2026 MZ Labs
+rem Copyright 2026 ChrisColeTech
 rem Shared Windows build environment. CALL this file; do not run it directly.
 set "SWR_ROOT=%~dp0.."
 for %%I in ("%SWR_ROOT%") do set "SWR_ROOT=%%~fI"

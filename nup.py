@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-# Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Validated reader for Switch 2 NUP packages.
 
 NUP stores ExeFS and RomFS in one indexed file. Raw entries are read from their

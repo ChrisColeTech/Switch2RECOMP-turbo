@@ -1,5 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* runtime/nsp.c on its own.
    usage: test_nsp_runtime <marker>                               the 4-byte "test" image of tests/run_nsp.sh
           test_nsp_runtime <marker> <expected image> [auto|portable]   every byte and unaligned ranges of the image

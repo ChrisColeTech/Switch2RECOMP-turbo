@@ -1,6 +1,5 @@
-<!-- SwitchRecomp - Copyright 2026 MZ Labs
-     Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-     Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
+<!-- Copyright 2026 ChrisColeTech
+     SPDX-License-Identifier: MIT -->
 # Add-on content (DLC)
 
 A built game gets its DLC installed into its data folder. The game then finds it the way it does on a console:

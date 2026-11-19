@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* included by the Win32 backend and the standalone device probe. no extra link libraries. */
 #ifndef SWR_CONTROLLER_SONY_WIN32_H
 #define SWR_CONTROLLER_SONY_WIN32_H

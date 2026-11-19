@@ -1,6 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-   Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* add-on content (DLC). A game sees DLC as two things: aoc:u says which add-on titles are installed, and fsp-srv
    OpenDataStorageByDataId hands out each title's own RomFS (it is never layered over the game's rom:).
    Both come from <data>/dlc.manifest, written by switchrecomp.py --install-dlc (dlc.py), one title a line:

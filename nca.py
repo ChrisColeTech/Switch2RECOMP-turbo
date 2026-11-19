@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-# Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Encrypted and combined application NSPs, read in place with the user's keys.
 
 A Switch 1 package keeps its ExeFS and RomFS AES-CTR encrypted, and a package that holds the game and its update

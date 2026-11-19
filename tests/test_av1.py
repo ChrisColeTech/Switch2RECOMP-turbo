@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-# Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """AV1 decoder test: builds tests/test_av1.c against the committed dav1d (runtime/av1/<win|lin>/libdav1d.a) and runs it.
 
 python tests/test_av1.py        (GCC: gcc/Library/bin from Install.bat, or the PATH; Linux: gcc)

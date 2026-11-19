@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """Exercise interpreter selection with disposable paths, without installing tools or running games."""
 import importlib.util
 import os

@@ -1,6 +1,5 @@
-<!-- SwitchRecomp - Copyright 2026 MZ Labs
-     Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-     Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. -->
+<!-- Copyright 2026 ChrisColeTech
+     SPDX-License-Identifier: MIT -->
 # Pokemon Legends Z-A (Switch 2 Edition): black screen at boot
 
 Status 2026-11-16: **fixed (renders).** Pokemon Legends Z-A Switch 2 Edition (`0100F43008C44000`, built by

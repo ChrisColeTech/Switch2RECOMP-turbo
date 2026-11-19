@@ -1,5 +1,5 @@
-/* SwitchRecomp - Copyright 2026 MZ Labs
-   Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt. */
+/* Copyright 2026 ChrisColeTech
+   SPDX-License-Identifier: MIT */
 /* runtime/dlc.c on its own: the manifest, the aoc:u count / list answers and the four kinds of title storage.
    usage: test_dlc_runtime <data folder with a trailing slash>   (tests/test_nsp_dlc.py makes the folder) */
 #include "rt.h"

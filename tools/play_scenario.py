@@ -1,6 +1,5 @@
-# SwitchRecomp - Copyright 2026 MZ Labs
-# Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
-# Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
+# Copyright 2026 ChrisColeTech
+# SPDX-License-Identifier: MIT
 """The scripted gameplay runs of docs/GAMEPLAY_INVESTIGATION.md, one command each, on top of tools/plza_probe.py.
 
 python tools/play_scenario.py dkb  --game "<buildDir>" [--label dkb-after] [--env NAME=VALUE ...] [--window 100,150]
