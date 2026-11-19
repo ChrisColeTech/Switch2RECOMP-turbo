@@ -14,6 +14,10 @@ This module opens such a package without hactool and without copying it:
     patch RomFS       the indirect (relocation) table maps the patched section onto the base section and the patch
                       section; the AesCtrEx (subsection) table gives the counter generation of each patch range
 
+The update can also come in a package of its own (Package(game, update=...)): an NSP, a card image (XCI) or a bare
+NCA with its ticket beside it. Its code replaces the game's and its patch RomFS is composed over the game's base
+section, each read from its own file. docs/UPDATES.md.
+
 docs/COMBINED_NSP.md describes the formats and the runtime marker written by Package.marker().
 """
 import ctypes
@@ -402,39 +406,90 @@ def dlc_base(title_id):
 
 
 # ------------------------------------------------------------------ the package
+def open_ncas(path, keys):
+    """the NCAs of a package that the keys open: an NSP (PFS0), a card image (the secure partition) or one bare NCA,
+    whose ticket is then looked for beside it. Compressed members (.ncz) cannot be read in place and are refused."""
+    import dlc
+    members = dlc.members(path)
+    bare = os.path.splitext(path)[1].lower() == '.nca'
+    tickets = {}
+    blobs = [nsp._read(path, member.offset, member.size) for member in members
+             if member.name.lower().endswith('.tik') and member.size <= 0x10000]
+    if bare:
+        folder = os.path.dirname(path)
+        for name in sorted(os.listdir(folder)):
+            beside = os.path.join(folder, name)
+            if name.lower().endswith('.tik') and os.path.getsize(beside) <= 0x10000:
+                with open(beside, 'rb') as fileobj: blobs.append(fileobj.read())
+    for blob in blobs:
+        rights, wrapped = ticket_key(blob)
+        if rights and tickets.get(rights) is None: tickets[rights] = wrapped
+    ncas = []; locked = 0
+    for member in members:
+        name = member.name.lower()
+        if name.endswith('.ncz') and not name.endswith('.cnmt.ncz'):
+            raise Error('%s: this is a compressed package (NSZ / XCZ). Its data cannot be read in place: decompress it '
+                        'to an NSP or XCI first (nsz -D)' % path)
+        if not name.endswith('.nca'): continue
+        try:
+            ncas.append(Nca(path, member, keys, tickets))
+        except Error:
+            if name.endswith('.cnmt.nca'): continue
+            header = xts(keys.header_key(), nsp._read(path, member.offset, 0xc00)) if member.size >= 0xc00 else b''
+            if header[0x200:0x204] != b'NCA3': locked += 1; continue
+            if header[0x205] == 0: raise      # a Program NCA that the keys or tickets don't open: say why
+    return ncas, locked
+
+
+def _is_patch(nca):
+    return any(section.patch for section in nca.sections)
+
+
 class Package:
-    """an application NSP whose Program NCA is encrypted and/or comes with its update"""
-    def __init__(self, path, keys=None):
+    """an application package whose Program NCA is encrypted and/or comes with an update: the update inside the same
+    package, or the one of `update`, a package of its own. embedded=False leaves the package's own update out (the
+    game as it was released)."""
+    def __init__(self, path, keys=None, update=None, embedded=True):
         self.path = os.path.abspath(path)
         self.keys = Keys(keys)
         self.keys_path = self.keys.path
-        members = nsp._pfs(self.path, 0, os.path.getsize(self.path))
-        tickets = {}
-        for member in members:
-            if member.name.lower().endswith('.tik') and member.size <= 0x10000:
-                rights, wrapped = ticket_key(nsp._read(self.path, member.offset, member.size))
-                if rights and tickets.get(rights) is None: tickets[rights] = wrapped
-        self.ncas = []; locked = 0
-        for member in members:
-            if not member.name.lower().endswith('.nca'): continue
-            try:
-                self.ncas.append(Nca(self.path, member, self.keys, tickets))
-            except Error:
-                if member.name.lower().endswith('.cnmt.nca'): continue
-                header = xts(self.keys.header_key(), nsp._read(self.path, member.offset, 0xc00)) if member.size >= 0xc00 else b''
-                if header[0x200:0x204] != b'NCA3': locked += 1; continue
-                if header[0x205] == 0: raise      # a Program NCA that the keys or tickets don't open: say why
+        self.ncas, _ = open_ncas(self.path, self.keys)
         programs = [nca for nca in self.ncas if nca.content_type == 0]
         if not programs:
             raise (Error if self.ncas else Locked)('%s: no decryptable Program NCA; check the installed keys' % self.path)
         self.title_id = min(nca.title_id for nca in programs)
         programs = [nca for nca in programs if nca.title_id == self.title_id]
-        patches = [nca for nca in programs if any(section.patch for section in nca.sections)]
+        patches = [nca for nca in programs if _is_patch(nca)]
         bases = [nca for nca in programs if nca not in patches]
         if len(patches) > 1 or len(bases) > 1:
             raise Error('%s: the package holds several versions of the game; keep one game and one update' % self.path)
         self.base = bases[0] if bases else None
-        self.update = patches[0] if patches else None
+        self.embedded_update = patches[0] if patches else None
+        self.update_path = None
+        self.update_ncas = self.ncas                      # where the update's metadata and control data are
+        if update:
+            if not self.base:
+                raise Error('%s: this package is an update on its own; the game\'s package is needed as the source' % self.path)
+            self.update_path = os.path.abspath(update)
+            self.update_ncas, _ = open_ncas(self.update_path, self.keys)
+            theirs = [nca for nca in self.update_ncas if nca.content_type == 0 and _is_patch(nca)]
+            mine = [nca for nca in theirs if nca.title_id == self.title_id]
+            if not mine:
+                if theirs:
+                    raise Error('%s: this update is for %016x, not for this game (%016x)'
+                                % (self.update_path, theirs[0].title_id, self.title_id))
+                raise Error('%s: the package holds no game update' % self.update_path)
+            if len(mine) > 1:
+                raise Error('%s: the package holds several updates; keep one' % self.update_path)
+            self.update = mine[0]
+            programs = [self.base, self.update]
+        elif embedded:
+            self.update = self.embedded_update
+        else:
+            if not self.base:
+                raise Error('%s: this package is an update on its own; the game\'s package is needed as the source' % self.path)
+            self.update = None
+            programs = [self.base]
         self.program = self.update or self.base           # the code and the metadata come from the update
         self.encrypted = any(section.crypto != 1 for nca in programs for section in nca.sections)
         for nca in programs:
@@ -465,9 +520,11 @@ class Package:
         if self.romfs_at > self.storage.size or self.romfs_size > self.storage.size - self.romfs_at:
             raise Error('%s: RomFS range is out of bounds' % self.path)
         self.root = nsp.romfs_tree(self.path, self.romfs_size, lambda offset, size: self.storage.read(self.romfs_at + offset, size))
-        self.version, self.addons, wanted = self._metadata()
+        self.version, _, wanted = self._metadata(self.update_ncas if self.update else self.ncas, bool(self.update))
+        _, self.addons, base_wanted = self._metadata(self.ncas, False)
         self.display_version = None
-        self.control = self._control(wanted)
+        self.control = self._control(self.update_ncas if self.update else self.ncas, wanted)
+        if not self.control and self.update_path: self.control = self._control(self.ncas, base_wanted)   # an update without control data
 
     def _exefs(self, section, at, size):
         head = section.read(at, nsp.PFS_HEAD.size)
@@ -504,12 +561,12 @@ class Package:
             files[strings[name_at:end].decode('utf-8', 'replace')] = image[data_at + relative:data_at + relative + length]
         return files
 
-    def _metadata(self):
-        """(title version, add-on content title ids, name of the Control NCA to use) from the content metadata: the
-        update's when the package has one, else the game's"""
+    def _metadata(self, ncas, updated):
+        """(title version, add-on content title ids, name of the Control NCA to use) from the content metadata of
+        these NCAs: the update's when it is applied, else the game's"""
         import dlc
         version = 0; addons = []; control = {}
-        for nca in self.ncas:
+        for nca in ncas:
             if nca.content_type != 1 or not nca.sections: continue
             try:
                 files = self._files(nca.sections[0])
@@ -517,18 +574,19 @@ class Package:
                     if not name.lower().endswith('.cnmt'): continue
                     cnmt = dlc.parse_cnmt(files[name])
                     if cnmt.type == 0x82 and dlc.is_addon_of(cnmt.title_id, self.title_id): addons.append(cnmt.title_id)
-                    if cnmt.type not in (0x80, 0x81) or dlc.base_of(cnmt.title_id) != dlc.base_of(self.title_id): continue
-                    if cnmt.type == 0x81 or not version: version = max(version, cnmt.version)
+                    if cnmt.type != (0x81 if updated else 0x80) or dlc.base_of(cnmt.title_id) != dlc.base_of(self.title_id): continue
+                    version = max(version, cnmt.version)
                     for record in cnmt.records:
                         if record.type == 3: control[cnmt.type] = record.nca_id + '.nca'
             except (Error, struct.error):
                 continue
-        return version, sorted(addons), control.get(0x81) or control.get(0x80)
+        return version, sorted(addons), control.get(0x81 if updated else 0x80)
 
-    def _control(self, wanted):
-        """{file name: bytes} of the Control NCA: control.nacp and the icons"""
+    def _control(self, ncas, wanted):
+        """{file name: bytes} of the Control NCA: control.nacp and the icons. `wanted` is the one the content metadata
+        names; when it is not among these NCAs the first Control NCA of the title serves"""
         found = None
-        for nca in self.ncas:
+        for nca in ncas:
             if nca.content_type != 2 or dlc_base(nca.title_id) != dlc_base(self.title_id): continue
             section = nca.section(3, 0)
             if not section or section.patch or section.sparse or section.compressed: continue
@@ -561,10 +619,34 @@ class Package:
                  'romfs %x %x' % (self.romfs_at, self.romfs_size)]
         if isinstance(self.storage, Patched):
             if self.storage.base: lines.append('base ' + self.storage.base.layer())
+            # an update of its own package: the patch row's offsets are in that file
+            if self.update_path: lines.append('update ' + self.update_path)
             lines.append('patch ' + self.storage.patch.layer() + ' %x %x %x %x' % self.storage.tables)
         else:
             lines.append('base ' + self.storage.layer())
         return '\n'.join(lines) + '\n'
+
+
+def update_info(path, keys=None, game=None):
+    """what an update package is: {'title_id', 'version', 'display'}. With `game` (the game's own package) the update
+    is opened over it, which proves that it belongs to that game and that the keys read it."""
+    path = os.path.abspath(path)
+    if not os.path.isfile(path): raise Error('%s: the update package is missing' % path)
+    if game:
+        if not (os.path.isfile(game) and nsp.is_nsp(game)):
+            raise Error('%s: a separate update needs the game as an NSP package; this game is built from %s'
+                        % (path, 'a NUP package, which holds its update already' if str(game).lower().endswith('.nup')
+                           else 'an extracted folder or another kind of file'))
+        package = Package(game, keys, update=path)
+        return {'title_id': package.title_id, 'version': package.version, 'display': package.display_version or ''}
+    key_file = Keys(keys)
+    ncas, _ = open_ncas(path, key_file)
+    patches = [nca for nca in ncas if nca.content_type == 0 and _is_patch(nca)]
+    if not patches: raise Error('%s: the package holds no game update' % path)
+    probe = Package.__new__(Package); probe.path = path; probe.title_id = patches[0].title_id
+    version, _, wanted = probe._metadata(ncas, True)
+    probe.display_version = None; probe._control(ncas, wanted)
+    return {'title_id': probe.title_id, 'version': version, 'display': probe.display_version or ''}
 
 
 class PackageRomfs:

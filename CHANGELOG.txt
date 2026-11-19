@@ -1,5 +1,12 @@
 Switch2Recomp 0.4.1 - MZ Labs
 
+- Game updates in a package of their own. switchrecomp.py GAME.nsp --update UPDATE (an NSP, an XCI, or an NCA with its
+  ticket beside it; a combined package's update serves too) recompiles the update's code and reads its patch RomFS in
+  place over the game's, each from its own file (romfs.nsp gets an "update <path>" row). --no-update builds a combined
+  package's game without the update it holds; --update-info says what an update package is and checks it against the
+  game. Each applied version keeps its generated C in a folder of its own, so going back to a version only links. An
+  update of another game, a compressed package (NSZ, XCZ) and a game that is not an NSP are refused with the reason.
+  docs/UPDATES.md.
 - Combined and encrypted NSPs build directly. A package that holds the game and its update (1G+1U), or the game, its
   update and its DLC (1G+1U+1D), is built like any NSP: the code, the title and the version are the update's, and the
   RomFS is read from the package in place with the update's BKTR patch composed over the base per read and both

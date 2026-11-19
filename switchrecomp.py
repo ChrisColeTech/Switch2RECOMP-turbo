@@ -462,9 +462,15 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
                     or name in ('.', '..') or base in reserved):
                 raise ValueError('unsafe ExeFS name in %s: %r' % (romfs.path, name))
             dst = os.path.join(ex, name); data = nxloader.nso_for_runtime(reader(), name)
-            current = open(dst, 'rb').read() if os.path.isfile(dst) else None
+            current = None
+            if os.path.isfile(dst):
+                with open(dst, 'rb') as fileobj: current = fileobj.read()
             if current != data:
                 with open(dst, 'wb') as fileobj: fileobj.write(data)
+        # a module only the other version of the game had (an update applied or removed since the last build)
+        kept = {name for name, _, _ in romfs.nsp.exefs()}
+        for name in os.listdir(ex):
+            if name not in kept and os.path.isfile(os.path.join(ex, name)): os.remove(os.path.join(ex, name))
         with open(nsp_marker, 'w', encoding='utf-8', newline='\n') as fileobj:
             fileobj.write(romfs.nsp.marker())
         # a package read with the keys also has the control data: title, version and icon
@@ -476,7 +482,11 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
             if blob:
                 with open(os.path.join(datadir, name), 'wb') as fileobj: fileobj.write(blob)
         if getattr(romfs.nsp, 'update', None):
-            say('Package: game with its update %s (v%d), applied in place' % (
+            say('Package: game with its update %s (v%d), applied in place%s' % (
+                romfs.nsp.display_version or '', romfs.nsp.version,
+                ' from %s' % romfs.nsp.update_path if romfs.nsp.update_path else ''))
+        elif getattr(romfs.nsp, 'embedded_update', None):
+            say('Package: the game without the update this package holds: %s (v%d)' % (
                 romfs.nsp.display_version or '', romfs.nsp.version))
         say('RomFS: using %s in place' % romfs.path)
         if getattr(romfs.nsp, 'addons', None):
@@ -520,6 +530,24 @@ def copy_nxshader(outdir, say):
     with open(os.path.join(dst, 'python.path'), 'w', encoding='utf-8', newline='\n') as fileobj:
         fileobj.write(os.path.abspath(sys.executable) + '\n')
     if copied: say('Vulkan shader translator: %d files copied' % copied)
+
+
+def program_hints(path, mods, say=lambda message: None):
+    """the execution hints (addresses the running game reported, <name>.hints) belong to one program: when the build is
+    of another one (an update applied or taken back), the file is put aside under that program's id and the file of
+    the program being built, if there is one from before, comes back. Hints of another version name addresses inside
+    this one's functions, and a game built with them can stop at start (Pokemon Legends: Arceus did)."""
+    code = hashlib.sha1(b''.join(bytes(m.build_id) for m in mods if not getattr(m, 'deferred', False))).hexdigest()[:16]
+    stamp = path + '.for'
+    try:
+        with open(stamp) as fileobj: owner = fileobj.read().strip()
+    except OSError:
+        owner = code if os.path.exists(path) else None      # a hints file from before the stamp: it is this program's
+    if owner and owner != code:
+        if os.path.exists(path): os.replace(path, '%s.%s' % (path, owner))
+        if os.path.exists('%s.%s' % (path, code)): os.replace('%s.%s' % (path, code), path)
+        say('Execution hints: the last build was another version of the program; its hints were put aside')
+    with open(stamp, 'w') as fileobj: fileobj.write(code + '\n')
 
 
 def output_name(title):
@@ -574,6 +602,14 @@ def main():
     ap.add_argument('--list-dlc', action='store_true', help='list the add-on content installed in --datadir and exit')
     ap.add_argument('--datadir', help="the built game's data folder (<outdir>/<name>_data), for the DLC options")
     ap.add_argument('--dlc-stub', action='store_true', help=argparse.SUPPRESS)   # diagnostics: license without data
+    ap.add_argument('--update', metavar='PACKAGE',
+                    help='apply a game update that is in a package of its own (.nsp .xci, or .nca with its .tik beside it) '
+                         'to the NSP game being built: its code is recompiled, its data is read in place over the game\'s')
+    ap.add_argument('--no-update', action='store_true',
+                    help='build a combined package (game + update) without the update it holds')
+    ap.add_argument('--update-info', nargs='+', metavar='PACKAGE',
+                    help='say what each update package is (title, version) and exit; with the game\'s package as the '
+                         'input, also check that the update belongs to it')
     ap.add_argument('-q', '--quiet', action='store_true')
     a = ap.parse_args()
     say = (lambda m: None) if a.quiet else (lambda m: print(m, flush=True))
@@ -604,7 +640,19 @@ def main():
             raise SystemExit('DLC error: %s' % e)
         if errors: raise SystemExit(1)
         return
+    if a.update_info:
+        import nca
+        failed = 0
+        for package in a.update_info:      # one line a package, for the launcher: tab-separated
+            try:
+                info = nca.update_info(package, game=a.input)
+                print('UPDATE\t%s\t%016x\t%d\t%s' % (os.path.abspath(package), info['title_id'], info['version'], info['display']), flush=True)
+            except (nca.Error, OSError, ValueError) as e:
+                failed = 1; print('UPDATE error: %s' % e, flush=True)
+        if failed: raise SystemExit(1)
+        return
     if not a.input: ap.error('the game folder, .nup/.nsp package or .nro file is required')
+    if a.update and a.no_update: ap.error('--update and --no-update exclude each other')
     # check the compiler first, not after minutes of translation
     cc = None
     if not a.no_build:
@@ -612,7 +660,7 @@ def main():
         if not cc: raise SystemExit('C compiler not found: %s' % a.cc if a.cc else 'No C compiler found (gcc, clang or tcc).')
     say('SwitchRecomp - use your own copy of the game. No games or keys included.')
     try:
-        mods, npdm, romfs = nxloader.load_program(a.input)
+        mods, npdm, romfs = nxloader.load_program(a.input, update=a.update, embedded_update=not a.no_update)
     except (ValueError, OSError) as e:
         raise SystemExit('Cannot load the game: %s' % e)
     for m in mods:
@@ -632,6 +680,7 @@ def main():
     if not a.no_build: check_writable(exe, modout)
     hints = []
     hp = base + '.hints'
+    program_hints(hp, mods, say)
     if os.path.exists(hp):
         with open(hp) as fi:
             for ln in fi:
@@ -644,7 +693,12 @@ def main():
     else:
         say('Analyzing the code...')
         prog.analyze(say)
+    # the generated C and its objects. A separate update is another program: it gets a folder of its own, so that
+    # applying an update and taking it back again each recompile once and after that only link
     build = base + '_build'
+    applied = getattr(getattr(romfs, 'nsp', None), 'update_path', None)
+    if applied: build += '_v%d' % romfs.nsp.version
+    elif a.no_update and getattr(getattr(romfs, 'nsp', None), 'embedded_update', None): build += '_base'
     os.makedirs(build, exist_ok=True)
     say('Translating ARM64 to C...')
     files = gen_module(prog, mods, npdm, build, title, a.chunk, say)

@@ -338,6 +338,7 @@ Nsp* nsp_open_marker(const char* marker);
 void nsp_close(Nsp* nsp);
 u64 nsp_size(Nsp* nsp);
 const char* nsp_path(Nsp* nsp);
+const char* nsp_update_path(Nsp* nsp);   /* the update's own package, "" when the update is in the game's or there is none */
 const char* nsp_kind(Nsp* nsp);     /* for the log: "", ", decrypted with prod.keys" or ", the update applied over the game" */
 int nsp_pread(Nsp* nsp, void* dst, u64 size, u64 off);
 /* add-on content (dlc.c): <data>/dlc.manifest and each title's RomFS under <data>/dlc/<title id>/ */
